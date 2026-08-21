@@ -1,4 +1,4 @@
-# Witness review work can become operationally invisible
+# Direct actionable mail can bypass the Beads work lifecycle
 
 Status: open
 
@@ -13,7 +13,14 @@ delivery acknowledgement, and was later marked read. For more than an hour,
 however, Gas Town exposed no durable state showing whether the review was
 queued, claimed, active, abandoned, or complete. The request thread had no
 reply, and `gt status --json` reported `has_work=false` because that field only
-describes pinned hook work.
+describes the agent's primary hook work.
+
+Gas Town already stores mail in Beads and already has relevant work primitives.
+Ordinary issues use `open`, `hooked`, `in_progress`, `blocked`, and `closed`;
+mail queues add `claimed-by` and `claimed-at` ownership labels; and self-handoff
+mail is explicitly auto-hooked. The defect is not the absence of a lifecycle
+engine. It is that direct actionable mail does not enter any of those existing
+work-ownership paths.
 
 A direct `gt nudge` produced an acknowledgement 12 seconds later. The Witness
 reported that the review was already active, full CI and custody checks were
@@ -67,17 +74,18 @@ how much of that interval contained active review work.
 ## Expected behavior
 
 After a running Witness receives a durable review request, Gas Town should make
-one of these states observable:
+its state observable using existing Beads primitives:
 
-- `queued`: delivered but not claimed;
-- `claimed`: a specific Witness generation owns the request;
+- `open`: actionable work is available but unclaimed;
+- an atomic claim: a specific Witness generation owns the request;
 - `in_progress`: review work has begun;
 - `blocked`: review cannot continue, with a durable reason;
-- `complete`: a durable exact-object verdict exists.
+- `closed`: a durable exact-object verdict completed the work.
 
 The requester should not need terminal capture or an out-of-band nudge to
 distinguish these states. Reading a message should remain separate from claiming
-its work.
+its work. A coordinator must also be able to claim mail work without displacing
+an unrelated patrol bead already occupying its primary hook.
 
 ## Actual behavior
 
@@ -101,11 +109,16 @@ This reproduces the observable gap without requiring a production system:
    ```bash
    gt mail send <rig>/witness \
      -s "REREVIEW REQUEST exact <sha>" \
-     -m "Review exact <sha> and return a durable verdict."
+     -m "Review exact <sha> and return a durable verdict." \
+     --type task --permanent
    ```
 
-3. Have the Witness view the message and begin work without replying or
-   attaching the message to its hook.
+   The incident used the command defaults instead, so its Beads record was an
+   ephemeral `msg-type:notification`. The explicit flags above demonstrate that
+   even correctly classifying and durably storing a task does not currently
+   claim it or attach it to work state.
+3. Have the Witness view the message and begin work without replying, claiming
+   the queue-style labels, or attaching a linked work bead.
 4. From the requester, inspect the recipient inbox, thread, and status:
 
    ```bash
@@ -127,6 +140,41 @@ This reproduces the observable gap without requiring a production system:
 
 ## Technical findings
 
+### Mail is already Beads-native
+
+`internal/mail/router.go` stores direct mail as a `gt:message` Beads record
+assigned to the recipient. The observed request was therefore already a Beads
+object. Its relevant fields were `status=open`, `assignee=jobscraper/witness`,
+`ephemeral=true`, `msg-type:notification`, `delivery:acked`, and `read`.
+
+This is a storage bridge, not a work-ownership bridge. Direct send does not set
+the message to `hooked` or `in_progress`, add queue claim labels, or update the
+recipient agent's `HookBead`.
+
+### Existing work bridges are specialized and disconnected
+
+Gas Town has two narrower mail-to-work paths:
+
+- `internal/cmd/handoff.go` creates permanent self-handoff mail and explicitly
+  changes that message to `status=hooked` for the successor session.
+- `internal/cmd/mail_queue.go` lets eligible workers claim queue-addressed mail
+  by adding `claimed-by` and `claimed-at` labels, and release it by removing
+  those labels.
+
+Neither path is invoked for ordinary direct mail to an agent. Queue claim also
+does not update the message to `in_progress`, expose blocked/completed work, or
+populate the claimant's `HookBead`. Conversely, auto-hooking every direct
+message would be incorrect because agents have one primary hook and coordinator
+roles may receive several actionable messages while patrolling.
+
+### Mail type does not imply work ownership
+
+`gt mail send` defaults to `--type notification` and ephemeral storage. The
+`--type task` option records intent and controls reply-reminder policy, but it
+does not promote or claim the Beads record. The observed request therefore
+exposed an additional semantic mismatch: Beads reported `issue_type=task` while
+mail metadata reported `msg-type:notification`.
+
 ### `read` is not a work acknowledgement
 
 `internal/mail/mailbox.go` implements `MarkReadOnly` as a read label that leaves
@@ -135,12 +183,12 @@ it is viewed. Delivery acknowledgement is a separate operation. These are
 transport and presentation states, not evidence that the requested work was
 claimed or completed.
 
-### `has_work` means pinned work
+### `has_work` means primary hook work
 
 `AgentRuntime.HasWork` in `internal/cmd/status.go` is documented as "Has pinned
-work?" and is populated from an agent's hook bead or handoff attachment. A
-mail-triggered review performed without a hook can therefore be active while
-`has_work=false` remains correct according to the current schema.
+work?" and is populated from the agent bead's scalar `HookBead`. A
+mail-triggered review performed outside that primary hook can therefore be
+active while `has_work=false` remains correct according to the current schema.
 
 ### Mail threads do not carry a review lifecycle
 
@@ -157,9 +205,22 @@ did it identify the Witness generation responsible for the review.
 
 ## Root-cause assessment
 
-The confirmed root cause is a state-model gap: mail delivery, message reading,
-pinned work, and review execution are represented independently, with no durable
-transition connecting them.
+The confirmed root cause is a composition gap among existing state models. Mail
+storage, delivery, reading, queue claims, handoff hooks, primary agent work, and
+review execution all have Beads-backed representations, but the direct-agent
+send path has no durable transition into work ownership.
+
+The incident did not exercise a generic mail-to-work transition that then
+failed. No such transition is called for direct mail. The request followed the
+implemented default path: an ephemeral notification bead was stored, delivered,
+and read while remaining `open`. Using `--type task` would have improved intent
+classification but would still not have claimed or started Beads work.
+
+This fragmentation reflects different original purposes: hooks represent one
+primary serialized assignment; direct mail represents communication and
+protocol events; mail queues distribute work across eligible workers; and
+handoff mail is a special successor-session case. The paths were never unified
+for long-running direct requests handled alongside coordinator patrol work.
 
 It is not confirmed that the Witness scheduler failed or that the Witness was
 idle. The fast post-nudge response stated that substantial review work was
@@ -177,6 +238,8 @@ Two behaviors still require focused tracing:
 
 Until review state is explicit:
 
+- Send exact-object requests with `--type task --permanent` so their intent is
+  explicit and their evidence is not subject to wisp cleanup.
 - Require the Witness to send a prompt, durable thread reply such as
   `CLAIMED`, `BLOCKED`, or `DECLINED` for exact-object review requests.
 - If no acknowledgement arrives within an operator-defined interval, use one
@@ -188,41 +251,51 @@ Until review state is explicit:
 
 ## Proposed repair
 
-Add a small, durable mail-work lifecycle rather than inferring execution from
-read state:
+Compose the existing Beads primitives instead of adding another lifecycle:
 
-1. Allow a recipient to atomically claim a message with its exact agent/session
-   generation.
-2. Store `queued`, `claimed`, `in_progress`, `blocked`, and `complete` states on
-   the message or a linked work record.
-3. Require exact-object review verdicts to reply on the original thread and
-   close the active claim.
-4. Expose active mail work separately from pinned hook work in `gt status`.
-5. Re-notify or escalate an acknowledged-but-unclaimed request after a bounded
-   interval. Do not duplicate a claim that already has a live generation.
-6. Recover claims after session replacement by comparing the stored generation
-   with the live session before reassignment.
+1. Treat permanent `msg-type:task` direct mail as actionable work while leaving
+   notifications, replies, and protocol events as ordinary mail.
+2. Atomically claim actionable mail using the existing queue-ownership model,
+   extended with the exact agent/session generation needed for recovery.
+3. Represent execution with the existing issue states: `open`, `in_progress`,
+   `blocked`, and `closed`. Either promote the message itself or create one
+   linked work bead when the mail record must remain immutable.
+4. Reserve `hooked` and `HookBead` for primary hook work. Track claimed mail as
+   secondary work so a Witness review cannot displace its patrol hook.
+5. Require exact-object verdicts to reply on the original thread and close the
+   associated work exactly once.
+6. Expose primary hook work and claimed secondary mail work separately in
+   `gt status`.
+7. Re-notify or escalate an acknowledged-but-unclaimed task after a bounded
+   interval, and recover a stale claim only after proving its stored generation
+   is no longer live.
 
-This preserves the useful distinction between mail and hook work while making
-review ownership observable.
+This reuses mail storage, queue claims, Beads issue states, thread identity, and
+generation custody while preserving the distinction between communication and
+work.
 
 ## Acceptance criteria
 
-- A delivered review request becomes visibly `queued` without being considered
-  claimed merely because it was read.
-- Starting the review atomically records the owning Witness generation and
-  changes the request to `in_progress`.
-- `gt status --json` reports pinned work and active mail work as separate fields.
+- A permanent `msg-type:task` direct request remains `open` and visibly
+  unclaimed until a recipient claims it; reading it does not claim it.
+- Starting the review atomically records the owning Witness generation and uses
+  the existing `in_progress` status on the message or its linked work bead.
+- Existing queue-addressed tasks and direct-agent tasks use the same claim
+  ownership semantics.
+- Claiming secondary mail work does not replace the agent's primary `HookBead`.
+- `gt status --json` reports primary hook work and claimed secondary mail work
+  separately.
 - The requester can identify the active message ID, thread ID, owner, state, and
   last transition without reading terminal output.
-- A final verdict replies on the originating thread and transitions the claim to
-  `complete` exactly once.
+- A final verdict replies on the originating thread and transitions the work to
+  `closed` exactly once.
 - Duplicate delivery or repeated nudges cannot create concurrent reviews for the
   same exact object and request.
 - A dead or replaced Witness generation leaves a recoverable claim that another
   generation can safely adopt.
-- Tests cover read-without-claim, claim-without-hook, duplicate delivery,
-  generation replacement, blocked review, and exact-once completion.
+- Tests cover notification-without-work, task read-without-claim,
+  claim-without-hook displacement, queue/direct claim parity, duplicate
+  delivery, generation replacement, blocked review, and exact-once completion.
 - An end-to-end test proves that a requester sees `in_progress` while a Witness
   performs a review with `has_work=false`.
 
@@ -230,6 +303,8 @@ review ownership observable.
 
 - `internal/mail/mailbox.go`: read labels and delivery acknowledgements
 - `internal/mail/router.go`: durable mail notification and nudge delivery
+- `internal/cmd/mail_queue.go`: queue claim and release ownership labels
+- `internal/cmd/handoff.go`: specialized self-mail auto-hook path
 - `internal/cmd/mail_inbox.go`: inbox viewing and read transitions
 - `internal/cmd/status.go`: agent runtime and pinned-work reporting
 - Witness startup/patrol instructions: review claim and reply protocol

@@ -91,7 +91,7 @@ A three-tier watchdog system keeps agents healthy:
 - **Deacon** - Background supervisor running continuous patrol cycles across all rigs.
 - **Dogs** - Infrastructure workers dispatched by the Deacon for maintenance tasks (e.g., Boot for triage).
 
-Operational incident: [Witness review work can become invisible](docs/operations/agents/260822-witness-review-work-invisible.md).
+Operational incident: [Direct actionable mail can bypass the Beads work lifecycle](docs/operations/agents/260822-witness-review-work-invisible.md).
 
 ### Refinery 🏭
 
