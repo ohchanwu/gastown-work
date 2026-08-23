@@ -3,6 +3,7 @@
 Active work:
 
 - [Actionable mail work lifecycle](specs/260824-actionable-mail-work-lifecycle.md)
+- [Actionable mail work lifecycle implementation](plans/260824-actionable-mail-work-lifecycle.md)
 
 Completed work:
 
