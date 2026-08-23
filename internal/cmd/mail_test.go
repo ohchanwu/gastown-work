@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
@@ -97,113 +96,6 @@ func TestClaimPatternMatching(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestQueueMessageReleaseValidation tests the validation logic for the release command.
-// This tests that release correctly identifies:
-// - Messages not claimed (no claimed-by label)
-// - Messages claimed by a different worker
-// - Messages without queue labels (non-queue messages)
-func TestQueueMessageReleaseValidation(t *testing.T) {
-	tests := []struct {
-		name        string
-		msgInfo     *queueMessageInfo
-		caller      string
-		wantErr     bool
-		errContains string
-	}{
-		{
-			name: "caller matches claimed-by - valid release",
-			msgInfo: &queueMessageInfo{
-				ID:        "hq-test1",
-				Title:     "Test Message",
-				ClaimedBy: "gastown/polecats/nux",
-				QueueName: "work-requests",
-				Status:    "open",
-			},
-			caller:  "gastown/polecats/nux",
-			wantErr: false,
-		},
-		{
-			name: "message not claimed",
-			msgInfo: &queueMessageInfo{
-				ID:        "hq-test2",
-				Title:     "Test Message",
-				ClaimedBy: "", // Not claimed
-				QueueName: "work-requests",
-				Status:    "open",
-			},
-			caller:      "gastown/polecats/nux",
-			wantErr:     true,
-			errContains: "not claimed",
-		},
-		{
-			name: "claimed by different worker",
-			msgInfo: &queueMessageInfo{
-				ID:        "hq-test3",
-				Title:     "Test Message",
-				ClaimedBy: "gastown/polecats/other",
-				QueueName: "work-requests",
-				Status:    "open",
-			},
-			caller:      "gastown/polecats/nux",
-			wantErr:     true,
-			errContains: "was claimed by",
-		},
-		{
-			name: "not a queue message",
-			msgInfo: &queueMessageInfo{
-				ID:        "hq-test4",
-				Title:     "Test Message",
-				ClaimedBy: "gastown/polecats/nux",
-				QueueName: "", // No queue label
-				Status:    "open",
-			},
-			caller:      "gastown/polecats/nux",
-			wantErr:     true,
-			errContains: "not a queue message",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateQueueRelease(tt.msgInfo, tt.caller)
-			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("error %q should contain %q", err.Error(), tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
-	}
-}
-
-// validateQueueRelease checks if a queue message can be released by the caller.
-// This mirrors the validation logic in runMailRelease.
-func validateQueueRelease(msgInfo *queueMessageInfo, caller string) error {
-	// Verify message is a queue message
-	if msgInfo.QueueName == "" {
-		return fmt.Errorf("message %s is not a queue message (no queue label)", msgInfo.ID)
-	}
-
-	// Verify message is claimed
-	if msgInfo.ClaimedBy == "" {
-		return fmt.Errorf("message %s is not claimed", msgInfo.ID)
-	}
-
-	// Verify caller is the one who claimed it
-	if msgInfo.ClaimedBy != caller {
-		return fmt.Errorf("message %s was claimed by %s, not %s", msgInfo.ID, msgInfo.ClaimedBy, caller)
-	}
-
-	return nil
 }
 
 // TestMailAnnounces tests the announces command functionality.

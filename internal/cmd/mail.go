@@ -32,6 +32,9 @@ var (
 	mailThreadJSON    bool
 	mailReplySubject  string
 	mailReplyMessage  string
+	mailReplyComplete bool
+	mailClaimID       string
+	mailBlockMessage  string
 	mailStdin         bool // Read message body from stdin
 
 	// Search flags
@@ -327,28 +330,32 @@ This is a convenience command that automatically:
 - Sends to the original sender
 
 The message body can be provided as a positional argument or via -m flag.
+Use --complete only for mail work claimed by this exact session generation;
+the reply and source close are committed atomically.
 
 Examples:
   gt mail reply msg-abc123 "Thanks, working on it now"
   gt mail reply msg-abc123 -m "Thanks, working on it now"
-  gt mail reply msg-abc123 -s "Custom subject" -m "Reply body"`,
+  gt mail reply msg-abc123 -s "Custom subject" -m "Reply body"
+  gt mail reply hq-task -m "Completed" --complete`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runMailReply,
 }
 
 var mailClaimCmd = &cobra.Command{
 	Use:   "claim [queue-name]",
-	Short: "Claim a message from a queue",
-	Long: `Claim the oldest unclaimed message from a work queue.
+	Short: "Claim actionable mail work",
+	Long: `Claim actionable mail work for this exact session generation.
 
 SYNTAX:
   gt mail claim [queue-name]
+  gt mail claim --id <message-id>
 
 BEHAVIOR:
-1. If queue specified, claim from that queue
-2. If no queue specified, claim from any eligible queue
-3. Add claimed-by and claimed-at labels to the message
-4. Print claimed message details
+1. If --id is specified, claim that direct or queue task
+2. If queue is specified, claim its oldest eligible task
+3. If neither is specified, claim from any eligible queue
+4. Bind ownership to the caller's exact tmux session generation
 
 ELIGIBILITY:
 The caller must match the queue's claim_pattern (stored in the queue bead).
@@ -356,35 +363,44 @@ Pattern examples: "*" (anyone), "gastown/polecats/*" (specific rig crew).
 
 Examples:
   gt mail claim work-requests   # Claim from specific queue
-  gt mail claim                 # Claim from any eligible queue`,
-	Args: cobra.MaximumNArgs(1),
+  gt mail claim                 # Claim from any eligible queue
+  gt mail claim --id hq-abc123  # Claim one exact task`,
+	Args: validateMailClaimArgs,
 	RunE: runMailClaim,
 }
 
 var mailReleaseCmd = &cobra.Command{
 	Use:   "release <message-id>",
-	Short: "Release a claimed queue message",
-	Long: `Release a previously claimed message back to its queue.
+	Short: "Release claimed mail work",
+	Long: `Release previously claimed direct or queue mail work.
 
 SYNTAX:
   gt mail release <message-id>
 
-BEHAVIOR:
-1. Find the message by ID
-2. Verify caller is the one who claimed it (claimed-by label matches)
-3. Remove claimed-by and claimed-at labels
-4. Message returns to queue for others to claim
-
-ERROR CASES:
-- Message not found
-- Message is not a queue message
-- Message not claimed
-- Caller did not claim this message
+Only the exact tmux session generation that claimed the work may release it.
+Released work returns to open/unclaimed state.
 
 Examples:
   gt mail release hq-abc123    # Release a claimed message`,
 	Args: cobra.ExactArgs(1),
 	RunE: runMailRelease,
+}
+
+var mailBlockCmd = &cobra.Command{
+	Use:     "block <message-id>",
+	Short:   "Block owned mail work",
+	Long:    "Mark mail work owned by this exact session generation blocked with a required reason.",
+	Args:    cobra.ExactArgs(1),
+	PreRunE: validateMailBlock,
+	RunE:    runMailBlock,
+}
+
+var mailResumeCmd = &cobra.Command{
+	Use:   "resume <message-id>",
+	Short: "Resume blocked mail work",
+	Long:  "Resume blocked mail work owned by this exact session generation.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runMailResume,
 }
 
 var mailClearCmd = &cobra.Command{
@@ -517,6 +533,9 @@ func init() {
 	mailReplyCmd.Flags().StringVarP(&mailReplySubject, "subject", "s", "", "Override reply subject (default: Re: <original>)")
 	mailReplyCmd.Flags().StringVarP(&mailReplyMessage, "message", "m", "", "Reply message body")
 	mailReplyCmd.Flags().StringVar(&mailReplyMessage, "body", "", "Reply message body (alias for --message)")
+	mailReplyCmd.Flags().BoolVar(&mailReplyComplete, "complete", false, "Complete owned mail work with this reply")
+	mailClaimCmd.Flags().StringVar(&mailClaimID, "id", "", "Claim one exact direct or queue task message")
+	mailBlockCmd.Flags().StringVarP(&mailBlockMessage, "message", "m", "", "Required reason the work is blocked")
 
 	// Search flags
 	mailSearchCmd.Flags().StringVar(&mailSearchFrom, "from", "", "Filter by sender address")
@@ -550,6 +569,8 @@ func init() {
 	mailCmd.AddCommand(mailReplyCmd)
 	mailCmd.AddCommand(mailClaimCmd)
 	mailCmd.AddCommand(mailReleaseCmd)
+	mailCmd.AddCommand(mailBlockCmd)
+	mailCmd.AddCommand(mailResumeCmd)
 	mailCmd.AddCommand(mailClearCmd)
 	mailCmd.AddCommand(mailSearchCmd)
 	mailCmd.AddCommand(mailAnnouncesCmd)

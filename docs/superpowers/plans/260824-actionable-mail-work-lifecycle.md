@@ -135,19 +135,21 @@ contributor work.
 - Modify: `internal/cmd/mail_thread.go`
 - Create: `internal/cmd/mail_work_test.go`
 
-- [ ] Write failing command tests for `gt mail claim --id`, existing queue
+- [x] Write failing command tests for `gt mail claim --id`, existing queue
   selection, direct and queue release, required block reasons, same-generation
   resume, and `gt mail reply --complete` with a non-empty body.
-- [ ] Add exact current-generation capture from `GT_SESSION` and tmux. Refuse to
+- [x] Add exact current-generation capture from `GT_SESSION` and tmux. Refuse to
   mutate when generation capture is unavailable or incomplete.
-- [ ] Replace the queue label/reread race with candidate selection followed by
+- [x] Replace the queue label/reread race with candidate selection followed by
   the shared transaction claim. Add `block` and `resume` subcommands and a
   `--complete` reply flag. Keep ordinary reply behavior unchanged.
-- [ ] Ensure completion notification failures report durable success plus a
+- [x] Ensure completion notification failures report durable success plus a
   retryable notification warning, never repeat the transaction.
-- [ ] Run `go test ./internal/cmd -run TestMailWork` and the full
-  `go test ./internal/cmd` package.
-- [ ] Commit: `feat(mail): expose generation-safe work commands`
+- [x] Run `go test ./internal/cmd -run TestMailWork` and the full
+  `go test ./internal/cmd` package. The focused suite passes; the full package
+  reaches the unrelated baseline failure
+  `TestDogDoneInsideOwnedTmuxSessionFinalizesOutsidePane`, reproduced alone.
+- [x] Commit: `feat(mail): expose generation-safe work commands`
 
 ## Task 6: Separate reading from work state and protect generic archive
 

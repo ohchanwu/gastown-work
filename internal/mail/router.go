@@ -150,6 +150,20 @@ func (r *Router) recordNotificationResult(err error) {
 	r.notifyMu.Unlock()
 }
 
+// NotifyPersisted wakes the recipient for a message that was already written
+// transactionally by a caller such as MailWorkStore.Complete.
+func (r *Router) NotifyPersisted(msg *Message) {
+	if msg == nil || msg.SuppressNotify || isSelfMail(msg.From, msg.To) {
+		return
+	}
+	msgCopy := *msg
+	r.notifyWg.Add(1)
+	go func() {
+		defer r.notifyWg.Done()
+		r.recordNotificationResult(r.notifyRecipient(&msgCopy))
+	}()
+}
+
 // isListAddress returns true if the address uses list:name syntax.
 func isListAddress(address string) bool {
 	return strings.HasPrefix(address, "list:")
@@ -1299,14 +1313,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Notification is async: the durable write is complete, so the caller
 	// doesn't block on idle probing (up to 1s per recipient in fan-out).
 	// Callers that exit soon after Send should call WaitPendingNotifications.
-	if !msg.SuppressNotify && !isSelfMail(msg.From, msg.To) {
-		msgCopy := *msg // copy to avoid data race if caller mutates msg
-		r.notifyWg.Add(1)
-		go func() {
-			defer r.notifyWg.Done()
-			r.recordNotificationResult(r.notifyRecipient(&msgCopy))
-		}()
-	}
+	r.NotifyPersisted(msg)
 
 	return nil
 }

@@ -60,6 +60,16 @@ func TestWaitPendingNotificationsDistinguishesQueued(t *testing.T) {
 	}
 }
 
+func TestNotifyPersistedSkipsNilSuppressedAndSelfMail(t *testing.T) {
+	r := NewRouterWithTownRoot(t.TempDir(), t.TempDir())
+	r.NotifyPersisted(nil)
+	r.NotifyPersisted(&Message{From: "gastown/Toast", To: "gastown/Toast"})
+	r.NotifyPersisted(&Message{From: "gastown/Toast", To: "gastown/Furiosa", SuppressNotify: true})
+	if err := r.WaitPendingNotifications(); err != nil {
+		t.Fatalf("WaitPendingNotifications() = %v", err)
+	}
+}
+
 func TestDetectTownRoot(t *testing.T) {
 	// Unset GT_TOWN_ROOT/GT_ROOT so tests exercise workspace.Find fallback.
 	// (The real session always has these set; this tests the detection logic itself.)
