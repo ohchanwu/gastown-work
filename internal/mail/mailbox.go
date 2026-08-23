@@ -28,8 +28,9 @@ var timeNow = time.Now
 
 // Common errors
 var (
-	ErrMessageNotFound = errors.New("message not found")
-	ErrEmptyInbox      = errors.New("inbox is empty")
+	ErrMessageNotFound           = errors.New("message not found")
+	ErrEmptyInbox                = errors.New("inbox is empty")
+	ErrMailWorkRequiresLifecycle = errors.New("mail work requires its lifecycle command")
 )
 
 // Mailbox manages messages for an identity via beads.
@@ -114,13 +115,21 @@ func (m *Mailbox) List() ([]*Message, error) {
 	if m.legacy {
 		return m.listLegacy()
 	}
-	return m.listBeads()
+	return m.listBeads(false)
 }
 
-func (m *Mailbox) listBeads() ([]*Message, error) {
+// ListAll includes completed actionable work while keeping archived legacy mail hidden.
+func (m *Mailbox) ListAll() ([]*Message, error) {
+	if m.legacy {
+		return m.listLegacy()
+	}
+	return m.listBeads(true)
+}
+
+func (m *Mailbox) listBeads(includeClosedWork bool) ([]*Message, error) {
 	// Single query to beads - returns both persistent and wisp messages
 	// Wisps are stored in the same DB with ephemeral=true, not synced to git.
-	messages, err := m.listFromDir(m.beadsDir)
+	messages, err := m.listFromDir(m.beadsDir, includeClosedWork)
 	if err != nil {
 		return nil, err
 	}
@@ -144,10 +153,10 @@ func (m *Mailbox) listBeads() ([]*Message, error) {
 // Uses per-identity --assignee queries to push filtering to Dolt, reducing
 // memory footprint under concurrent agent load. A separate CC query fetches
 // messages where this identity is CC'd.
-func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
+func (m *Mailbox) listFromDir(beadsDir string, includeClosedWork bool) ([]*Message, error) {
 	// Use in-process store when available
 	if m.store != nil {
-		return m.storeListFromDir()
+		return m.storeListFromDir(includeClosedWork)
 	}
 
 	identities := m.identityVariants()
@@ -194,8 +203,8 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	// Deduplicate messages across queries (assignee + CC + wisps may overlap).
 	seen := make(map[string]bool)
 	messages := make([]*Message, 0, len(assignee.messages)+len(cc.messages)+len(wisps.messages))
-	messages = appendBeadsMessages(messages, seen, assignee.messages, true)
-	messages = appendBeadsMessages(messages, seen, cc.messages, false)
+	messages = appendBeadsMessages(messages, seen, assignee.messages, true, includeClosedWork)
+	messages = appendBeadsMessages(messages, seen, cc.messages, false, includeClosedWork)
 	if wisps.err == nil {
 		messages = appendWispMessages(messages, seen, wisps.messages)
 	}
@@ -209,6 +218,7 @@ func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []str
 		args := []string{"list",
 			"--label", "gt:message",
 			"--assignee", id,
+			"--status=all",
 			"--json",
 			"--limit", "0",
 		}
@@ -234,6 +244,7 @@ func (m *Mailbox) queryIssueMessagesByCC(beadsDir string, identities []string) [
 		args := []string{"list",
 			"--label", "gt:message",
 			"--label", "cc:" + id,
+			"--status=all",
 			"--json",
 			"--limit", "0",
 		}
@@ -269,18 +280,36 @@ func parseBeadsListOutput(stdout []byte) ([]BeadsMessage, error) {
 	return msgs, nil
 }
 
-func appendBeadsMessages(messages []*Message, seen map[string]bool, msgs []BeadsMessage, includeHooked bool) []*Message {
+func appendBeadsMessages(messages []*Message, seen map[string]bool, msgs []BeadsMessage, includeHooked, includeClosedWork bool) []*Message {
 	for i := range msgs {
 		bm := &msgs[i]
 		if seen[bm.ID] {
 			continue
 		}
-		if bm.Status == "open" || (includeHooked && bm.Status == "hooked") {
+		message := bm.ToMessage()
+		if mailMessageVisible(message, includeHooked, includeClosedWork) {
 			seen[bm.ID] = true
-			messages = append(messages, bm.ToMessage())
+			messages = append(messages, message)
 		}
 	}
 	return messages
+}
+
+func mailMessageVisible(message *Message, includeHooked, includeClosedWork bool) bool {
+	if message == nil {
+		return false
+	}
+	if message.IsActionableWork() {
+		switch message.Status {
+		case WorkStateOpen, WorkStateInProgress, WorkStateBlocked:
+			return true
+		case WorkStateClosed:
+			return includeClosedWork
+		default:
+			return false
+		}
+	}
+	return message.Status == WorkStateOpen || (includeHooked && message.Status == WorkState("hooked"))
 }
 
 func appendWispMessages(messages []*Message, seen map[string]bool, wisps []wispQueryMessage) []*Message {
@@ -601,7 +630,21 @@ func (m *Mailbox) MarkRead(id string) error {
 	if m.legacy {
 		return m.markReadLegacy(id)
 	}
+	msg, err := m.Get(id)
+	if err != nil {
+		return err
+	}
+	if err := ensureGenericCloseAllowed(msg); err != nil {
+		return err
+	}
 	return m.markReadBeads(id)
+}
+
+func ensureGenericCloseAllowed(msg *Message) error {
+	if msg != nil && msg.IsActionableWork() && msg.Status != WorkStateClosed {
+		return fmt.Errorf("%w: use gt mail release or gt mail reply --complete for %s", ErrMailWorkRequiresLifecycle, msg.ID)
+	}
+	return nil
 }
 
 func (m *Mailbox) markReadBeads(id string) error {
@@ -926,6 +969,9 @@ func (m *Mailbox) Archive(id string) error {
 			// Underlying bead has been GC'd; nothing to archive or close.
 			return nil
 		}
+		return err
+	}
+	if err := ensureGenericCloseAllowed(msg); err != nil {
 		return err
 	}
 	if err := m.appendToArchive(msg); err != nil {

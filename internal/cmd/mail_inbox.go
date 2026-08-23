@@ -55,7 +55,7 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 
 	// Load the inbox once. Count() and ListUnread() both call List(), so using
 	// them here doubles the bd/Dolt reads on the hot patrol path.
-	messages, total, unread, err := loadInboxSnapshot(mailbox, mailInboxUnread)
+	messages, total, unread, err := loadInboxSnapshot(mailbox, mailInboxUnread, mailInboxAll)
 	if err != nil {
 		return fmt.Errorf("listing messages: %w", err)
 	}
@@ -112,10 +112,17 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 
 type inboxLister interface {
 	List() ([]*mail.Message, error)
+	ListAll() ([]*mail.Message, error)
 }
 
-func loadInboxSnapshot(mailbox inboxLister, unreadOnly bool) ([]*mail.Message, int, int, error) {
-	allMessages, err := mailbox.List()
+func loadInboxSnapshot(mailbox inboxLister, unreadOnly, includeClosedWork bool) ([]*mail.Message, int, int, error) {
+	var allMessages []*mail.Message
+	var err error
+	if includeClosedWork {
+		allMessages, err = mailbox.ListAll()
+	} else {
+		allMessages, err = mailbox.List()
+	}
 	if err != nil {
 		return nil, 0, 0, err
 	}

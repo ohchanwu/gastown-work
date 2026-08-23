@@ -60,7 +60,7 @@ func mailStoreCtx() (context.Context, context.CancelFunc) {
 
 // storeListFromDir queries messages using the in-process store.
 // Returns messages where identity is the assignee.
-func (m *Mailbox) storeListFromDir() ([]*Message, error) {
+func (m *Mailbox) storeListFromDir(includeClosedWork bool) ([]*Message, error) {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
 
@@ -88,9 +88,10 @@ func (m *Mailbox) storeListFromDir() ([]*Message, error) {
 			if seen[si.ID] {
 				continue
 			}
-			if si.Status == beadsdk.StatusOpen || string(si.Status) == "hooked" {
+			message := sdkIssueToMessage(si)
+			if mailMessageVisible(message, true, includeClosedWork) {
 				seen[si.ID] = true
-				messages = append(messages, sdkIssueToMessage(si))
+				messages = append(messages, message)
 			}
 		}
 	}

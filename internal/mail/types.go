@@ -457,6 +457,10 @@ func (bm *BeadsMessage) ToMessage() *Message {
 	for _, cc := range bm.cc {
 		ccAddrs = append(ccAddrs, identityToAddress(cc))
 	}
+	read := bm.HasLabel("read")
+	if !bm.HasLabel(MailWorkLabel) {
+		read = read || bm.Status == "closed"
+	}
 
 	return &Message{
 		ID:              bm.ID,
@@ -465,7 +469,7 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		Subject:         bm.Title,
 		Body:            bm.Description,
 		Timestamp:       bm.CreatedAt,
-		Read:            bm.Status == "closed" || bm.HasLabel("read"),
+		Read:            read,
 		Status:          WorkState(bm.Status),
 		Labels:          append([]string(nil), bm.Labels...),
 		Metadata:        append(json.RawMessage(nil), bm.Metadata...),

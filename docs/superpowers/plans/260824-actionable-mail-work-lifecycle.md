@@ -163,15 +163,15 @@ contributor work.
 - Modify: `internal/cmd/mail_inbox_test.go`
 - Modify: `internal/cmd/mail_archive_test.go`
 
-- [ ] Write failing tests showing enrolled `open`, `in_progress`, and `blocked`
+- [x] Write failing tests showing enrolled `open`, `in_progress`, and `blocked`
   mail remains in the normal inbox according to its `read` label, while
   `--all` also includes closed work.
-- [ ] Write failing tests that generic delete/archive/close rejects nonterminal
+- [x] Write failing tests that generic delete/archive/close rejects nonterminal
   enrolled work and points to release or complete. Keep legacy mail behavior.
-- [ ] Update both SDK and subprocess query/conversion paths so issue status is
+- [x] Update both SDK and subprocess query/conversion paths so issue status is
   work state and `read` is presentation state for enrolled mail.
-- [ ] Run focused mail and command tests.
-- [ ] Commit: `fix(mail): separate task state from inbox reading`
+- [x] Run focused mail and command tests.
+- [x] Commit: `fix(mail): separate task state from inbox reading`
 
 ## Task 7: Add additive status and startup discovery
 

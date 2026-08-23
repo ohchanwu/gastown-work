@@ -110,7 +110,7 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 
 	// Load the inbox once. The inject path needs unread messages later, and
 	// calling Count() followed by ListUnread() doubles bd/Dolt reads.
-	messages, _, unread, err := loadInboxSnapshot(mailbox, false)
+	messages, _, unread, err := loadInboxSnapshot(mailbox, false, false)
 	if err != nil {
 		if mailCheckInject {
 			fmt.Fprintf(os.Stderr, "gt mail check: inbox load error for %s: %v\n", address, err)
