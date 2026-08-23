@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -181,6 +182,32 @@ func TestOutputRoleDirectives(t *testing.T) {
 			t.Errorf("expected directive content, got: %s", out)
 		}
 	})
+}
+
+func TestRenderPendingMailWorkRequiresClaimBeforeActing(t *testing.T) {
+	metadata, err := mail.EncodeMailWorkMetadata(nil, &mail.WorkMetadata{Schema: mail.MailWorkSchema, Route: mail.WorkRouteDirect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := []*mail.Message{
+		{ID: "hq-pending", Subject: "Review exact object", From: "mayor/", To: "gastown/Toast", Type: mail.TypeTask, Status: mail.WorkStateOpen, Labels: []string{"gt:message", mail.MailWorkLabel}, Metadata: metadata},
+		{ID: "hq-active", Subject: "Already claimed", From: "mayor/", To: "gastown/Toast", Type: mail.TypeTask, Status: mail.WorkStateInProgress, Labels: []string{"gt:message", mail.MailWorkLabel}},
+		{ID: "hq-malformed", Subject: "Broken enrollment", From: "mayor/", To: "gastown/Toast", Type: mail.TypeTask, Status: mail.WorkStateOpen, Labels: []string{"gt:message", mail.MailWorkLabel}},
+		{ID: "hq-note", Subject: "FYI", From: "mayor/", To: "gastown/Toast", Type: mail.TypeNotification, Status: mail.WorkStateOpen, Labels: []string{"gt:message"}},
+	}
+	var output bytes.Buffer
+	renderPendingMailWork(&output, messages)
+	text := output.String()
+	for _, want := range []string{"Pending Task Mail", "hq-pending", "Review exact object", "gt mail claim --id hq-pending", "claim before acting"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("pending mail output missing %q: %s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"hq-active", "hq-malformed", "hq-note"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("pending mail output included %q: %s", unwanted, text)
+		}
+	}
 }
 
 func TestContainedWitnessPrimeGuidanceIsExactlyBrokerSafe(t *testing.T) {

@@ -2,15 +2,19 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func captureStderr(t *testing.T, fn func()) string {
@@ -72,6 +76,90 @@ func TestDiscoverRigAgents_UsesRigPrefix(t *testing.T) {
 	}
 	if agents[0].WorkTitle != "Pinned" {
 		t.Fatalf("agent WorkTitle = %q, want %q", agents[0].WorkTitle, "Pinned")
+	}
+}
+
+func TestAgentRuntimeMailWorkIsAdditiveToPrimaryWork(t *testing.T) {
+	agent := AgentRuntime{Address: "gastown/Toast", HasWork: false}
+	messages := statusMailWorkMessages(t)
+	populateMailWorkInfo(&agent, messages, func(generation mail.WorkGeneration) bool {
+		return generation.Name == "gt-gastown-Toast"
+	})
+
+	if agent.HasWork {
+		t.Fatal("secondary mail changed has_work")
+	}
+	if !agent.HasMailWork || !agent.HasAnyWork {
+		t.Fatalf("mail work flags = %v/%v", agent.HasMailWork, agent.HasAnyWork)
+	}
+	if agent.PendingMailWork != 1 || len(agent.MailWork) != 2 {
+		t.Fatalf("pending/owned = %d/%d", agent.PendingMailWork, len(agent.MailWork))
+	}
+	if agent.MailWork[0].Status != mail.WorkStateInProgress || agent.MailWork[1].Status != mail.WorkStateBlocked {
+		t.Fatalf("mail work = %#v", agent.MailWork)
+	}
+
+	payload, err := json.Marshal(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonText := string(payload)
+	for _, want := range []string{
+		`"has_work":false`, `"has_mail_work":true`, `"has_any_work":true`,
+		`"pending_mail_work":1`, `"mail_work":[`,
+	} {
+		if !strings.Contains(jsonText, want) {
+			t.Fatalf("status JSON missing %s: %s", want, jsonText)
+		}
+	}
+
+	var output bytes.Buffer
+	renderAgentDetails(&output, agent, "", nil, t.TempDir())
+	for _, want := range []string{"hook: (none)", "mail work: in_progress", "mail work: blocked", "pending task mail: 1"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("human status missing %q: %s", want, output.String())
+		}
+	}
+	output.Reset()
+	renderAgentCompact(&output, agent, "", nil, "")
+	for _, want := range []string{"active:1", "blocked:1", "pending:1"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("compact status missing %q: %s", want, output.String())
+		}
+	}
+}
+
+func statusMailWorkMessages(t *testing.T) []*mail.Message {
+	t.Helper()
+	now := time.Date(2026, time.August, 24, 8, 0, 0, 0, time.UTC)
+	generation := mail.WorkGenerationFromTmux(tmux.SessionGeneration{
+		Name: "gt-gastown-Toast", SessionID: "$8", PaneID: "%12", Nonce: "generation-nonce",
+		Custody: "custody-marker", ServerPID: 4242, ServerIdentity: "server-start-identity",
+		Transport: tmux.SessionTransport{Bound: true, SocketName: "gastown", SocketPath: "/tmp/tmux-test/gastown"},
+	})
+	makeMessage := func(id string, state mail.WorkState, work *mail.WorkMetadata) *mail.Message {
+		metadata, err := mail.EncodeMailWorkMetadata(nil, work)
+		if err != nil {
+			t.Fatal(err)
+		}
+		message := &mail.Message{
+			ID: id, From: "mayor/", To: "gastown/Toast", Subject: id, Type: mail.TypeTask,
+			Status: state, Labels: []string{"gt:message", mail.MailWorkLabel}, Metadata: metadata,
+		}
+		if !message.IsActionableWork() {
+			t.Fatalf("%s is not actionable", id)
+		}
+		parsed, err := mail.ParseMailWorkMetadata(message.Metadata)
+		if err != nil || parsed.Validate(state) != nil {
+			t.Fatalf("%s metadata invalid: parse=%v validate=%v", id, err, parsed.Validate(state))
+		}
+		return message
+	}
+	claim := &mail.WorkClaim{Actor: "gastown/Toast", ClaimedAt: now, Generation: generation}
+	return []*mail.Message{
+		makeMessage("pending", mail.WorkStateOpen, &mail.WorkMetadata{Schema: mail.MailWorkSchema, Route: mail.WorkRouteDirect}),
+		makeMessage("active", mail.WorkStateInProgress, &mail.WorkMetadata{Schema: mail.MailWorkSchema, Route: mail.WorkRouteDirect, Claim: claim}),
+		makeMessage("blocked", mail.WorkStateBlocked, &mail.WorkMetadata{Schema: mail.MailWorkSchema, Route: mail.WorkRouteDirect, Claim: claim, Blocked: &mail.WorkBlock{Reason: "dependency", At: now.Add(time.Minute)}}),
 	}
 }
 

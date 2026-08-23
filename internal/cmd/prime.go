@@ -249,6 +249,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	outputMoleculeContext(ctx)
 	outputCheckpointContext(ctx)
 	runPrimeExternalTools(ctx, cwd)
+	outputPendingMailWork(ctx)
 
 	if ctx.Role == RoleMayor {
 		checkPendingEscalations(ctx)

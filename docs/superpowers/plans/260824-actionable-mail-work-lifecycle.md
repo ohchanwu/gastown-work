@@ -182,15 +182,17 @@ contributor work.
 - Modify: `internal/cmd/prime_output.go`
 - Modify: `internal/cmd/prime_output_test.go`
 
-- [ ] Write failing JSON and human-output tests for active, blocked, and pending
+- [x] Write failing JSON and human-output tests for active, blocked, and pending
   mail work, including `has_work=false`, `has_mail_work=true`, and
   `has_any_work=true`.
-- [ ] Preserve every existing `has_work` assertion and add the minimal fields:
+- [x] Preserve every existing `has_work` assertion and add the minimal fields:
   `has_mail_work`, `has_any_work`, `mail_work`, and pending-mail count.
-- [ ] Add startup output that lists pending enrolled tasks separately and tells
+- [x] Add startup output that lists pending enrolled tasks separately and tells
   the agent to claim before acting. Do not auto-hook or auto-claim.
-- [ ] Run focused status/prime tests, then `go test ./internal/cmd`.
-- [ ] Commit: `feat(status): report secondary mail work`
+- [x] Run focused status/prime tests, then `go test ./internal/cmd`. Focused
+  tests pass; the full package reaches the unchanged baseline failure
+  `TestDogDoneInsideOwnedTmuxSessionFinalizesOutsidePane`.
+- [x] Commit: `feat(status): report secondary mail work`
 
 ## Task 8: Add generation-safe recovery and Reaper protection
 

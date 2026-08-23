@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -656,6 +657,48 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("1. Run `" + cli.Name() + " prime` (loads full context)")
 		fmt.Println("2. Run `" + cli.Name() + " boot triage` immediately")
 		fmt.Println("3. When triage completes, exit cleanly")
+	}
+}
+
+func outputPendingMailWork(ctx RoleContext) {
+	identity := getAgentIdentity(ctx)
+	if identity == "" || ctx.WorkDir == "" {
+		return
+	}
+	router := mail.NewRouter(ctx.WorkDir)
+	mailbox, err := router.GetMailbox(identity)
+	if err != nil {
+		style.PrintWarning("could not inspect pending task mail: %v", err)
+		return
+	}
+	messages, err := mailbox.List()
+	if err != nil {
+		style.PrintWarning("could not inspect pending task mail: %v", err)
+		return
+	}
+	renderPendingMailWork(os.Stdout, messages)
+}
+
+func renderPendingMailWork(w io.Writer, messages []*mail.Message) {
+	var pending []*mail.Message
+	for _, message := range messages {
+		if message == nil || !message.IsActionableWork() || message.Status != mail.WorkStateOpen {
+			continue
+		}
+		work, err := mail.ParseMailWorkMetadata(message.Metadata)
+		if err == nil && work.Validate(mail.WorkStateOpen) == nil {
+			pending = append(pending, message)
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "## Pending Task Mail")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "These tasks are durable but unclaimed. You must claim before acting; reading does not claim work.")
+	for _, message := range pending {
+		fmt.Fprintf(w, "- `%s mail claim --id %s` — %s\n", cli.Name(), message.ID, message.Subject)
 	}
 }
 
