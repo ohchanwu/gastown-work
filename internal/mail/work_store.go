@@ -22,11 +22,178 @@ type MailWorkStore struct {
 	now   func() time.Time
 }
 
+type MailWorkGenerationState string
+
+const (
+	MailWorkGenerationLive      MailWorkGenerationState = "live"
+	MailWorkGenerationDead      MailWorkGenerationState = "dead"
+	MailWorkGenerationReplaced  MailWorkGenerationState = "replaced"
+	MailWorkGenerationMissing   MailWorkGenerationState = "missing"
+	MailWorkGenerationMalformed MailWorkGenerationState = "malformed"
+	MailWorkGenerationUnknown   MailWorkGenerationState = "unknown"
+)
+
+func ClassifyMailWorkGeneration(receipt *WorkGeneration, capture func(WorkGeneration) (tmux.SessionGeneration, error)) MailWorkGenerationState {
+	if receipt == nil {
+		return MailWorkGenerationMissing
+	}
+	if err := receipt.validate(); err != nil {
+		return MailWorkGenerationMalformed
+	}
+	if capture == nil {
+		return MailWorkGenerationUnknown
+	}
+	current, err := capture(*receipt)
+	if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
+		return MailWorkGenerationDead
+	}
+	if err != nil {
+		return MailWorkGenerationUnknown
+	}
+	observed := WorkGenerationFromTmux(current)
+	if err := observed.validate(); err != nil {
+		return MailWorkGenerationUnknown
+	}
+	if receipt.Equal(observed) {
+		return MailWorkGenerationLive
+	}
+	return MailWorkGenerationReplaced
+}
+
+func ObserveMailWorkGeneration(receipt *WorkGeneration) MailWorkGenerationState {
+	return ClassifyMailWorkGeneration(receipt, func(generation WorkGeneration) (tmux.SessionGeneration, error) {
+		transport, err := tmux.NewTmuxForSessionGeneration(generation.Tmux())
+		if err != nil {
+			return tmux.SessionGeneration{}, err
+		}
+		return transport.CaptureSessionGeneration(generation.Name)
+	})
+}
+
+type MailWorkRecoveryAction string
+
+const (
+	MailWorkRecoveryPreserved MailWorkRecoveryAction = "preserved"
+	MailWorkRecoveryReopened  MailWorkRecoveryAction = "reopened"
+	MailWorkRecoveryNeeds     MailWorkRecoveryAction = "NEEDS_RECOVERY"
+)
+
+type MailWorkRecoveryScan struct {
+	Status     WorkState
+	Generation WorkGeneration
+}
+
+type MailWorkRecoveryResult struct {
+	ID              string
+	Status          WorkState
+	Owner           string
+	GenerationState MailWorkGenerationState
+	Action          MailWorkRecoveryAction
+	Reason          string
+}
+
 func NewMailWorkStore(store beadsdk.Storage) *MailWorkStore {
 	return &MailWorkStore{store: store, now: time.Now}
 }
 
 type QueueClaimEligibility func(queue, actor string) bool
+
+// Recover conditionally reopens only work whose exact owning generation is
+// proven dead. The scan tuple is revalidated inside the transaction so a
+// concurrent owner transition always wins.
+func (s *MailWorkStore) Recover(ctx context.Context, id, actor string, scan MailWorkRecoveryScan, evidence MailWorkGenerationState) (MailWorkRecoveryResult, error) {
+	actor = AddressToIdentity(actor)
+	result := MailWorkRecoveryResult{
+		ID:              id,
+		Status:          scan.Status,
+		GenerationState: evidence,
+		Action:          MailWorkRecoveryNeeds,
+	}
+	if scan.Status != WorkStateInProgress && scan.Status != WorkStateBlocked {
+		result.Reason = "scanned state is not recoverable"
+		return result, nil
+	}
+	if err := scan.Generation.validate(); err != nil {
+		result.Reason = "missing or malformed generation receipt"
+		return result, nil
+	}
+
+	err := s.runTransaction(ctx, "gt: recover mail work "+id, func(tx beadsdk.Transaction) error {
+		issue, message, work, err := loadMailWork(ctx, tx, id)
+		if err != nil {
+			if errors.Is(err, ErrMailWorkInvalid) || errors.Is(err, ErrMessageNotFound) {
+				result.Reason = err.Error()
+				return nil
+			}
+			return err
+		}
+		result.Status = WorkState(issue.Status)
+		if work.Claim != nil {
+			result.Owner = work.Claim.Actor
+		}
+		if WorkState(issue.Status) != scan.Status || work.Claim == nil || !work.Claim.Generation.Equal(scan.Generation) {
+			result.Reason = "mail work changed after scan"
+			return nil
+		}
+
+		switch evidence {
+		case MailWorkGenerationLive:
+			result.Action = MailWorkRecoveryPreserved
+			result.Reason = "exact owner generation is live"
+			return nil
+		case MailWorkGenerationDead, MailWorkGenerationReplaced:
+			if scan.Status == WorkStateBlocked {
+				result.Reason = "blocked work requires owner-routed recovery"
+				return nil
+			}
+		case MailWorkGenerationMissing, MailWorkGenerationMalformed, MailWorkGenerationUnknown:
+			result.Reason = "owner generation is not proven dead"
+			return nil
+		default:
+			result.Reason = "unrecognized generation evidence"
+			return nil
+		}
+
+		work.Claim = nil
+		if err := work.Validate(WorkStateOpen); err != nil {
+			result.Reason = "record cannot be safely reopened: " + err.Error()
+			return nil
+		}
+		metadata, err := EncodeMailWorkMetadata(issue.Metadata, work)
+		if err != nil {
+			return err
+		}
+		updates := map[string]interface{}{
+			"status":   string(WorkStateOpen),
+			"metadata": metadata,
+		}
+		if work.Route == WorkRouteQueue {
+			updates["assignee"] = "queue:" + message.Queue
+		}
+		for _, label := range issue.Labels {
+			if strings.HasPrefix(label, "claimed-by:") || strings.HasPrefix(label, "claimed-at:") {
+				if err := tx.RemoveLabel(ctx, id, label, actor); err != nil {
+					return err
+				}
+			}
+		}
+		if err := tx.UpdateIssue(ctx, id, updates, actor); err != nil {
+			return err
+		}
+		if err := tx.AddComment(ctx, id, actor, "mail work reopened after proven-dead owner generation"); err != nil {
+			return err
+		}
+		result.Status = WorkStateOpen
+		result.Owner = ""
+		result.Action = MailWorkRecoveryReopened
+		result.Reason = "exact owner generation is dead"
+		return nil
+	})
+	if err != nil {
+		return MailWorkRecoveryResult{}, err
+	}
+	return result, nil
+}
 
 func (s *MailWorkStore) Claim(ctx context.Context, id, actor string, generation tmux.SessionGeneration, eligible QueueClaimEligibility) (*WorkMetadata, error) {
 	actor = AddressToIdentity(actor)

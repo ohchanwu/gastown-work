@@ -207,18 +207,23 @@ contributor work.
 - Modify: `internal/cmd/reaper.go`
 - Modify: `internal/cmd/reaper_test.go`
 
-- [ ] Write failing tests for live, dead, replaced, missing, and malformed
+- [x] Write failing tests for live, dead, replaced, missing, and malformed
   generation receipts. Unknown or contradictory evidence must return
   `NEEDS_RECOVERY` without mutation.
-- [ ] Add a compare-and-swap recovery test where a concurrent transition wins;
+- [x] Add a compare-and-swap recovery test where a concurrent transition wins;
   recovery must preserve the newer state.
-- [ ] Reuse existing tmux exact-generation liveness checks. Reopen only
+- [x] Reuse existing tmux exact-generation liveness checks. Reopen only
   `in_progress` work whose scanned status and generation still match and whose
   exact owner is proven dead. Preserve and escalate dead-owner blocked work.
-- [ ] Add nonterminal `gt:mail-work` exclusions to stale auto-close and purge
+- [x] Add nonterminal `gt:mail-work` exclusions to stale auto-close and purge
   candidate selection, including unknown-state preservation.
-- [ ] Run focused patrol/Reaper tests and affected package suites.
-- [ ] Commit: `fix(reaper): preserve and recover mail work safely`
+- [x] Run focused patrol/Reaper tests and affected package suites. The focused
+  tests, isolated Dolt SQL tests, and full mail/Reaper packages pass. The full
+  command package has only the unchanged baseline failure
+  `TestDogDoneInsideOwnedTmuxSessionFinalizesOutsidePane`.
+- [x] Keep the Reaper CLI unchanged because it already routes through the
+  protected shared package; no duplicate command-layer guard is needed.
+- [x] Commit: `fix(reaper): preserve and recover mail work safely`
 
 ## Task 9: Prove the end-to-end contract
 

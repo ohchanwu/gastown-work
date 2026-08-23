@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/witness"
 )
 
@@ -41,6 +42,18 @@ func TestPatrolScanOutputJSON(t *testing.T) {
 					WasActive:      true,
 				},
 			},
+		},
+		MailWork: &PatrolScanMailWorkOutput{
+			Checked:       2,
+			Reopened:      1,
+			NeedsRecovery: 1,
+			Items: []PatrolScanMailWorkItem{{
+				ID:              "hq-task",
+				Owner:           "gastown/alpha",
+				Status:          "blocked",
+				GenerationState: "dead",
+				Action:          "NEEDS_RECOVERY",
+			}},
 		},
 		Receipts: []witness.PatrolReceipt{
 			{
@@ -94,6 +107,33 @@ func TestPatrolScanOutputJSON(t *testing.T) {
 	}
 	if parsed.Receipts[0].Verdict != witness.PatrolVerdictStale {
 		t.Errorf("receipt Verdict = %q, want %q", parsed.Receipts[0].Verdict, witness.PatrolVerdictStale)
+	}
+	if parsed.MailWork == nil || parsed.MailWork.Checked != 2 || parsed.MailWork.NeedsRecovery != 1 {
+		t.Fatalf("mail work output = %#v", parsed.MailWork)
+	}
+}
+
+func TestRecoverPatrolMailWorkPreservesMalformedRecords(t *testing.T) {
+	messages := []mail.BeadsMessage{{
+		ID:       "hq-malformed",
+		Status:   string(mail.WorkStateInProgress),
+		Metadata: json.RawMessage(`{"unrelated":true}`),
+	}}
+	observed := false
+	result := recoverPatrolMailWork(t.Context(), "gastown/witness", nil, messages, func(*mail.WorkGeneration) mail.MailWorkGenerationState {
+		observed = true
+		return mail.MailWorkGenerationDead
+	})
+
+	if observed {
+		t.Fatal("malformed receipt reached liveness observer")
+	}
+	if result.Checked != 1 || result.Reopened != 0 || result.NeedsRecovery != 1 || len(result.Items) != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	item := result.Items[0]
+	if item.Action != string(mail.MailWorkRecoveryNeeds) || item.GenerationState != string(mail.MailWorkGenerationMalformed) {
+		t.Fatalf("item = %#v", item)
 	}
 }
 

@@ -469,15 +469,16 @@ func TestAutoCloseExcludesControlPlaneIdentityRecords(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
 		issues: map[string]*fakeIssue{
-			"stale-task":         {id: "stale-task", title: "Stale task", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
-			"labeled-convoy":     {id: "labeled-convoy", title: "Tracked by convoy", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:convoy"}},
-			"typed-convoy":       {id: "typed-convoy", title: "Convoy", status: "open", issueType: "convoy", updatedAt: now.Add(-8 * 24 * time.Hour)},
-			"typed-agent":        {id: "typed-agent", title: "Agent", status: "open", issueType: "agent", updatedAt: now.Add(-8 * 24 * time.Hour)},
-			"protected-agent":    {id: "protected-agent", title: "Refinery identity", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:agent"}},
-			"protected-standing": {id: "protected-standing", title: "Standing order", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:standing-orders"}},
-			"protected-keep":     {id: "protected-keep", title: "Keep", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:keep"}},
-			"protected-role":     {id: "protected-role", title: "Role", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:role"}},
-			"protected-rig":      {id: "protected-rig", title: "Rig", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:rig"}},
+			"stale-task":          {id: "stale-task", title: "Stale task", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"protected-mail-work": {id: "protected-mail-work", title: "Actionable mail", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:mail-work"}},
+			"labeled-convoy":      {id: "labeled-convoy", title: "Tracked by convoy", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:convoy"}},
+			"typed-convoy":        {id: "typed-convoy", title: "Convoy", status: "open", issueType: "convoy", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"typed-agent":         {id: "typed-agent", title: "Agent", status: "open", issueType: "agent", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"protected-agent":     {id: "protected-agent", title: "Refinery identity", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:agent"}},
+			"protected-standing":  {id: "protected-standing", title: "Standing order", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:standing-orders"}},
+			"protected-keep":      {id: "protected-keep", title: "Keep", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:keep"}},
+			"protected-role":      {id: "protected-role", title: "Role", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:role"}},
+			"protected-rig":       {id: "protected-rig", title: "Rig", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:rig"}},
 		},
 		ops: map[int][]string{},
 	}
@@ -502,7 +503,7 @@ func TestAutoCloseExcludesControlPlaneIdentityRecords(t *testing.T) {
 	if result.Closed != 1 || state.status("stale-task") != "closed" {
 		t.Fatalf("AutoClose live closed = %#v; stale task status = %q", result.ClosedEntries, state.status("stale-task"))
 	}
-	for _, id := range []string{"labeled-convoy", "typed-convoy", "typed-agent", "protected-agent", "protected-standing", "protected-keep", "protected-role", "protected-rig"} {
+	for _, id := range []string{"protected-mail-work", "labeled-convoy", "typed-convoy", "typed-agent", "protected-agent", "protected-standing", "protected-keep", "protected-role", "protected-rig"} {
 		if got := state.status(id); got != "open" {
 			t.Fatalf("AutoClose live changed protected identity %q to %q", id, got)
 		}
@@ -513,15 +514,17 @@ func TestAutoCloseRevalidatesEligibilityAtUpdate(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
 		issues: map[string]*fakeIssue{
-			"becomes-agent":   {id: "becomes-agent", title: "Agent race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
-			"gains-agent-tag": {id: "gains-agent-tag", title: "Label race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
-			"still-stale":     {id: "still-stale", title: "Still stale", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"becomes-agent":       {id: "becomes-agent", title: "Agent race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"gains-agent-tag":     {id: "gains-agent-tag", title: "Label race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"gains-mail-work-tag": {id: "gains-mail-work-tag", title: "Mail race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"still-stale":         {id: "still-stale", title: "Still stale", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
 		},
 		ops: map[int][]string{},
 	}
 	state.beforeAutoCloseUpdate = func(s *fakeReaperState) {
 		s.issues["becomes-agent"].issueType = "agent"
 		s.issues["gains-agent-tag"].labels = append(s.issues["gains-agent-tag"].labels, "gt:agent")
+		s.issues["gains-mail-work-tag"].labels = append(s.issues["gains-mail-work-tag"].labels, "gt:mail-work")
 	}
 	db := openFakeReaperDB(t, state)
 	t.Cleanup(func() { _ = db.Close() })
@@ -538,6 +541,9 @@ func TestAutoCloseRevalidatesEligibilityAtUpdate(t *testing.T) {
 	}
 	if got := state.status("gains-agent-tag"); got != "open" {
 		t.Fatalf("concurrently protected identity status = %q, want open", got)
+	}
+	if got := state.status("gains-mail-work-tag"); got != "open" {
+		t.Fatalf("concurrently enrolled mail work status = %q, want open", got)
 	}
 	transactionConnections := map[int]bool{}
 	for connectionID, operations := range state.opsSince(nil) {
@@ -590,13 +596,16 @@ func TestAutoCloseConditionalUpdateRunsOnIsolatedDolt(t *testing.T) {
 		`INSERT INTO issues (id, title, status, priority, issue_type, updated_at) VALUES
 			('stale-task', 'Stale task', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
 			('protected-agent', 'Agent identity', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
+			('protected-mail-work', 'Actionable mail', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
 			('mixed-dependent', 'Mixed dependency states', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
 			('closed-dependency', 'Closed dependency', 'closed', 3, 'task', NOW()),
 			('open-dependency', 'Open dependency', 'open', 3, 'task', NOW()),
 			('mixed-blocked', 'Mixed blocker states', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
 			('closed-blocker', 'Closed blocker', 'closed', 3, 'task', NOW()),
 			('open-blocker', 'Open blocker', 'open', 3, 'task', NOW())`,
-		`INSERT INTO labels (issue_id, label) VALUES ('protected-agent', 'gt:agent')`,
+		`INSERT INTO labels (issue_id, label) VALUES
+			('protected-agent', 'gt:agent'),
+			('protected-mail-work', 'gt:mail-work')`,
 		`INSERT INTO dependencies (issue_id, depends_on_issue_id) VALUES
 			('mixed-dependent', 'closed-dependency'),
 			('mixed-dependent', 'open-dependency'),
@@ -615,11 +624,14 @@ func TestAutoCloseConditionalUpdateRunsOnIsolatedDolt(t *testing.T) {
 	if result.Closed != 1 || len(result.ClosedEntries) != 1 || result.ClosedEntries[0].ID != "stale-task" {
 		t.Fatalf("AutoClose result = %#v, want only stale-task", result)
 	}
-	var staleStatus, protectedStatus, mixedDependentStatus, mixedBlockedStatus string
+	var staleStatus, protectedStatus, mailWorkStatus, mixedDependentStatus, mixedBlockedStatus string
 	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'stale-task'").Scan(&staleStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'protected-agent'").Scan(&protectedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'protected-mail-work'").Scan(&mailWorkStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'mixed-dependent'").Scan(&mixedDependentStatus); err != nil {
@@ -628,11 +640,62 @@ func TestAutoCloseConditionalUpdateRunsOnIsolatedDolt(t *testing.T) {
 	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'mixed-blocked'").Scan(&mixedBlockedStatus); err != nil {
 		t.Fatal(err)
 	}
-	if staleStatus != "closed" || protectedStatus != "open" || mixedDependentStatus != "open" || mixedBlockedStatus != "open" {
+	if staleStatus != "closed" || protectedStatus != "open" || mailWorkStatus != "open" || mixedDependentStatus != "open" || mixedBlockedStatus != "open" {
 		t.Fatalf(
-			"isolated statuses stale=%q protected=%q mixed-dependent=%q mixed-blocked=%q",
-			staleStatus, protectedStatus, mixedDependentStatus, mixedBlockedStatus,
+			"isolated statuses stale=%q protected=%q mail-work=%q mixed-dependent=%q mixed-blocked=%q",
+			staleStatus, protectedStatus, mailWorkStatus, mixedDependentStatus, mixedBlockedStatus,
 		)
+	}
+}
+
+func TestPurgeOldMailExcludesLifecycleHistoryOnIsolatedDolt(t *testing.T) {
+	if os.Getenv("GT_TEST_EXTERNAL_DOLT") != "1" ||
+		os.Getenv("GT_TEST_ISOLATED") != "1" ||
+		os.Getenv("GT_DOLT_HOST") != "127.0.0.1" {
+		t.Skip("requires the explicit isolated Dolt test harness")
+	}
+	port, err := strconv.Atoi(os.Getenv("GT_DOLT_PORT"))
+	if err != nil || port <= 0 || port == 33327 {
+		t.Fatalf("refusing non-isolated Dolt port %q", os.Getenv("GT_DOLT_PORT"))
+	}
+	dbName := fmt.Sprintf("reaper_mail_%d", time.Now().UnixNano())
+	rootDB, err := sql.Open("mysql", fmt.Sprintf("root@tcp(127.0.0.1:%d)/?parseTime=true", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rootDB.Close() })
+	if _, err := rootDB.Exec("CREATE DATABASE `" + dbName + "`"); err != nil {
+		t.Fatalf("create isolated database: %v", err)
+	}
+	t.Cleanup(func() { _, _ = rootDB.Exec("DROP DATABASE IF EXISTS `" + dbName + "`") })
+
+	db, err := OpenDB("127.0.0.1", port, dbName, 15*time.Second, 15*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, statement := range []string{
+		`CREATE TABLE issues (id VARCHAR(64) PRIMARY KEY, status VARCHAR(32) NOT NULL, closed_at DATETIME NULL)`,
+		`CREATE TABLE labels (issue_id VARCHAR(64) NOT NULL, label VARCHAR(64) NOT NULL)`,
+		`INSERT INTO issues (id, status, closed_at) VALUES
+			('ordinary-mail', 'closed', NOW() - INTERVAL 31 DAY),
+			('mail-work-history', 'closed', NOW() - INTERVAL 31 DAY)`,
+		`INSERT INTO labels (issue_id, label) VALUES
+			('ordinary-mail', 'gt:message'),
+			('mail-work-history', 'gt:message'),
+			('mail-work-history', 'gt:mail-work')`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("initialize isolated schema: %v\n%s", err, statement)
+		}
+	}
+
+	count, err := purgeOldMail(db, dbName, 30*24*time.Hour, true)
+	if err != nil {
+		t.Fatalf("purgeOldMail dry run: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("purgeOldMail candidates = %d, want only ordinary mail", count)
 	}
 }
 

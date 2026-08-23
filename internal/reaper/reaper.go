@@ -387,7 +387,7 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Count mail candidates.
 	// The issues/labels tables may not exist on the gt Dolt server if beads
 	// stores its data on a separate Dolt instance. Skip gracefully.
-	mailQuery := "SELECT COUNT(*) FROM issues WHERE status = 'closed' AND closed_at < ? AND id IN (SELECT issue_id FROM labels WHERE label = 'gt:message')"
+	mailQuery := "SELECT COUNT(*) FROM issues WHERE status = 'closed' AND closed_at < ? AND id IN (SELECT issue_id FROM labels WHERE label = 'gt:message') AND id NOT IN (SELECT issue_id FROM labels WHERE label = 'gt:mail-work')"
 	if err := db.QueryRowContext(ctx, mailQuery, now.Add(-mailDeleteAge)).Scan(&result.MailCandidates); err != nil {
 		if !isTableNotFound(err) {
 			return nil, fmt.Errorf("count mail candidates: %w", err)
@@ -407,7 +407,7 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		AND i.issue_type NOT IN ('epic', 'convoy', 'agent')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent')
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:mail-work')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
@@ -730,8 +730,8 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 	mailCutoff := time.Now().UTC().Add(-mailDeleteAge)
 
 	countQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM `%s`.issues WHERE status = 'closed' AND closed_at < ? AND id IN (SELECT issue_id FROM `%s`.labels WHERE label = 'gt:message')",
-		dbName, dbName)
+		"SELECT COUNT(*) FROM `%s`.issues WHERE status = 'closed' AND closed_at < ? AND id IN (SELECT issue_id FROM `%s`.labels WHERE label = 'gt:message') AND id NOT IN (SELECT issue_id FROM `%s`.labels WHERE label = 'gt:mail-work')",
+		dbName, dbName, dbName)
 	var count int
 	if err := db.QueryRowContext(ctx, countQuery, mailCutoff).Scan(&count); err != nil {
 		if isTableNotFound(err) {
@@ -755,8 +755,8 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 	}()
 
 	idQuery := fmt.Sprintf(
-		"SELECT i.id FROM `%s`.issues i INNER JOIN `%s`.labels l ON i.id = l.issue_id WHERE i.status = 'closed' AND i.closed_at < ? AND l.label = 'gt:message' LIMIT %d",
-		dbName, dbName, DefaultBatchSize)
+		"SELECT i.id FROM `%s`.issues i INNER JOIN `%s`.labels l ON i.id = l.issue_id WHERE i.status = 'closed' AND i.closed_at < ? AND l.label = 'gt:message' AND i.id NOT IN (SELECT issue_id FROM `%s`.labels WHERE label = 'gt:mail-work') LIMIT %d",
+		dbName, dbName, dbName, DefaultBatchSize)
 	auxTables := []string{"labels", "comments", "events", "dependencies"}
 
 	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, mailCutoff, "issues", auxTables)
@@ -806,7 +806,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		AND i.issue_type NOT IN ('epic', 'convoy', 'agent')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent')
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:mail-work')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
@@ -914,7 +914,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		`UPDATE %[1]s.issues i
 		LEFT JOIN %[1]s.labels protected_label
 			ON protected_label.issue_id = i.id
-			AND protected_label.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent')
+			AND protected_label.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:mail-work')
 		LEFT JOIN (
 			%[1]s.dependencies child_dependency
 			INNER JOIN %[1]s.issues open_dependency

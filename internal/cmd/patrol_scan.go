@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -76,7 +78,25 @@ type PatrolScanOutput struct {
 	Zombies     *PatrolScanZombieOutput   `json:"zombies"`
 	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
 	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
+	MailWork    *PatrolScanMailWorkOutput `json:"mail_work,omitempty"`
 	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+}
+
+type PatrolScanMailWorkOutput struct {
+	Checked       int                      `json:"checked"`
+	Reopened      int                      `json:"reopened"`
+	NeedsRecovery int                      `json:"needs_recovery"`
+	Items         []PatrolScanMailWorkItem `json:"items,omitempty"`
+	Errors        []string                 `json:"errors,omitempty"`
+}
+
+type PatrolScanMailWorkItem struct {
+	ID              string `json:"id"`
+	Owner           string `json:"owner,omitempty"`
+	Status          string `json:"status"`
+	GenerationState string `json:"generation_state"`
+	Action          string `json:"action"`
+	Reason          string `json:"reason,omitempty"`
 }
 
 // PatrolScanZombieOutput holds zombie detection results.
@@ -172,6 +192,9 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	completionResult := runPatrolScanPhase(diagnostics, "completion discovery", func() *witness.DiscoverCompletionsResult {
 		return witness.DiscoverCompletions(bd, workDir, rigName, router)
 	})
+	mailWorkResult := runPatrolScanPhase(diagnostics, "mail work recovery", func() *PatrolScanMailWorkOutput {
+		return scanPatrolMailWork(townRoot, rigName)
+	})
 
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
@@ -186,12 +209,111 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 			sendZombieNotification(router, rigName, zombieResult, activeZombies)
 		}
 	}
-
-	if patrolScanJSON {
-		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts)
+	if mailWorkResult != nil && mailWorkResult.NeedsRecovery > 0 {
+		sendMailWorkRecoveryNotification(router, rigName, mailWorkResult)
 	}
 
-	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
+	if patrolScanJSON {
+		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, mailWorkResult, receipts)
+	}
+
+	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, mailWorkResult, receipts)
+}
+
+func scanPatrolMailWork(townRoot, rigName string) *PatrolScanMailWorkOutput {
+	result := &PatrolScanMailWorkOutput{}
+	beadsDir := beads.ResolveBeadsDir(townRoot)
+	bd := beads.NewWithBeadsDir(townRoot, beadsDir)
+	raw, err := bd.Run("list", "--label="+mail.MailWorkLabel, "--status=all", "--json", "--flat", "--no-pager", "--limit=0")
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("list mail work: %v", err))
+		return result
+	}
+	var messages []mail.BeadsMessage
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("parse mail work: %v", err))
+		return result
+	}
+	active := messages[:0]
+	for _, message := range messages {
+		if message.Status == string(mail.WorkStateInProgress) || message.Status == string(mail.WorkStateBlocked) {
+			active = append(active, message)
+		}
+	}
+	if len(active) == 0 {
+		return result
+	}
+
+	openCtx, openCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	store, cleanup, err := bd.OpenStore(openCtx)
+	openCancel()
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("open mail work store: %v", err))
+		return result
+	}
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return recoverPatrolMailWork(ctx, rigName+"/witness", mail.NewMailWorkStore(store), active, mail.ObserveMailWorkGeneration)
+}
+
+func recoverPatrolMailWork(ctx context.Context, actor string, store *mail.MailWorkStore, messages []mail.BeadsMessage, observe func(*mail.WorkGeneration) mail.MailWorkGenerationState) *PatrolScanMailWorkOutput {
+	result := &PatrolScanMailWorkOutput{}
+	for _, message := range messages {
+		state := mail.WorkState(message.Status)
+		if state != mail.WorkStateInProgress && state != mail.WorkStateBlocked {
+			continue
+		}
+		result.Checked++
+		item := PatrolScanMailWorkItem{ID: message.ID, Status: message.Status, Action: string(mail.MailWorkRecoveryNeeds)}
+		work, err := mail.ParseMailWorkMetadata(message.Metadata)
+		if err != nil || work == nil || work.Claim == nil || work.Validate(state) != nil {
+			item.GenerationState = string(mail.MailWorkGenerationMalformed)
+			item.Reason = "missing or malformed mail work metadata"
+			result.NeedsRecovery++
+			result.Items = append(result.Items, item)
+			continue
+		}
+		item.Owner = work.Claim.Actor
+		evidence := observe(&work.Claim.Generation)
+		recovery, err := store.Recover(ctx, message.ID, actor, mail.MailWorkRecoveryScan{Status: state, Generation: work.Claim.Generation}, evidence)
+		if err != nil {
+			item.GenerationState = string(evidence)
+			item.Reason = err.Error()
+			result.NeedsRecovery++
+			result.Items = append(result.Items, item)
+			continue
+		}
+		item.Status = string(recovery.Status)
+		item.Owner = recovery.Owner
+		item.GenerationState = string(recovery.GenerationState)
+		item.Action = string(recovery.Action)
+		item.Reason = recovery.Reason
+		switch recovery.Action {
+		case mail.MailWorkRecoveryReopened:
+			result.Reopened++
+		case mail.MailWorkRecoveryNeeds:
+			result.NeedsRecovery++
+		}
+		result.Items = append(result.Items, item)
+	}
+	return result
+}
+
+func sendMailWorkRecoveryNotification(router *mail.Router, rigName string, result *PatrolScanMailWorkOutput) {
+	lines := []string{"Actionable mail work requires conservative recovery:"}
+	for _, item := range result.Items {
+		if item.Action == string(mail.MailWorkRecoveryNeeds) {
+			lines = append(lines, fmt.Sprintf("- %s: status=%s owner=%s generation=%s reason=%s", item.ID, item.Status, item.Owner, item.GenerationState, item.Reason))
+		}
+	}
+	_ = router.Send(&mail.Message{
+		From:    rigName + "/witness",
+		To:      "mayor/",
+		Subject: fmt.Sprintf("MAIL_WORK_RECOVERY_NEEDED: %d task(s)", result.NeedsRecovery),
+		Body:    strings.Join(lines, "\n"),
+		Type:    mail.TypeNotification,
+	})
 }
 
 func runPatrolScanPhase[T any](diagnostics io.Writer, name string, fn func() T) T {
@@ -290,10 +412,11 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 	_ = router.Send(mayorMsg)
 }
 
-func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, receipts []witness.PatrolReceipt) error {
+func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, mailWorkResult *PatrolScanMailWorkOutput, receipts []witness.PatrolReceipt) error {
 	output := PatrolScanOutput{
 		Rig:       rigName,
 		Timestamp: timestamp,
+		MailWork:  mailWorkResult,
 		Receipts:  receipts,
 	}
 
@@ -371,7 +494,7 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 	return enc.Encode(output)
 }
 
-func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt) error {
+func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, mailWorkResult *PatrolScanMailWorkOutput, _ []witness.PatrolReceipt) error {
 	fmt.Printf("%s Patrol scan: %s\n\n", style.Bold.Render("🔍"), rigName)
 
 	// Zombies
@@ -478,6 +601,21 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 	} else {
 		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d completion(s)\n",
 			zombieCount, activeCount, stallCount, completionCount)
+	}
+
+	if mailWorkResult != nil && (mailWorkResult.Checked > 0 || len(mailWorkResult.Errors) > 0 || patrolScanVerbose) {
+		fmt.Printf("%s Mail Work Recovery: checked %d, reopened %d, needs recovery %d\n",
+			style.Bold.Render("📨"), mailWorkResult.Checked, mailWorkResult.Reopened, mailWorkResult.NeedsRecovery)
+		for _, item := range mailWorkResult.Items {
+			fmt.Printf("  %s: %s (%s, %s)\n", item.ID, item.Action, item.Status, item.GenerationState)
+			if item.Reason != "" {
+				fmt.Printf("    %s\n", style.Dim.Render(item.Reason))
+			}
+		}
+		for _, scanErr := range mailWorkResult.Errors {
+			fmt.Printf("  %s\n", style.Dim.Render("Error: "+scanErr))
+		}
+		fmt.Println()
 	}
 
 	return nil

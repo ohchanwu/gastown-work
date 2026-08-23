@@ -92,6 +92,121 @@ func TestMailWorkStoreClaimRejectsContenders(t *testing.T) {
 	}
 }
 
+func TestClassifyMailWorkGenerationEvidence(t *testing.T) {
+	generation := testWorkGeneration()
+	replacement := generation.Tmux()
+	replacement.Nonce = "replacement-generation"
+
+	tests := []struct {
+		name    string
+		receipt *WorkGeneration
+		capture func(WorkGeneration) (tmux.SessionGeneration, error)
+		want    MailWorkGenerationState
+	}{
+		{name: "live", receipt: &generation, capture: func(g WorkGeneration) (tmux.SessionGeneration, error) { return g.Tmux(), nil }, want: MailWorkGenerationLive},
+		{name: "dead", receipt: &generation, capture: func(WorkGeneration) (tmux.SessionGeneration, error) {
+			return tmux.SessionGeneration{}, tmux.ErrSessionNotFound
+		}, want: MailWorkGenerationDead},
+		{name: "replaced", receipt: &generation, capture: func(WorkGeneration) (tmux.SessionGeneration, error) { return replacement, nil }, want: MailWorkGenerationReplaced},
+		{name: "missing", want: MailWorkGenerationMissing},
+		{name: "malformed", receipt: &WorkGeneration{}, want: MailWorkGenerationMalformed},
+		{name: "unknown", receipt: &generation, capture: func(WorkGeneration) (tmux.SessionGeneration, error) {
+			return tmux.SessionGeneration{}, errors.New("tmux unreadable")
+		}, want: MailWorkGenerationUnknown},
+		{name: "contradictory empty capture", receipt: &generation, capture: func(WorkGeneration) (tmux.SessionGeneration, error) {
+			return tmux.SessionGeneration{}, nil
+		}, want: MailWorkGenerationUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClassifyMailWorkGeneration(tt.receipt, tt.capture); got != tt.want {
+				t.Fatalf("state = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMailWorkStoreRecoveryIsConservativeAndCASBound(t *testing.T) {
+	claimIssue := func(t *testing.T) (*fakeMailWorkStore, WorkGeneration) {
+		t.Helper()
+		store := newFakeMailWorkStore(t, testMailWorkIssue(t, WorkRouteDirect))
+		generation := testWorkGeneration()
+		if _, err := NewMailWorkStore(store).Claim(context.Background(), "hq-task", "gastown/Toast", generation.Tmux(), nil); err != nil {
+			t.Fatal(err)
+		}
+		return store, generation
+	}
+
+	t.Run("live owner is preserved", func(t *testing.T) {
+		store, generation := claimIssue(t)
+		result, err := NewMailWorkStore(store).Recover(context.Background(), "hq-task", "witness", MailWorkRecoveryScan{Status: WorkStateInProgress, Generation: generation}, MailWorkGenerationLive)
+		if err != nil || result.Action != MailWorkRecoveryPreserved || store.snapshot().Status != beadsdk.StatusInProgress {
+			t.Fatalf("result=%+v err=%v status=%s", result, err, store.snapshot().Status)
+		}
+	})
+
+	t.Run("proven dead owner is reopened", func(t *testing.T) {
+		store, generation := claimIssue(t)
+		result, err := NewMailWorkStore(store).Recover(context.Background(), "hq-task", "witness", MailWorkRecoveryScan{Status: WorkStateInProgress, Generation: generation}, MailWorkGenerationDead)
+		if err != nil || result.Action != MailWorkRecoveryReopened {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		issue := store.snapshot()
+		work, parseErr := ParseMailWorkMetadata(issue.Metadata)
+		if parseErr != nil || issue.Status != beadsdk.StatusOpen || work.Claim != nil {
+			t.Fatalf("reopened issue=%+v work=%+v parse=%v", issue, work, parseErr)
+		}
+		assertLabelCount(t, issue.Labels, "claimed-by:gastown/Toast", 0)
+	})
+
+	t.Run("replaced owner generation is reopened", func(t *testing.T) {
+		store, generation := claimIssue(t)
+		result, err := NewMailWorkStore(store).Recover(context.Background(), "hq-task", "witness", MailWorkRecoveryScan{Status: WorkStateInProgress, Generation: generation}, MailWorkGenerationReplaced)
+		if err != nil || result.Action != MailWorkRecoveryReopened || store.snapshot().Status != beadsdk.StatusOpen {
+			t.Fatalf("result=%+v err=%v status=%s", result, err, store.snapshot().Status)
+		}
+	})
+
+	t.Run("blocked dead owner needs recovery", func(t *testing.T) {
+		store, generation := claimIssue(t)
+		if _, err := NewMailWorkStore(store).Block(context.Background(), "hq-task", "gastown/Toast", generation.Tmux(), "dependency"); err != nil {
+			t.Fatal(err)
+		}
+		result, err := NewMailWorkStore(store).Recover(context.Background(), "hq-task", "witness", MailWorkRecoveryScan{Status: WorkStateBlocked, Generation: generation}, MailWorkGenerationDead)
+		if err != nil || result.Action != MailWorkRecoveryNeeds || store.snapshot().Status != beadsdk.StatusBlocked {
+			t.Fatalf("result=%+v err=%v status=%s", result, err, store.snapshot().Status)
+		}
+	})
+
+	t.Run("unknown evidence needs recovery", func(t *testing.T) {
+		store, generation := claimIssue(t)
+		result, err := NewMailWorkStore(store).Recover(context.Background(), "hq-task", "witness", MailWorkRecoveryScan{Status: WorkStateInProgress, Generation: generation}, MailWorkGenerationUnknown)
+		if err != nil || result.Action != MailWorkRecoveryNeeds || store.snapshot().Status != beadsdk.StatusInProgress {
+			t.Fatalf("result=%+v err=%v status=%s", result, err, store.snapshot().Status)
+		}
+	})
+
+	t.Run("concurrent transition wins", func(t *testing.T) {
+		store, generation := claimIssue(t)
+		if _, err := NewMailWorkStore(store).Block(context.Background(), "hq-task", "gastown/Toast", generation.Tmux(), "new blocker"); err != nil {
+			t.Fatal(err)
+		}
+		result, err := NewMailWorkStore(store).Recover(context.Background(), "hq-task", "witness", MailWorkRecoveryScan{Status: WorkStateInProgress, Generation: generation}, MailWorkGenerationDead)
+		if err != nil || result.Action != MailWorkRecoveryNeeds || store.snapshot().Status != beadsdk.StatusBlocked {
+			t.Fatalf("result=%+v err=%v status=%s", result, err, store.snapshot().Status)
+		}
+	})
+
+	t.Run("missing scan receipt needs recovery", func(t *testing.T) {
+		store, _ := claimIssue(t)
+		result, err := NewMailWorkStore(store).Recover(context.Background(), "hq-task", "witness", MailWorkRecoveryScan{Status: WorkStateInProgress}, MailWorkGenerationMissing)
+		if err != nil || result.Action != MailWorkRecoveryNeeds || store.snapshot().Status != beadsdk.StatusInProgress {
+			t.Fatalf("result=%+v err=%v status=%s", result, err, store.snapshot().Status)
+		}
+	})
+}
+
 func TestMailWorkStoreConcurrentClaimHasOneWinner(t *testing.T) {
 	store := newFakeMailWorkStore(t, testMailWorkIssue(t, WorkRouteQueue))
 	workStore := NewMailWorkStore(store)
