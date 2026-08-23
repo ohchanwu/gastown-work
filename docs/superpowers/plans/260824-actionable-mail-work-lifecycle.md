@@ -95,18 +95,18 @@ contributor work.
 - Modify: `internal/mail/work_store.go`
 - Modify: `internal/mail/work_store_test.go`
 
-- [ ] Write failing tests that complete `in_progress` and `blocked` work, create
+- [x] Write failing tests that complete `in_progress` and `blocked` work, create
   one persistent reply on the original thread, close the source, and return the
   original reply ID on retry.
-- [ ] Add rollback probes for failure after reply creation and before source
+- [x] Add rollback probes for failure after reply creation and before source
   closure; neither a reply nor a closure may survive.
-- [ ] Add fail-closed tests for closed work with absent or malformed completion
+- [x] Add fail-closed tests for closed work with absent or malformed completion
   metadata and for a non-owner generation.
-- [ ] Implement reply creation, completion metadata, source close, compatibility
-  label cleanup, and transition comment in one transaction. Generate retryable
+- [x] Implement reply creation, completion metadata, source close, compatibility
+  ownership summaries, and transition comment in one transaction. Generate retryable
   values outside the callback where needed; notify only after commit.
-- [ ] Run focused isolated tests and `go test ./internal/mail`.
-- [ ] Commit: `feat(mail): complete mail work atomically`
+- [x] Run focused isolated tests and `go test ./internal/mail`.
+- [x] Commit: `feat(mail): complete mail work atomically`
 
 ## Task 4: Enroll only newly sent permanent task mail
 

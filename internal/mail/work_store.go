@@ -140,6 +140,108 @@ func (s *MailWorkStore) Resume(ctx context.Context, id, actor string, generation
 	})
 }
 
+type MailWorkCompletionResult struct {
+	ReplyID string
+	Created bool
+}
+
+func (s *MailWorkStore) Complete(ctx context.Context, id, actor string, generation tmux.SessionGeneration, subject, body string) (MailWorkCompletionResult, error) {
+	actor = AddressToIdentity(actor)
+	if strings.TrimSpace(body) == "" {
+		return MailWorkCompletionResult{}, fmt.Errorf("%w: completion reply body is required", ErrMailWorkInvalid)
+	}
+	currentGeneration := WorkGenerationFromTmux(generation)
+	if err := currentGeneration.validate(); err != nil {
+		return MailWorkCompletionResult{}, fmt.Errorf("%w: %v", ErrMailWorkInvalid, err)
+	}
+	completedAt := s.now().UTC().Truncate(time.Second)
+	var result MailWorkCompletionResult
+	err := s.runTransaction(ctx, "gt: complete mail work "+id, func(tx beadsdk.Transaction) error {
+		issue, message, work, err := loadMailWork(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if work.Claim == nil || work.Claim.Actor != actor || !work.Claim.Generation.Equal(currentGeneration) {
+			return mailWorkConflict(id, issue.Status, work)
+		}
+		if issue.Status == beadsdk.StatusClosed {
+			result = MailWorkCompletionResult{ReplyID: work.Completion.ReplyID}
+			return nil
+		}
+		if issue.Status != beadsdk.StatusInProgress && issue.Status != beadsdk.StatusBlocked {
+			return mailWorkConflict(id, issue.Status, work)
+		}
+		if message.ThreadID == "" || message.From == "" {
+			return fmt.Errorf("%w: source message has no reply route", ErrMailWorkInvalid)
+		}
+		if strings.TrimSpace(subject) == "" {
+			subject = message.Subject
+			if !strings.HasPrefix(subject, "Re: ") {
+				subject = "Re: " + subject
+			}
+		}
+
+		replyMessage := &Message{
+			From:     actor,
+			To:       message.From,
+			Subject:  subject,
+			Body:     body,
+			Priority: PriorityNormal,
+			Type:     TypeReply,
+			ThreadID: message.ThreadID,
+			ReplyTo:  id,
+		}
+		labels := buildMessageLabels(replyMessage, true)
+		reply := &beadsdk.Issue{
+			Title:       replyMessage.Subject,
+			Description: replyMessage.Body,
+			Status:      beadsdk.StatusOpen,
+			Priority:    PriorityToBeads(replyMessage.Priority),
+			IssueType:   beadsdk.TypeTask,
+			Assignee:    AddressToIdentity(replyMessage.To),
+			CreatedAt:   completedAt,
+			UpdatedAt:   completedAt,
+			CreatedBy:   actor,
+		}
+		if err := tx.CreateIssue(ctx, reply, actor); err != nil {
+			return err
+		}
+		if reply.ID == "" {
+			return fmt.Errorf("%w: reply creation returned no ID", ErrMailWorkInvalid)
+		}
+		for _, label := range labels {
+			if err := tx.AddLabel(ctx, reply.ID, label, actor); err != nil {
+				return err
+			}
+		}
+
+		work.Blocked = nil
+		work.Completion = &WorkCompletion{ReplyID: reply.ID, CompletedAt: completedAt}
+		if err := work.Validate(WorkStateClosed); err != nil {
+			return fmt.Errorf("%w: %v", ErrMailWorkInvalid, err)
+		}
+		metadata, err := EncodeMailWorkMetadata(issue.Metadata, work)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrMailWorkInvalid, err)
+		}
+		if err := tx.UpdateIssue(ctx, id, map[string]interface{}{"metadata": metadata}, actor); err != nil {
+			return err
+		}
+		if err := tx.CloseIssue(ctx, id, "mail work completed", actor, generation.SessionID); err != nil {
+			return err
+		}
+		if err := tx.AddComment(ctx, id, actor, "mail work completed with reply "+reply.ID); err != nil {
+			return err
+		}
+		result = MailWorkCompletionResult{ReplyID: reply.ID, Created: true}
+		return nil
+	})
+	if err != nil {
+		return MailWorkCompletionResult{}, err
+	}
+	return result, nil
+}
+
 type ownedWorkMutation func(beadsdk.Transaction, *beadsdk.Issue, *Message, *WorkMetadata) (map[string]interface{}, error)
 
 func (s *MailWorkStore) transitionOwned(ctx context.Context, id, actor string, generation tmux.SessionGeneration, from, to WorkState, event string, mutate ownedWorkMutation) (*WorkMetadata, error) {

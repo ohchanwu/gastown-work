@@ -188,6 +188,106 @@ func TestMailWorkStoreTransitionFailureRollsBack(t *testing.T) {
 	assertLabelCount(t, issue.Labels, "claimed-by:gastown/Toast", 0)
 }
 
+func TestMailWorkStoreCompleteExactlyOnce(t *testing.T) {
+	store := newFakeMailWorkStore(t, testMailWorkIssue(t, WorkRouteDirect))
+	workStore := NewMailWorkStore(store)
+	completedAt := time.Date(2026, 8, 24, 9, 0, 0, 0, time.UTC)
+	workStore.now = func() time.Time { return completedAt }
+	generation := testWorkGeneration().Tmux()
+	if _, err := workStore.Claim(context.Background(), "hq-task", "gastown/Toast", generation, nil); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	first, err := workStore.Complete(context.Background(), "hq-task", "gastown/Toast", generation, "Re: Repair the system", "Repair complete")
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if !first.Created || first.ReplyID == "" {
+		t.Fatalf("first result = %+v, want created reply", first)
+	}
+	second, err := workStore.Complete(context.Background(), "hq-task", "gastown/Toast", generation, "Re: Repair the system", "Repair complete")
+	if err != nil {
+		t.Fatalf("retry Complete: %v", err)
+	}
+	if second.Created || second.ReplyID != first.ReplyID {
+		t.Fatalf("retry result = %+v, want existing %s", second, first.ReplyID)
+	}
+
+	source := store.snapshot()
+	work, err := ParseMailWorkMetadata(source.Metadata)
+	if err != nil || work.Validate(WorkStateClosed) != nil || work.Completion.ReplyID != first.ReplyID {
+		t.Fatalf("completed source work = %+v, parse error = %v", work, err)
+	}
+	reply := store.snapshotReply()
+	if source.Status != beadsdk.StatusClosed || reply == nil || reply.ID != first.ReplyID || reply.Description != "Repair complete" {
+		t.Fatalf("source/reply = %+v / %+v", source, reply)
+	}
+	assertLabelCount(t, reply.Labels, "thread:thread-task", 1)
+	assertLabelCount(t, reply.Labels, "reply-to:hq-task", 1)
+	assertLabelCount(t, reply.Labels, "msg-type:reply", 1)
+}
+
+func TestMailWorkStoreCompletesBlockedWork(t *testing.T) {
+	store := newFakeMailWorkStore(t, testMailWorkIssue(t, WorkRouteDirect))
+	workStore := NewMailWorkStore(store)
+	generation := testWorkGeneration().Tmux()
+	if _, err := workStore.Claim(context.Background(), "hq-task", "gastown/Toast", generation, nil); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := workStore.Block(context.Background(), "hq-task", "gastown/Toast", generation, "waiting"); err != nil {
+		t.Fatalf("Block: %v", err)
+	}
+	if _, err := workStore.Complete(context.Background(), "hq-task", "gastown/Toast", generation, "Re: Repair", "Changes required"); err != nil {
+		t.Fatalf("Complete blocked work: %v", err)
+	}
+	work, err := ParseMailWorkMetadata(store.snapshot().Metadata)
+	if err != nil || work.Blocked != nil || work.Validate(WorkStateClosed) != nil {
+		t.Fatalf("completed blocked metadata = %+v, error = %v", work, err)
+	}
+}
+
+func TestMailWorkStoreCompletionFailureRollsBackReplyAndClose(t *testing.T) {
+	store := newFakeMailWorkStore(t, testMailWorkIssue(t, WorkRouteDirect))
+	workStore := NewMailWorkStore(store)
+	generation := testWorkGeneration().Tmux()
+	if _, err := workStore.Claim(context.Background(), "hq-task", "gastown/Toast", generation, nil); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	store.failClose = errors.New("source close failed")
+
+	if _, err := workStore.Complete(context.Background(), "hq-task", "gastown/Toast", generation, "Re: Repair", "Done"); err == nil {
+		t.Fatal("Complete succeeded, want rollback")
+	}
+	if issue := store.snapshot(); issue.Status != beadsdk.StatusInProgress {
+		t.Fatalf("failed completion status = %s, want in_progress", issue.Status)
+	}
+	if reply := store.snapshotReply(); reply != nil {
+		t.Fatalf("failed completion retained reply %+v", reply)
+	}
+}
+
+func TestMailWorkStoreCompletionFailsClosed(t *testing.T) {
+	store := newFakeMailWorkStore(t, testMailWorkIssue(t, WorkRouteDirect))
+	workStore := NewMailWorkStore(store)
+	generation := testWorkGeneration().Tmux()
+	if _, err := workStore.Claim(context.Background(), "hq-task", "gastown/Toast", generation, nil); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	replacement := generation
+	replacement.Nonce = "replacement-generation"
+	if _, err := workStore.Complete(context.Background(), "hq-task", "gastown/Toast", replacement, "Re: Repair", "Done"); !errors.Is(err, ErrMailWorkConflict) {
+		t.Fatalf("replacement Complete error = %v, want conflict", err)
+	}
+
+	store.mu.Lock()
+	store.issue.Status = beadsdk.StatusClosed
+	store.mu.Unlock()
+	if _, err := workStore.Complete(context.Background(), "hq-task", "gastown/Toast", generation, "Re: Repair", "Done"); !errors.Is(err, ErrMailWorkInvalid) {
+		t.Fatalf("inconsistent closed Complete error = %v, want invalid", err)
+	}
+}
+
 func TestMailWorkStoreDoltConcurrentClaim(t *testing.T) {
 	if os.Getenv("GT_TEST_ISOLATED") != "1" {
 		t.Skip("requires the repository isolated Dolt test launcher")
@@ -257,6 +357,66 @@ func TestMailWorkStoreDoltConcurrentClaim(t *testing.T) {
 	}
 }
 
+func TestMailWorkStoreDoltCompletionTransaction(t *testing.T) {
+	if os.Getenv("GT_TEST_ISOLATED") != "1" {
+		t.Skip("requires the repository isolated Dolt test launcher")
+	}
+	store, cleanup := openMailWorkTestStore(t)
+	defer cleanup()
+
+	issue := testMailWorkIssue(t, WorkRouteDirect)
+	issue.ID = "test-mail-complete"
+	issue.UpdatedAt = issue.CreatedAt
+	labels := append([]string(nil), issue.Labels...)
+	if err := store.CreateIssue(context.Background(), issue, "mayor/"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	for _, label := range labels {
+		if err := store.AddLabel(context.Background(), issue.ID, label, "mayor/"); err != nil {
+			t.Fatalf("AddLabel(%s): %v", label, err)
+		}
+	}
+
+	workStore := NewMailWorkStore(store)
+	generation := testWorkGeneration().Tmux()
+	if _, err := workStore.Claim(context.Background(), issue.ID, "gastown/Toast", generation, nil); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	first, err := workStore.Complete(context.Background(), issue.ID, "gastown/Toast", generation, "Re: Repair", "Completed")
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	second, err := workStore.Complete(context.Background(), issue.ID, "gastown/Toast", generation, "Re: Repair", "Completed")
+	if err != nil {
+		t.Fatalf("retry Complete: %v", err)
+	}
+	if !first.Created || second.Created || first.ReplyID == "" || second.ReplyID != first.ReplyID {
+		t.Fatalf("completion results = %+v / %+v", first, second)
+	}
+
+	source, err := store.GetIssue(context.Background(), issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue source: %v", err)
+	}
+	reply, err := store.GetIssue(context.Background(), first.ReplyID)
+	if err != nil {
+		t.Fatalf("GetIssue reply: %v", err)
+	}
+	if source.Status != beadsdk.StatusClosed || reply.Description != "Completed" || reply.Assignee != "mayor/" {
+		t.Fatalf("source/reply = %+v / %+v", source, reply)
+	}
+	replies, err := store.SearchIssues(context.Background(), "", beadsdk.IssueFilter{
+		Labels: []string{"gt:message", "thread:thread-task", "reply-to:" + issue.ID},
+		Limit:  0,
+	})
+	if err != nil {
+		t.Fatalf("SearchIssues replies: %v", err)
+	}
+	if len(replies) != 1 {
+		t.Fatalf("completion reply count = %d, want 1", len(replies))
+	}
+}
+
 func openMailWorkTestStore(t *testing.T) (beadsdk.Storage, func()) {
 	t.Helper()
 	t.Setenv("BEADS_TEST_MODE", "1")
@@ -279,8 +439,11 @@ type fakeMailWorkStore struct {
 	beadsdk.Storage
 	mu          sync.Mutex
 	issue       *beadsdk.Issue
+	reply       *beadsdk.Issue
+	nextID      int
 	comments    []string
 	failComment error
+	failClose   error
 }
 
 func newFakeMailWorkStore(t *testing.T, issue *beadsdk.Issue) *fakeMailWorkStore {
@@ -293,15 +456,26 @@ func (s *fakeMailWorkStore) RunInTransaction(ctx context.Context, _ string, fn f
 	defer s.mu.Unlock()
 	tx := &fakeMailWorkTransaction{
 		issue:       cloneWorkIssueNoTest(s.issue),
+		reply:       cloneWorkIssueNoTest(s.reply),
+		nextID:      s.nextID,
 		comments:    append([]string(nil), s.comments...),
 		failComment: s.failComment,
+		failClose:   s.failClose,
 	}
 	if err := fn(tx); err != nil {
 		return err
 	}
 	s.issue = tx.issue
+	s.reply = tx.reply
+	s.nextID = tx.nextID
 	s.comments = tx.comments
 	return nil
+}
+
+func (s *fakeMailWorkStore) snapshotReply() *beadsdk.Issue {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneWorkIssueNoTest(s.reply)
 }
 
 func (s *fakeMailWorkStore) snapshot() *beadsdk.Issue {
@@ -313,29 +487,34 @@ func (s *fakeMailWorkStore) snapshot() *beadsdk.Issue {
 type fakeMailWorkTransaction struct {
 	beadsdk.Transaction
 	issue       *beadsdk.Issue
+	reply       *beadsdk.Issue
+	nextID      int
 	comments    []string
 	failComment error
+	failClose   error
 }
 
 func (tx *fakeMailWorkTransaction) GetIssue(_ context.Context, id string) (*beadsdk.Issue, error) {
-	if tx.issue == nil || tx.issue.ID != id {
+	issue := tx.findIssue(id)
+	if issue == nil {
 		return nil, ErrMessageNotFound
 	}
-	return cloneWorkIssueNoTest(tx.issue), nil
+	return cloneWorkIssueNoTest(issue), nil
 }
 
 func (tx *fakeMailWorkTransaction) UpdateIssue(_ context.Context, id string, updates map[string]interface{}, _ string) error {
-	if tx.issue == nil || tx.issue.ID != id {
+	issue := tx.findIssue(id)
+	if issue == nil {
 		return ErrMessageNotFound
 	}
 	for key, value := range updates {
 		switch key {
 		case "status":
-			tx.issue.Status = beadsdk.Status(value.(string))
+			issue.Status = beadsdk.Status(value.(string))
 		case "assignee":
-			tx.issue.Assignee = value.(string)
+			issue.Assignee = value.(string)
 		case "metadata":
-			tx.issue.Metadata = append(json.RawMessage(nil), value.(json.RawMessage)...)
+			issue.Metadata = append(json.RawMessage(nil), value.(json.RawMessage)...)
 		default:
 			return fmt.Errorf("unexpected update %q", key)
 		}
@@ -344,47 +523,88 @@ func (tx *fakeMailWorkTransaction) UpdateIssue(_ context.Context, id string, upd
 }
 
 func (tx *fakeMailWorkTransaction) GetLabels(_ context.Context, id string) ([]string, error) {
-	if tx.issue == nil || tx.issue.ID != id {
+	issue := tx.findIssue(id)
+	if issue == nil {
 		return nil, ErrMessageNotFound
 	}
-	return append([]string(nil), tx.issue.Labels...), nil
+	return append([]string(nil), issue.Labels...), nil
 }
 
 func (tx *fakeMailWorkTransaction) AddLabel(_ context.Context, id, label, _ string) error {
-	if tx.issue == nil || tx.issue.ID != id {
+	issue := tx.findIssue(id)
+	if issue == nil {
 		return ErrMessageNotFound
 	}
-	for _, existing := range tx.issue.Labels {
+	for _, existing := range issue.Labels {
 		if existing == label {
 			return nil
 		}
 	}
-	tx.issue.Labels = append(tx.issue.Labels, label)
+	issue.Labels = append(issue.Labels, label)
 	return nil
 }
 
 func (tx *fakeMailWorkTransaction) RemoveLabel(_ context.Context, id, label, _ string) error {
-	if tx.issue == nil || tx.issue.ID != id {
+	issue := tx.findIssue(id)
+	if issue == nil {
 		return ErrMessageNotFound
 	}
-	filtered := tx.issue.Labels[:0]
-	for _, existing := range tx.issue.Labels {
+	filtered := issue.Labels[:0]
+	for _, existing := range issue.Labels {
 		if existing != label {
 			filtered = append(filtered, existing)
 		}
 	}
-	tx.issue.Labels = filtered
+	issue.Labels = filtered
 	return nil
 }
 
 func (tx *fakeMailWorkTransaction) AddComment(_ context.Context, id, actor, comment string) error {
-	if tx.issue == nil || tx.issue.ID != id {
+	if tx.findIssue(id) == nil {
 		return ErrMessageNotFound
 	}
 	if tx.failComment != nil {
 		return tx.failComment
 	}
 	tx.comments = append(tx.comments, actor+": "+comment)
+	return nil
+}
+
+func (tx *fakeMailWorkTransaction) CreateIssue(_ context.Context, issue *beadsdk.Issue, _ string) error {
+	if tx.reply != nil {
+		return errors.New("reply already exists")
+	}
+	tx.nextID++
+	if issue.ID == "" {
+		issue.ID = fmt.Sprintf("hq-reply-%d", tx.nextID)
+	}
+	tx.reply = cloneWorkIssueNoTest(issue)
+	return nil
+}
+
+func (tx *fakeMailWorkTransaction) CloseIssue(_ context.Context, id, reason, _ string, session string) error {
+	if tx.failClose != nil {
+		return tx.failClose
+	}
+	issue := tx.findIssue(id)
+	if issue == nil {
+		return ErrMessageNotFound
+	}
+	now := time.Now().UTC()
+	issue.Status = beadsdk.StatusClosed
+	issue.ClosedAt = &now
+	issue.CloseReason = reason
+	issue.ClosedBySession = session
+	return nil
+}
+
+func (tx *fakeMailWorkTransaction) findIssue(id string) *beadsdk.Issue {
+	if tx.issue != nil && tx.issue.ID == id {
+		return tx.issue
+	}
+	if tx.reply != nil && tx.reply.ID == id {
+		return tx.reply
+	}
 	return nil
 }
 
