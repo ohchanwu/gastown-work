@@ -146,6 +146,10 @@ type Message struct {
 	// (no nudge, no banner). Set by the CLI when --no-notify is passed.
 	// In-memory only — not serialized.
 	SuppressNotify bool `json:"-"`
+
+	// mailWork is set by Router.Send only for a newly enrolled task. Keeping it
+	// internal prevents callers from bypassing routing and persistence checks.
+	mailWork bool
 }
 
 // NewMessage creates a new message with a generated ID and thread ID.

@@ -116,15 +116,15 @@ contributor work.
 - Modify: `internal/mail/router_test.go`
 - Modify: `internal/cmd/mail_send_test.go`
 
-- [ ] Write failing router tests proving `gt:mail-work` is added only for new
+- [x] Write failing router tests proving `gt:mail-work` is added only for new
   persistent direct or queue `TypeTask` messages, including the
   `--type task --permanent` CLI path.
-- [ ] Add exclusions for wisps, groups/lists, channels, announcements,
+- [x] Add exclusions for wisps, groups/lists, channels, announcements,
   self-handoffs, replies, notifications, and escalations.
-- [ ] Add the label in the shared message-label builder so direct and queue
+- [x] Add the label in the shared message-label builder so direct and queue
   sends cannot drift; leave historical records untouched.
-- [ ] Run `go test ./internal/mail ./internal/cmd -run 'Test.*Mail.*(Work|Task|Permanent)'`.
-- [ ] Commit: `feat(mail): enroll persistent task messages`
+- [x] Run `go test ./internal/mail ./internal/cmd -run 'Test.*Mail.*(Work|Task|Permanent)'`.
+- [x] Commit: `feat(mail): enroll persistent task messages`
 
 ## Task 5: Route claim, release, block, resume, and complete through one CLI path
 
