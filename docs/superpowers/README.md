@@ -2,7 +2,7 @@
 
 Active work:
 
-- None.
+- [Actionable mail work lifecycle](specs/260824-actionable-mail-work-lifecycle.md)
 
 Completed work:
 

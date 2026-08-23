@@ -2,6 +2,9 @@
 
 Status: open
 
+Design:
+[Actionable mail work lifecycle](../../superpowers/specs/260824-actionable-mail-work-lifecycle.md)
+
 Severity: P1 when the review gates a production or security-sensitive change
 
 Observed: 2026-08-22
