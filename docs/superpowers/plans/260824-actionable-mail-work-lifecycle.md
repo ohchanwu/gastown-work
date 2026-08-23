@@ -71,22 +71,22 @@ contributor work.
 - Create: `internal/mail/work_store_test.go`
 - Modify: `internal/mail/store.go`
 
-- [ ] Write failing storage tests for direct and queue claim, same-generation
+- [x] Write failing storage tests for direct and queue claim, same-generation
   retry, competing agents, replacement generations of one agent, release route
   restoration, block/resume, and rejection of malformed or contradictory
   records.
-- [ ] Add transaction fault tests proving a callback error leaves status,
+- [x] Add transaction fault tests proving a callback error leaves status,
   assignee, labels, and metadata unchanged.
-- [ ] Run the focused tests through
-  `GT_TEST_DOLT_PORT=33428 scripts/test-isolated.sh go test ./internal/mail -run TestMailWorkStore`
+- [x] Run the focused tests through
+  `GT_TEST_DOLT_PORT=33428 scripts/test-isolated.sh -run TestMailWorkStore ./internal/mail`
   and confirm the intended failures.
-- [ ] Implement one `MailWorkStore` over `beads.Storage.RunInTransaction`.
+- [x] Implement one `MailWorkStore` over `beads.Storage.RunInTransaction`.
   Claim must verify eligibility and atomically write status, assignee,
   compatibility labels, full generation receipt, and a transition comment.
   Release, block, and resume must compare the exact stored generation before
   changing anything.
-- [ ] Re-run the focused isolated tests and `go test ./internal/mail`.
-- [ ] Commit: `feat(mail): add atomic work transitions`
+- [x] Re-run the focused isolated tests and `go test ./internal/mail`.
+- [x] Commit: `feat(mail): add atomic work transitions`
 
 ## Task 3: Make completion exactly once
 

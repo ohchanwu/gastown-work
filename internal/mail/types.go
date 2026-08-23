@@ -288,7 +288,13 @@ func (m *Message) ValidateStored() error {
 	}
 	logical := *m
 	if logical.Queue != "" {
-		if logical.Channel != "" || logical.To != "queue:"+logical.Queue {
+		activeQueueWork := logical.IsActionableWork() &&
+			(logical.Status == WorkStateInProgress || logical.Status == WorkStateBlocked || logical.Status == WorkStateClosed)
+		validAssignee := logical.To == "queue:"+logical.Queue
+		if activeQueueWork {
+			validAssignee = logical.ClaimedBy != "" && AddressToIdentity(logical.To) == AddressToIdentity(logical.ClaimedBy)
+		}
+		if logical.Channel != "" || !validAssignee {
 			return fmt.Errorf("stored queue message has inconsistent route")
 		}
 		logical.To = ""
