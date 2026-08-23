@@ -7,6 +7,7 @@ package mail
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -281,6 +282,7 @@ func sdkIssueToMessage(si *beadsdk.Issue) *Message {
 		Labels:      si.Labels,
 		Pinned:      si.Pinned,
 		Wisp:        si.Ephemeral,
+		Metadata:    append(json.RawMessage(nil), si.Metadata...),
 	}
 
 	return bm.ToMessage()

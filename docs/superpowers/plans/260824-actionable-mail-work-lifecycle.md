@@ -47,21 +47,21 @@ contributor work.
 - Modify: `internal/mail/types.go`
 - Test: `internal/mail/types_test.go`
 
-- [ ] Add table-driven failing tests for enrollment classification: permanent
+- [x] Add table-driven failing tests for enrollment classification: permanent
   direct and queue task mail with `gt:mail-work` qualify; ephemeral tasks,
   channels, notifications, replies, escalations, self-handoffs, and unmarked
   historical tasks do not.
-- [ ] Run
+- [x] Run
   `go test ./internal/mail -run 'TestMailWork(Classification|Metadata|Validation)'`
   and confirm the new tests fail because the model does not exist.
-- [ ] Add the minimal model: label and schema constants, route and state types,
+- [x] Add the minimal model: label and schema constants, route and state types,
   generation receipt, claim/block/completion records, versioned JSON codec, and
   validation for each allowed state.
-- [ ] Extend `Message`/`BeadsMessage` conversion with issue status, labels,
+- [x] Extend `Message`/`BeadsMessage` conversion with issue status, labels,
   metadata, and mail-work helpers. Permit claim summaries on enrolled direct
   work while retaining queue-only validation for legacy records.
-- [ ] Re-run the focused tests and `go test ./internal/mail`; both must pass.
-- [ ] Commit: `feat(mail): model actionable mail work`
+- [x] Re-run the focused tests and `go test ./internal/mail`; both must pass.
+- [x] Commit: `feat(mail): model actionable mail work`
 
 ## Task 2: Add the atomic transition store
 
