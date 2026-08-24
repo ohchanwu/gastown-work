@@ -1,6 +1,6 @@
 # Actionable mail work lifecycle
 
-Status: approved design; implementation pending
+Status: implemented locally; awaiting integration
 
 Created: 2026-08-24
 

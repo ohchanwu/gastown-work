@@ -1,12 +1,11 @@
 # Agentic implementation knowledge
 
-Active work:
-
-- [Actionable mail work lifecycle](specs/260824-actionable-mail-work-lifecycle.md)
-- [Actionable mail work lifecycle implementation](plans/260824-actionable-mail-work-lifecycle.md)
+Active work: none.
 
 Completed work:
 
+- [Actionable mail work lifecycle specification](archive/260824-actionable-mail-work-lifecycle-spec.md)
+- [Actionable mail work lifecycle implementation](archive/260824-actionable-mail-work-lifecycle.md)
 - [Lifecycle custody and truthful closeout](archive/260818-lifecycle-custody-truthful-closeout.md)
 
 Completed plans and evidence move to `archive/`. Ordinary work must not scan the

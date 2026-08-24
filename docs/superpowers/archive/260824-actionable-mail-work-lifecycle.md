@@ -21,7 +21,7 @@ the durable transaction.
 session-generation custody, existing Gas Town isolated test launcher.
 
 **Spec:**
-[Actionable mail work lifecycle](../specs/260824-actionable-mail-work-lifecycle.md)
+[Actionable mail work lifecycle](260824-actionable-mail-work-lifecycle-spec.md)
 
 **Global constraints:** Never push. Preserve `AgentRuntime.HasWork` and
 `HookBead` semantics. Do not enroll historical mail. Do not fall back to
@@ -248,7 +248,8 @@ contributor work.
 
 **Files:**
 
-- Modify: `docs/architecture.md`
+- Modify: `docs/design/architecture.md`
+- Modify: `docs/design/mail-protocol.md`
 - Modify: `docs/superpowers/README.md`
 - Move after completion:
   `docs/superpowers/plans/260824-actionable-mail-work-lifecycle.md` to
@@ -257,17 +258,21 @@ contributor work.
   `docs/superpowers/specs/260824-actionable-mail-work-lifecycle.md` to
   `docs/superpowers/archive/260824-actionable-mail-work-lifecycle-spec.md`
 
-- [ ] Document the mail-work record, transaction boundary, secondary-work
-  status fields, and conservative recovery rules in `docs/architecture.md`.
-- [ ] Run `gofmt` on touched Go files and inspect the cumulative diff against
+- [x] Document the mail-work record, transaction boundary, secondary-work
+  status fields, and conservative recovery rules in the established
+  `docs/design/architecture.md` and `docs/design/mail-protocol.md` files.
+- [x] Run `gofmt` on touched Go files and inspect the cumulative diff against
   `b9aa0538`.
-- [ ] Run `CGO_ENABLED=0 GT_TEST_DOLT_PORT=33429 make test`, `make build`,
-  `go vet ./...`, and Gitleaks. Classify environmental or unrelated failures
-  with exact evidence; do not silently waive them.
-- [ ] Verify there are no `TODO`, `TBD`, placeholders, credentials, private
+- [x] Run `CGO_ENABLED=0 GT_TEST_DOLT_PORT=33429 make test`, `make build`,
+  `go vet ./...`, and Gitleaks. Build and vet pass. Feature-scoped Gitleaks
+  passes; the full-history scan reports 15 pre-existing findings. The full test
+  run has four reproduced baselines: command dog closeout state, unavailable
+  Docker for convoy setup, Dolt offline database-removal refusal, and legacy
+  tmux multi-pane ambiguity. All affected lifecycle packages pass.
+- [x] Verify there are no `TODO`, `TBD`, placeholders, credentials, private
   topology, or production-specific evidence in tracked changes.
-- [ ] Move the completed plan/spec to the tracked archive, update the index,
+- [x] Move the completed plan/spec to the tracked archive, update the index,
   inspect the staged documentation diff, rerun Gitleaks, and commit:
   `docs: record actionable mail work architecture`.
-- [ ] Confirm the worktree is clean and report local commits and verification.
+- [x] Confirm the worktree is clean and report local commits and verification.
   Do not push.

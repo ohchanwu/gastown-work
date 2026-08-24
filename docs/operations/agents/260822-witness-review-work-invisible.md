@@ -1,9 +1,9 @@
 # Direct actionable mail can bypass the Beads work lifecycle
 
-Status: open
+Status: implemented; awaiting integration
 
 Design:
-[Actionable mail work lifecycle](../../superpowers/specs/260824-actionable-mail-work-lifecycle.md)
+[Actionable mail work lifecycle](../../superpowers/archive/260824-actionable-mail-work-lifecycle-spec.md)
 
 Severity: P1 when the review gates a production or security-sensitive change
 

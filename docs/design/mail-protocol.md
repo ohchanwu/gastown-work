@@ -507,6 +507,32 @@ Work queues where each message goes to exactly one claimant (unlike groups).
 Fields: `status` (active/paused/closed), `max_concurrency`, `processing_order`
 (fifo/priority), plus count fields (available, processing, completed, failed).
 
+### Actionable task lifecycle (`gt:mail-work`)
+
+New permanent direct or queue task mail is durable secondary work:
+
+```bash
+gt mail send deacon/ --type task --permanent -s "Repair request" -m "Details"
+gt mail claim --id <message-id>
+# Then block/resume, release, or complete through one of these paths:
+gt mail block <message-id> -m "Waiting for dependency"
+gt mail resume <message-id>
+gt mail release <message-id>
+gt mail reply <message-id> --complete -m "Result"
+```
+
+The original message is the sole work record. Work moves between `open`,
+`in_progress`, and `blocked`; `closed` is terminal. Reading changes only its
+`read` label.
+Claims bind to the caller's exact tmux session generation and never replace the
+primary hook. Completion creates one persistent thread reply and closes the
+source atomically.
+
+Patrol preserves live and uncertain owners. It may reopen only `in_progress`
+work whose exact stored generation is proven dead or replaced; blocked work is
+escalated without mutation. Reaper never stale-closes or purges records labeled
+`gt:mail-work`, including completed history.
+
 ### Channels (`gt:channel`)
 
 Pub/sub broadcast streams with configurable message retention.

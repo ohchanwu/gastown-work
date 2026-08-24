@@ -246,6 +246,35 @@ for submission instead of inferring behavior from a session name. In
 particular, text left in an interactive prompt composer is not a successful
 Codex submission without the matching runtime receipt.
 
+### Actionable mail as secondary work
+
+A newly sent permanent direct or queue message with `msg-type:task` is one
+durable work record. The router enrolls it with `gt:mail-work` and versioned
+`gt_mail` metadata; notifications, replies, ephemeral messages, broadcasts,
+and historical mail are not auto-enrolled. Actionable mail is secondary work:
+claiming it never reads or replaces the agent bead's scalar `HookBead`.
+
+The issue status is the lifecycle authority: `open` is unclaimed,
+`in_progress` is claimed, `blocked` retains its owner and reason, and `closed`
+records atomic completion. Reading changes only the `read` label. Claim,
+release, block, resume, and completion use one Beads transaction and compare the
+stored exact tmux `SessionGeneration`. Completion creates one persistent reply
+on the original thread and closes the source in that same transaction, so a
+retry returns the recorded reply rather than duplicating it.
+
+Status preserves `has_work` as the primary-hook signal and adds
+`has_mail_work`, `has_any_work`, active mail-work summaries, and a pending count.
+Startup context lists unclaimed tasks and requires an explicit claim before
+work starts; it does not auto-hook them.
+
+Witness patrol evaluates active claims on their stored tmux transport. A live
+exact generation is preserved. Missing, malformed, or uncertain evidence is
+`NEEDS_RECOVERY` and cannot mutate the record. Only `in_progress` work whose
+exact generation is proven dead or replaced may be compare-and-set back to
+`open`; blocked work remains blocked and is escalated. Reaper excludes every
+`gt:mail-work` record from stale auto-close and old-mail purge, including closed
+history.
+
 `gt nudge-canary --confirm-live` verifies this path with 20 receipt-confirmed
 turns in a temporary town, isolated Mayor identity, and dedicated tmux socket.
 The canary requires zero attached clients and sole lock ownership, waits for a
