@@ -231,16 +231,18 @@ contributor work.
 
 - Create: `internal/cmd/mail_work_integration_test.go`
 
-- [ ] Add an isolated Dolt/tmux end-to-end test with unrelated primary hook
+- [x] Add an isolated Dolt/tmux end-to-end test with unrelated primary hook
   work: send, read without claim, claim, status both work records, complete,
   retry completion, and prove `HookBead` never changes.
-- [ ] Add a no-primary-hook case proving `has_work=false` while active mail
+- [x] Add a no-primary-hook case proving `has_work=false` while active mail
   makes `has_mail_work` and `has_any_work` true.
-- [ ] Add replacement-generation cases proving live work is not stolen and
+- [x] Add replacement-generation cases proving live work is not stolen and
   proven-dead work is recoverable.
-- [ ] Run the end-to-end test through `scripts/test-isolated.sh` on a dedicated
-  port, then run all mail, command, patrol, and Reaper tests.
-- [ ] Commit: `test(mail): cover actionable work lifecycle end to end`
+- [x] Run the end-to-end test through `scripts/test-isolated.sh` on dedicated
+  port 33435, then run the focused mail, command, patrol, and Reaper suites.
+  The most recent full command-package run remains green except for the
+  unchanged baseline dog/tmux finalization failure recorded in Task 8.
+- [x] Commit: `test(mail): cover actionable work lifecycle end to end`
 
 ## Task 10: Update architecture and perform the release gate
 
