@@ -160,6 +160,9 @@ func TestReaperQueriesUseTypedDependencyColumns(t *testing.T) {
 		if !strings.Contains(body.text, "d.depends_on_issue_id IS NOT NULL") {
 			t.Fatalf("%s should guard nullable depends_on_issue_id in NOT IN subquery", body.name)
 		}
+		if !strings.Contains(body.text, "'gt:message'") {
+			t.Fatalf("%s should exclude protocol mail from stale auto-close", body.name)
+		}
 	}
 
 	if !strings.Contains(scanBody, "wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL") {
@@ -470,6 +473,7 @@ func TestAutoCloseExcludesControlPlaneIdentityRecords(t *testing.T) {
 	state := &fakeReaperState{
 		issues: map[string]*fakeIssue{
 			"stale-task":          {id: "stale-task", title: "Stale task", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"protected-message":   {id: "protected-message", title: "Protocol escalation", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:message", "gt:escalation", "msg-type:escalation"}},
 			"protected-mail-work": {id: "protected-mail-work", title: "Actionable mail", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:mail-work"}},
 			"labeled-convoy":      {id: "labeled-convoy", title: "Tracked by convoy", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:convoy"}},
 			"typed-convoy":        {id: "typed-convoy", title: "Convoy", status: "open", issueType: "convoy", updatedAt: now.Add(-8 * 24 * time.Hour)},
@@ -503,7 +507,7 @@ func TestAutoCloseExcludesControlPlaneIdentityRecords(t *testing.T) {
 	if result.Closed != 1 || state.status("stale-task") != "closed" {
 		t.Fatalf("AutoClose live closed = %#v; stale task status = %q", result.ClosedEntries, state.status("stale-task"))
 	}
-	for _, id := range []string{"protected-mail-work", "labeled-convoy", "typed-convoy", "typed-agent", "protected-agent", "protected-standing", "protected-keep", "protected-role", "protected-rig"} {
+	for _, id := range []string{"protected-message", "protected-mail-work", "labeled-convoy", "typed-convoy", "typed-agent", "protected-agent", "protected-standing", "protected-keep", "protected-role", "protected-rig"} {
 		if got := state.status(id); got != "open" {
 			t.Fatalf("AutoClose live changed protected identity %q to %q", id, got)
 		}
@@ -516,6 +520,7 @@ func TestAutoCloseRevalidatesEligibilityAtUpdate(t *testing.T) {
 		issues: map[string]*fakeIssue{
 			"becomes-agent":       {id: "becomes-agent", title: "Agent race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
 			"gains-agent-tag":     {id: "gains-agent-tag", title: "Label race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"gains-message-tag":   {id: "gains-message-tag", title: "Protocol mail race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
 			"gains-mail-work-tag": {id: "gains-mail-work-tag", title: "Mail race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
 			"still-stale":         {id: "still-stale", title: "Still stale", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
 		},
@@ -524,6 +529,7 @@ func TestAutoCloseRevalidatesEligibilityAtUpdate(t *testing.T) {
 	state.beforeAutoCloseUpdate = func(s *fakeReaperState) {
 		s.issues["becomes-agent"].issueType = "agent"
 		s.issues["gains-agent-tag"].labels = append(s.issues["gains-agent-tag"].labels, "gt:agent")
+		s.issues["gains-message-tag"].labels = append(s.issues["gains-message-tag"].labels, "gt:message")
 		s.issues["gains-mail-work-tag"].labels = append(s.issues["gains-mail-work-tag"].labels, "gt:mail-work")
 	}
 	db := openFakeReaperDB(t, state)
@@ -541,6 +547,9 @@ func TestAutoCloseRevalidatesEligibilityAtUpdate(t *testing.T) {
 	}
 	if got := state.status("gains-agent-tag"); got != "open" {
 		t.Fatalf("concurrently protected identity status = %q, want open", got)
+	}
+	if got := state.status("gains-message-tag"); got != "open" {
+		t.Fatalf("concurrently protected protocol mail status = %q, want open", got)
 	}
 	if got := state.status("gains-mail-work-tag"); got != "open" {
 		t.Fatalf("concurrently enrolled mail work status = %q, want open", got)
@@ -596,6 +605,7 @@ func TestAutoCloseConditionalUpdateRunsOnIsolatedDolt(t *testing.T) {
 		`INSERT INTO issues (id, title, status, priority, issue_type, updated_at) VALUES
 			('stale-task', 'Stale task', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
 			('protected-agent', 'Agent identity', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
+			('protected-message', 'Protocol escalation', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
 			('protected-mail-work', 'Actionable mail', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
 			('mixed-dependent', 'Mixed dependency states', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
 			('closed-dependency', 'Closed dependency', 'closed', 3, 'task', NOW()),
@@ -605,6 +615,7 @@ func TestAutoCloseConditionalUpdateRunsOnIsolatedDolt(t *testing.T) {
 			('open-blocker', 'Open blocker', 'open', 3, 'task', NOW())`,
 		`INSERT INTO labels (issue_id, label) VALUES
 			('protected-agent', 'gt:agent'),
+			('protected-message', 'gt:message'),
 			('protected-mail-work', 'gt:mail-work')`,
 		`INSERT INTO dependencies (issue_id, depends_on_issue_id) VALUES
 			('mixed-dependent', 'closed-dependency'),
@@ -624,11 +635,14 @@ func TestAutoCloseConditionalUpdateRunsOnIsolatedDolt(t *testing.T) {
 	if result.Closed != 1 || len(result.ClosedEntries) != 1 || result.ClosedEntries[0].ID != "stale-task" {
 		t.Fatalf("AutoClose result = %#v, want only stale-task", result)
 	}
-	var staleStatus, protectedStatus, mailWorkStatus, mixedDependentStatus, mixedBlockedStatus string
+	var staleStatus, protectedStatus, messageStatus, mailWorkStatus, mixedDependentStatus, mixedBlockedStatus string
 	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'stale-task'").Scan(&staleStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'protected-agent'").Scan(&protectedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'protected-message'").Scan(&messageStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'protected-mail-work'").Scan(&mailWorkStatus); err != nil {
@@ -640,10 +654,10 @@ func TestAutoCloseConditionalUpdateRunsOnIsolatedDolt(t *testing.T) {
 	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'mixed-blocked'").Scan(&mixedBlockedStatus); err != nil {
 		t.Fatal(err)
 	}
-	if staleStatus != "closed" || protectedStatus != "open" || mailWorkStatus != "open" || mixedDependentStatus != "open" || mixedBlockedStatus != "open" {
+	if staleStatus != "closed" || protectedStatus != "open" || messageStatus != "open" || mailWorkStatus != "open" || mixedDependentStatus != "open" || mixedBlockedStatus != "open" {
 		t.Fatalf(
-			"isolated statuses stale=%q protected=%q mail-work=%q mixed-dependent=%q mixed-blocked=%q",
-			staleStatus, protectedStatus, mailWorkStatus, mixedDependentStatus, mixedBlockedStatus,
+			"isolated statuses stale=%q protected=%q message=%q mail-work=%q mixed-dependent=%q mixed-blocked=%q",
+			staleStatus, protectedStatus, messageStatus, mailWorkStatus, mixedDependentStatus, mixedBlockedStatus,
 		)
 	}
 }

@@ -530,8 +530,10 @@ source atomically.
 
 Patrol preserves live and uncertain owners. It may reopen only `in_progress`
 work whose exact stored generation is proven dead or replaced; blocked work is
-escalated without mutation. Reaper never stale-closes or purges records labeled
-`gt:mail-work`, including completed history.
+escalated without mutation. Reaper never stale-closes any `gt:message`; it
+revalidates that protection immediately before mutation. Records labeled
+`gt:mail-work` are also excluded from old-mail purge, including completed
+history.
 
 ### Channels (`gt:channel`)
 

@@ -272,8 +272,9 @@ exact generation is preserved. Missing, malformed, or uncertain evidence is
 `NEEDS_RECOVERY` and cannot mutate the record. Only `in_progress` work whose
 exact generation is proven dead or replaced may be compare-and-set back to
 `open`; blocked work remains blocked and is escalated. Reaper excludes every
-`gt:mail-work` record from stale auto-close and old-mail purge, including closed
-history.
+`gt:message` record from generic stale auto-close during both discovery and
+mutation revalidation. Records labeled `gt:mail-work` are additionally excluded
+from old-mail purge, including closed history.
 
 `gt nudge-canary --confirm-live` verifies this path with 20 receipt-confirmed
 turns in a temporary town, isolated Mayor identity, and dedicated tmux socket.

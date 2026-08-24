@@ -407,7 +407,7 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		AND i.issue_type NOT IN ('epic', 'convoy', 'agent')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:mail-work')
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:message', 'gt:mail-work')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
@@ -806,7 +806,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		AND i.issue_type NOT IN ('epic', 'convoy', 'agent')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:mail-work')
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:message', 'gt:mail-work')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
@@ -914,7 +914,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		`UPDATE %[1]s.issues i
 		LEFT JOIN %[1]s.labels protected_label
 			ON protected_label.issue_id = i.id
-			AND protected_label.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:mail-work')
+			AND protected_label.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent', 'gt:message', 'gt:mail-work')
 		LEFT JOIN (
 			%[1]s.dependencies child_dependency
 			INNER JOIN %[1]s.issues open_dependency
