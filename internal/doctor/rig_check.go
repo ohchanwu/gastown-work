@@ -277,39 +277,7 @@ func (c *HooksPathConfiguredCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 
 	c.unconfiguredClones = nil
-
-	// Check all clone locations
-	clonePaths := []string{
-		filepath.Join(rigPath, "mayor", "rig"),
-		filepath.Join(rigPath, "refinery", "rig"),
-	}
-
-	// Add crew clones
-	crewDir := filepath.Join(rigPath, "crew")
-	if entries, err := os.ReadDir(crewDir); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() {
-				clonePaths = append(clonePaths, filepath.Join(crewDir, entry.Name()))
-			}
-		}
-	}
-
-	// Add polecat clones
-	polecatDir := filepath.Join(rigPath, "polecats")
-	if entries, err := os.ReadDir(polecatDir); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() {
-				clonePaths = append(clonePaths, filepath.Join(polecatDir, entry.Name()))
-			}
-		}
-	}
-
-	for _, clonePath := range clonePaths {
-		// Skip if not a git repo
-		if _, err := os.Stat(filepath.Join(clonePath, ".git")); os.IsNotExist(err) {
-			continue
-		}
-
+	for _, clonePath := range findRigClones(rigPath) {
 		if !hooksPathConfigured(clonePath) {
 			// Get relative path for cleaner output
 			relPath, _ := filepath.Rel(rigPath, clonePath)

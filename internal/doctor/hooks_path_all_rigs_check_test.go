@@ -97,6 +97,23 @@ func TestHooksPathChecksUseSameValidation(t *testing.T) {
 	}
 }
 
+func TestHooksPathChecksInspectNestedPolecatClone(t *testing.T) {
+	townRoot := t.TempDir()
+	clonePath := filepath.Join(townRoot, "rig", "polecats", "furiosa", "rig")
+	initHooksTestRepo(t, clonePath)
+	setHooksPath(t, clonePath, "missing-hooks")
+
+	ctx := &CheckContext{TownRoot: townRoot, RigName: "rig"}
+	for name, result := range map[string]*CheckResult{
+		"rig":    NewHooksPathConfiguredCheck().Run(ctx),
+		"global": NewHooksPathAllRigsCheck().Run(ctx),
+	} {
+		if result.Status != StatusWarning {
+			t.Errorf("%s check status = %v, want %v: %s", name, result.Status, StatusWarning, result.Message)
+		}
+	}
+}
+
 func initHooksTestRepo(t *testing.T, clonePath string) {
 	t.Helper()
 	if output, err := exec.Command("git", "init", clonePath).CombinedOutput(); err != nil {
