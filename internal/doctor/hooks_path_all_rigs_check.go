@@ -54,7 +54,12 @@ func (c *HooksPathAllRigsCheck) Run(ctx *CheckContext) *CheckResult {
 
 			cmd := exec.Command("git", "-C", clonePath, "config", "--get", "core.hooksPath")
 			output, err := cmd.Output()
-			if err != nil || strings.TrimSpace(string(output)) != ".githooks" {
+			hooksPath := strings.TrimSpace(string(output))
+			if hooksPath != "" && !filepath.IsAbs(hooksPath) {
+				hooksPath = filepath.Join(clonePath, hooksPath)
+			}
+			info, statErr := os.Stat(hooksPath)
+			if err != nil || hooksPath == "" || statErr != nil || !info.IsDir() {
 				c.unconfiguredClones = append(c.unconfiguredClones, clonePath)
 			}
 		}
