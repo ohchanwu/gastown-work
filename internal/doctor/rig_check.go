@@ -245,7 +245,7 @@ func (c *GitExcludeConfiguredCheck) Fix(ctx *CheckContext) error {
 	return nil
 }
 
-// HooksPathConfiguredCheck verifies all clones have core.hooksPath set to .githooks.
+// HooksPathConfiguredCheck verifies all clones have a valid core.hooksPath.
 // This ensures the pre-push hook blocks pushes to invalid branches (no internal PRs).
 type HooksPathConfiguredCheck struct {
 	FixableCheck
@@ -310,15 +310,7 @@ func (c *HooksPathConfiguredCheck) Run(ctx *CheckContext) *CheckResult {
 			continue
 		}
 
-		// Skip if no .githooks directory exists
-		if _, err := os.Stat(filepath.Join(clonePath, ".githooks")); os.IsNotExist(err) {
-			continue
-		}
-
-		// Check core.hooksPath
-		cmd := exec.Command("git", "-C", clonePath, "config", "--get", "core.hooksPath")
-		output, err := cmd.Output()
-		if err != nil || strings.TrimSpace(string(output)) != ".githooks" {
+		if !hooksPathConfigured(clonePath) {
 			// Get relative path for cleaner output
 			relPath, _ := filepath.Rel(rigPath, clonePath)
 			if relPath == "" {

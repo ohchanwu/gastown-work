@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 )
 
 // HooksPathAllRigsCheck verifies all clones across all rigs have core.hooksPath set.
@@ -46,20 +45,8 @@ func (c *HooksPathAllRigsCheck) Run(ctx *CheckContext) *CheckResult {
 	for _, rigPath := range rigs {
 		clonePaths := findRigClones(rigPath)
 		for _, clonePath := range clonePaths {
-			// Skip if no .githooks directory (repo doesn't use hooks)
-			if _, err := os.Stat(filepath.Join(clonePath, ".githooks")); os.IsNotExist(err) {
-				continue
-			}
 			totalClones++
-
-			cmd := exec.Command("git", "-C", clonePath, "config", "--get", "core.hooksPath")
-			output, err := cmd.Output()
-			hooksPath := strings.TrimSpace(string(output))
-			if hooksPath != "" && !filepath.IsAbs(hooksPath) {
-				hooksPath = filepath.Join(clonePath, hooksPath)
-			}
-			info, statErr := os.Stat(hooksPath)
-			if err != nil || hooksPath == "" || statErr != nil || !info.IsDir() {
+			if !hooksPathConfigured(clonePath) {
 				c.unconfiguredClones = append(c.unconfiguredClones, clonePath)
 			}
 		}
@@ -89,6 +76,26 @@ func (c *HooksPathAllRigsCheck) Run(ctx *CheckContext) *CheckResult {
 		Details: details,
 		FixHint: "Run 'gt doctor --fix' to configure hooks",
 	}
+}
+
+func hooksPathConfigured(clonePath string) bool {
+	output, err := exec.Command("git", "-C", clonePath, "config", "-z", "--path", "--get", "core.hooksPath").Output()
+	if err != nil || len(output) == 0 || output[len(output)-1] != 0 {
+		return false
+	}
+
+	hooksPath := string(output[:len(output)-1])
+	if hooksPath == "" {
+		return false
+	}
+	if !filepath.IsAbs(hooksPath) {
+		hooksPath = filepath.Join(clonePath, hooksPath)
+	}
+	if info, err := os.Stat(hooksPath); err != nil || !info.IsDir() {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(hooksPath, "pre-push"))
+	return err == nil && info.Mode().IsRegular()
 }
 
 // Fix configures core.hooksPath for all unconfigured clones.
