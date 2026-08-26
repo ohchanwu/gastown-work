@@ -2103,7 +2103,7 @@ func checkCompletedConvoys(ctx context.Context, townBeads string, dryRun, quiet 
 		convoys,
 		dryRun,
 		func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
-			return getTrackedIssuesCached(ctx, townBeads, convoy.ID, cache)
+			return getTrackedIssuesCachedWithoutWorkers(ctx, townBeads, convoy.ID, cache)
 		},
 		func(convoy convoyListIssue, tracked []trackedIssueInfo, dryRun bool) error {
 			_, err := closeConvoyIfCompleteWithOutputContext(ctx, townBeads, convoy.ID, convoy.Title, tracked, dryRun, !quiet)

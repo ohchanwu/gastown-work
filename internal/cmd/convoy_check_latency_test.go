@@ -1,0 +1,125 @@
+package cmd
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestCheckCompletedConvoysLiveSizeSkipsWorkerInventory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+
+	townRoot, _ := makeRoutingTownWorkspace(t)
+	chdirConvoyTest(t, townRoot)
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte("{\"prefix\":\"hq-\",\"path\":\".\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "rig-a", "polecats"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "rig-a", "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	convoys := make([]convoyListIssue, 51)
+	tracked := make(map[string][]string, len(convoys))
+	uniqueTargets := make(map[string]struct{})
+	edge := 0
+	for i := range convoys {
+		convoys[i] = convoyListIssue{ID: fmt.Sprintf("hq-cv-%02d", i), Title: fmt.Sprintf("Convoy %02d", i), Status: "open", IssueType: "convoy", Labels: []string{"gt:convoy"}}
+		count := 1
+		if i == 0 {
+			count = 13
+		} else if i <= 8 {
+			count = 2
+		}
+		for range count {
+			target := fmt.Sprintf("hq-task-%02d", edge)
+			if edge == 70 {
+				target = "hq-task-00"
+			}
+			tracked[convoys[i].ID] = append(tracked[convoys[i].ID], target)
+			uniqueTargets[target] = struct{}{}
+			edge++
+		}
+	}
+	if edge != 71 || len(uniqueTargets) != 70 || len(tracked[convoys[0].ID]) != 13 {
+		t.Fatalf("fixture shape: convoys=%d edges=%d targets=%d max=%d", len(convoys), edge, len(uniqueTargets), len(tracked[convoys[0].ID]))
+	}
+
+	convoyJSON, err := json.Marshal(convoys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerLog := filepath.Join(t.TempDir(), "worker-scans")
+	mutationLog := filepath.Join(t.TempDir(), "mutations")
+	var script strings.Builder
+	fmt.Fprintf(&script, `case "$*" in
+  "--allow-stale version") exit 0 ;;
+  "list --label=gt:convoy --json --limit=0 --status=open --flat") printf '%%s\n' '%s' ;;
+  "list --json --limit=0 --status=open --flat") printf '%%s\n' '[]' ;;
+  "list --label=gt:agent --status=open --json --limit=0 --flat") printf 'scan\n' >> "$GT_WORKER_SCAN_LOG"; printf '%%s\n' '[]' ;;
+  sql*)
+    case "$2" in
+`, convoyJSON)
+	for _, convoy := range convoys {
+		rows := make([]map[string]string, 0, len(tracked[convoy.ID]))
+		for _, target := range tracked[convoy.ID] {
+			rows = append(rows, map[string]string{"depends_on_id": target})
+		}
+		rowsJSON, marshalErr := json.Marshal(rows)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		fmt.Fprintf(&script, "      *%s*) printf '%%s\\n' '%s' ;;\n", convoy.ID, rowsJSON)
+	}
+	script.WriteString(`      *) exit 1 ;;
+    esac
+    ;;
+  show*)
+    shift 2
+    sep=
+    printf '['
+    for id do
+      printf '%s{"id":"%s","title":"Open task","status":"open","issue_type":"task"}' "$sep" "$id"
+      sep=,
+    done
+    printf ']\n'
+    ;;
+  close*|update*|export*) printf '%s\n' "$*" >> "$GT_MUTATION_LOG"; exit 1 ;;
+  *) printf 'unexpected bd args: %s\n' "$*" >&2; exit 1 ;;
+esac
+`)
+	writeRoutingBdStub(t, script.String())
+	t.Setenv("GT_WORKER_SCAN_LOG", workerLog)
+	t.Setenv("GT_MUTATION_LOG", mutationLog)
+
+	start := time.Now()
+	summary, err := checkCompletedConvoys(context.Background(), townRoot, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Checked != 51 || summary.EligibleClosed != 0 || summary.SkippedUncertain != 0 || summary.TimedOut || len(summary.Errors) != 0 {
+		t.Fatalf("summary = %+v, want successful no-ready no-op", summary)
+	}
+	if data, readErr := os.ReadFile(mutationLog); readErr == nil || !os.IsNotExist(readErr) {
+		t.Fatalf("dry-run mutation log = %q, err=%v", data, readErr)
+	}
+	data, err := os.ReadFile(workerLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	scans := strings.Count(string(data), "scan\n")
+	t.Logf("live-size completion: convoys=%d edges=%d targets=%d worker_scans=%d elapsed=%s", len(convoys), edge, len(uniqueTargets), scans, time.Since(start).Round(time.Millisecond))
+	if scans != 0 {
+		t.Fatalf("worker inventory process launches = %d, want 0", scans)
+	}
+}
