@@ -1,12 +1,17 @@
 package cmd
 
 import (
+	"bytes"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/crew"
+	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/rig"
 )
 
 type fakeAgentBeadUpserter struct {
@@ -84,4 +89,63 @@ func TestUpsertCrewAgentBead(t *testing.T) {
 			t.Fatalf("id = %q, want empty on error", id)
 		}
 	})
+}
+
+func TestEnsureCrewAgentBeadRecoversAfterInitialUpsertFailure(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(`{"prefix":"bom-","path":"bti_ops_match"}`+"\n"), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	rigPath := filepath.Join(townRoot, "bti_ops_match")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+	bareRepo := filepath.Join(townRoot, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", bareRepo).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, output)
+	}
+	workspaces := crew.NewManager(&rig.Rig{Name: "bti_ops_match", Path: rigPath, GitURL: bareRepo}, git.NewGit(rigPath))
+
+	worker, err := workspaces.Add("neo", false)
+	if err != nil {
+		t.Fatalf("initial workspace add: %v", err)
+	}
+	beadStore := &fakeAgentBeadUpserter{retErr: errors.New("temporary bead failure")}
+
+	firstWorker, _, recovered, err := ensureCrewAgentBead(workspaces, beadStore, townRoot, "bti_ops_match", "neo", worker, nil)
+	if err == nil || firstWorker != worker || recovered {
+		t.Fatalf("initial result = (%v, recovered=%v, err=%v), want created worker with bead error", firstWorker, recovered, err)
+	}
+	statePath := filepath.Join(worker.ClonePath, "state.json")
+	stateBeforeRetry, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state before retry: %v", err)
+	}
+
+	beadStore.retErr = nil
+	duplicate, addErr := workspaces.Add("neo", false)
+	if duplicate != nil || !errors.Is(addErr, crew.ErrCrewExists) {
+		t.Fatalf("retry add = (%v, %v), want ErrCrewExists", duplicate, addErr)
+	}
+	retriedWorker, id, recovered, err := ensureCrewAgentBead(workspaces, beadStore, townRoot, "bti_ops_match", "neo", duplicate, addErr)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if retriedWorker.Name != worker.Name || retriedWorker.ClonePath != worker.ClonePath || !recovered {
+		t.Fatalf("retry result = (%v, recovered=%v), want persisted worker recovered", retriedWorker, recovered)
+	}
+	if id != "bom-bti_ops_match-crew-neo" {
+		t.Fatalf("retry id = %q, want %q", id, "bom-bti_ops_match-crew-neo")
+	}
+	stateAfterRetry, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state after retry: %v", err)
+	}
+	if !bytes.Equal(stateAfterRetry, stateBeforeRetry) || beadStore.calls != 2 {
+		t.Fatalf("retry changed workspace state=%v and bead calls=%d, want unchanged workspace and two bead attempts", !bytes.Equal(stateAfterRetry, stateBeforeRetry), beadStore.calls)
+	}
 }

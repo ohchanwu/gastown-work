@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 
@@ -21,6 +22,10 @@ type agentBeadUpserter interface {
 	CreateOrReopenAgentBead(id, title string, fields *beads.AgentFields) (*beads.Issue, error)
 }
 
+type crewWorkspaceGetter interface {
+	Get(name string) (*crew.CrewWorker, error)
+}
+
 // upsertCrewAgentBead ensures the crew agent bead exists with expected metadata.
 // It uses CreateOrReopenAgentBead instead of a Show()+Create sequence so existing
 // beads in alternate stores (issues/wisps) do not trigger false "issue not found"
@@ -38,6 +43,28 @@ func upsertCrewAgentBead(bd agentBeadUpserter, townRoot, rigName, crewName strin
 		return "", err
 	}
 	return crewID, nil
+}
+
+func ensureCrewAgentBead(manager crewWorkspaceGetter, bd agentBeadUpserter, townRoot, rigName, crewName string, worker *crew.CrewWorker, addErr error) (*crew.CrewWorker, string, bool, error) {
+	recovered := false
+	if errors.Is(addErr, crew.ErrCrewExists) {
+		var err error
+		worker, err = manager.Get(crewName)
+		if err != nil {
+			return nil, "", false, addErr
+		}
+		// Add persists these fields only after the workspace is fully created.
+		// Bare or crash-left directories therefore remain excluded identities.
+		if worker == nil || worker.CreatedAt.IsZero() || worker.Branch == "" {
+			return nil, "", false, fmt.Errorf("%w: workspace state is incomplete", crew.ErrCrewExists)
+		}
+		recovered = true
+	} else if addErr != nil {
+		return nil, "", false, addErr
+	}
+
+	crewID, err := upsertCrewAgentBead(bd, townRoot, rigName, crewName)
+	return worker, crewID, recovered, err
 }
 
 func runCrewAdd(cmd *cobra.Command, args []string) error {
@@ -101,6 +128,7 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 	var created []string
 	var failed []string
 	var lastWorker *crew.CrewWorker
+	succeeded := 0
 
 	// Process each name
 	for _, arg := range args {
@@ -119,33 +147,38 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 		// Create crew workspace
 		fmt.Printf("Creating crew workspace %s in %s...\n", name, rigName)
 
-		worker, err := crewMgr.Add(name, crewBranch)
+		worker, addErr := crewMgr.Add(name, crewBranch)
+		worker, crewID, recovered, err := ensureCrewAgentBead(crewMgr, bd, townRoot, rigName, name, worker, addErr)
+		if worker != nil && !recovered {
+			fmt.Printf("%s Created crew workspace: %s/%s\n",
+				style.Bold.Render("✓"), rigName, name)
+			fmt.Printf("  Path: %s\n", worker.ClonePath)
+			fmt.Printf("  Branch: %s\n", worker.Branch)
+			created = append(created, name)
+			lastWorker = worker
+			succeeded++
+		}
 		if err != nil {
-			if err == crew.ErrCrewExists {
-				style.PrintWarning("crew workspace '%s' already exists, skipping", name)
-				failed = append(failed, name+" (exists)")
+			if worker != nil && !recovered {
+				style.PrintWarning("could not create agent bead for %s: %v", name, err)
+				fmt.Println()
 				continue
 			}
-			style.PrintWarning("creating crew workspace '%s': %v", name, err)
-			failed = append(failed, name)
+			if errors.Is(err, crew.ErrCrewExists) {
+				style.PrintWarning("crew workspace '%s' already exists but is incomplete, skipping", name)
+				failed = append(failed, name+" (exists)")
+			} else {
+				style.PrintWarning("creating crew workspace or agent bead '%s': %v", name, err)
+				failed = append(failed, name)
+			}
 			continue
 		}
-
-		fmt.Printf("%s Created crew workspace: %s/%s\n",
-			style.Bold.Render("✓"), rigName, name)
-		fmt.Printf("  Path: %s\n", worker.ClonePath)
-		fmt.Printf("  Branch: %s\n", worker.Branch)
-
-		// Create (or reopen/update) agent bead for the crew worker.
-		crewID, err := upsertCrewAgentBead(bd, townRoot, rigName, name)
-		if err != nil {
-			style.PrintWarning("could not create agent bead for %s: %v", name, err)
+		if recovered {
+			fmt.Printf("%s Recovered crew agent bead: %s\n", style.Bold.Render("✓"), crewID)
+			succeeded++
 		} else {
 			fmt.Printf("  Agent bead: %s\n", crewID)
 		}
-
-		created = append(created, name)
-		lastWorker = worker
 		fmt.Println()
 	}
 
@@ -163,7 +196,7 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Return error if all failed
-	if len(created) == 0 && len(failed) > 0 {
+	if succeeded == 0 && len(failed) > 0 {
 		return fmt.Errorf("failed to create any crew workspaces")
 	}
 
