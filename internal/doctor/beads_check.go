@@ -82,6 +82,7 @@ func (c *PrefixConflictCheck) Run(ctx *CheckContext) *CheckResult {
 // - The beads were initialized before auto-derive existed with a different prefix
 type PrefixMismatchCheck struct {
 	FixableCheck
+	prefixGetter dbPrefixGetter
 }
 
 // NewPrefixMismatchCheck creates a new prefix mismatch check.
@@ -94,7 +95,18 @@ func NewPrefixMismatchCheck() *PrefixMismatchCheck {
 				CheckCategory:    CategoryConfig,
 			},
 		},
+		prefixGetter: &realDBPrefixGetter{},
 	}
+}
+
+func reconciledPrefix(registryPrefix, routePrefix, databasePrefix string) (string, error) {
+	registryPrefix = strings.TrimSuffix(strings.TrimSpace(registryPrefix), "-")
+	routePrefix = strings.TrimSuffix(strings.TrimSpace(routePrefix), "-")
+	databasePrefix = strings.TrimSuffix(strings.TrimSpace(databasePrefix), "-")
+	if routePrefix == "" || databasePrefix == "" || routePrefix != databasePrefix {
+		return "", fmt.Errorf("prefix evidence disagrees: registry=%q route=%q database=%q", registryPrefix, routePrefix, databasePrefix)
+	}
+	return routePrefix, nil
 }
 
 // Run checks for prefix mismatches between rigs.json and routes.jsonl.
@@ -228,7 +240,15 @@ func (c *PrefixMismatchCheck) Fix(ctx *CheckContext) error {
 		}
 
 		if rigEntry.BeadsConfig.Prefix != routePrefix {
-			rigEntry.BeadsConfig.Prefix = routePrefix
+			databasePrefix, err := c.prefixGetter.GetDBPrefix(filepath.Join(ctx.TownRoot, rigName))
+			if err != nil {
+				return fmt.Errorf("reading database prefix for %s: %w", rigName, err)
+			}
+			prefix, err := reconciledPrefix(rigEntry.BeadsConfig.Prefix, routePrefix, databasePrefix)
+			if err != nil {
+				return fmt.Errorf("reconciling prefix for %s: %w", rigName, err)
+			}
+			rigEntry.BeadsConfig.Prefix = prefix
 			rigsConfig.Rigs[rigName] = rigEntry
 			modified = true
 		}
