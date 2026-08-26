@@ -72,7 +72,7 @@ endif
 # the replaced binary broke session startup hooks → witness respawned → loop every 1-2 min.
 check-forward-only:
 ifndef SKIP_FORWARD_CHECK
-	@BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@'); \
+	@BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --verbose 2>/dev/null | sed -nE 's/.*(@|: )([a-f0-9]+)\)$$/\2/p' | head -1); \
 	if [ -n "$$BINARY_COMMIT" ] && [ "$$BINARY_COMMIT" != "unknown" ]; then \
 		HEAD_COMMIT=$$(git rev-parse HEAD 2>/dev/null); \
 		if [ "$$BINARY_COMMIT" = "$$HEAD_COMMIT" ] || [ "$$(git rev-parse --short HEAD)" = "$$BINARY_COMMIT" ]; then \

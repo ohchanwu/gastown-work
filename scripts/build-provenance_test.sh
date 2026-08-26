@@ -23,4 +23,14 @@ if ! grep -qE "(@|: )${expected_commit}\\)$" <<<"$version_output"; then
 	exit 1
 fi
 
+set +e
+forward_output="$(make -C "$REPO_ROOT" INSTALL_DIR="$BUILD_DIR" check-forward-only 2>&1)"
+forward_status=$?
+set -e
+if [[ $forward_status -eq 0 || "$forward_output" != *"Binary is already at HEAD, nothing to do"* ]]; then
+	echo "FAIL: check-forward-only did not recognize the exact built commit" >&2
+	echo "$forward_output" >&2
+	exit 1
+fi
+
 echo "PASS: official build uses only the explicit Gas Town commit label @$expected_commit"
