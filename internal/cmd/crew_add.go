@@ -22,7 +22,8 @@ type agentBeadUpserter interface {
 	CreateOrReopenAgentBead(id, title string, fields *beads.AgentFields) (*beads.Issue, error)
 }
 
-type crewWorkspaceGetter interface {
+type crewWorkspaceManager interface {
+	Add(name string, createBranch bool) (*crew.CrewWorker, error)
 	Get(name string) (*crew.CrewWorker, error)
 }
 
@@ -45,7 +46,7 @@ func upsertCrewAgentBead(bd agentBeadUpserter, townRoot, rigName, crewName strin
 	return crewID, nil
 }
 
-func ensureCrewAgentBead(manager crewWorkspaceGetter, bd agentBeadUpserter, townRoot, rigName, crewName string, worker *crew.CrewWorker, addErr error) (*crew.CrewWorker, string, bool, error) {
+func ensureCrewAgentBead(manager crewWorkspaceManager, bd agentBeadUpserter, townRoot, rigName, crewName string, worker *crew.CrewWorker, addErr error) (*crew.CrewWorker, string, bool, error) {
 	recovered := false
 	if errors.Is(addErr, crew.ErrCrewExists) {
 		var err error
@@ -123,7 +124,10 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 	crewMgr := crew.NewManager(r, crewGit)
 
 	bd := beads.New(beads.ResolveBeadsDir(r.Path))
+	return runCrewAddWith(args, baseRig, townRoot, crewBranch, crewMgr, bd)
+}
 
+func runCrewAddWith(args []string, baseRig, townRoot string, createBranch bool, crewMgr crewWorkspaceManager, bd agentBeadUpserter) error {
 	// Track results
 	var created []string
 	var failed []string
@@ -147,7 +151,7 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 		// Create crew workspace
 		fmt.Printf("Creating crew workspace %s in %s...\n", name, rigName)
 
-		worker, addErr := crewMgr.Add(name, crewBranch)
+		worker, addErr := crewMgr.Add(name, createBranch)
 		worker, crewID, recovered, err := ensureCrewAgentBead(crewMgr, bd, townRoot, rigName, name, worker, addErr)
 		if worker != nil && !recovered {
 			fmt.Printf("%s Created crew workspace: %s/%s\n",
@@ -156,11 +160,11 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  Branch: %s\n", worker.Branch)
 			created = append(created, name)
 			lastWorker = worker
-			succeeded++
 		}
 		if err != nil {
 			if worker != nil && !recovered {
 				style.PrintWarning("could not create agent bead for %s: %v", name, err)
+				failed = append(failed, name+" (agent bead)")
 				fmt.Println()
 				continue
 			}
@@ -173,9 +177,9 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 			}
 			continue
 		}
+		succeeded++
 		if recovered {
 			fmt.Printf("%s Recovered crew agent bead: %s\n", style.Bold.Render("✓"), crewID)
-			succeeded++
 		} else {
 			fmt.Printf("  Agent bead: %s\n", crewID)
 		}

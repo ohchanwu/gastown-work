@@ -15,11 +15,12 @@ import (
 )
 
 type fakeAgentBeadUpserter struct {
-	gotID    string
-	gotTitle string
-	gotField *beads.AgentFields
-	retErr   error
-	calls    int
+	gotID     string
+	gotTitle  string
+	gotField  *beads.AgentFields
+	retErr    error
+	retErrors []error
+	calls     int
 }
 
 // CreateOrReopenAgentBead captures invocation details so tests can assert on
@@ -29,6 +30,9 @@ func (f *fakeAgentBeadUpserter) CreateOrReopenAgentBead(id, title string, fields
 	f.gotID = id
 	f.gotTitle = title
 	f.gotField = fields
+	if len(f.retErrors) >= f.calls {
+		return nil, f.retErrors[f.calls-1]
+	}
 	if f.retErr != nil {
 		return nil, f.retErr
 	}
@@ -91,7 +95,7 @@ func TestUpsertCrewAgentBead(t *testing.T) {
 	})
 }
 
-func TestEnsureCrewAgentBeadRecoversAfterInitialUpsertFailure(t *testing.T) {
+func TestRunCrewAddRecoversAfterInitialUpsertFailure(t *testing.T) {
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
 		t.Fatalf("mkdir .beads: %v", err)
@@ -109,16 +113,14 @@ func TestEnsureCrewAgentBeadRecoversAfterInitialUpsertFailure(t *testing.T) {
 		t.Fatalf("git init --bare: %v\n%s", err, output)
 	}
 	workspaces := crew.NewManager(&rig.Rig{Name: "bti_ops_match", Path: rigPath, GitURL: bareRepo}, git.NewGit(rigPath))
-
-	worker, err := workspaces.Add("neo", false)
-	if err != nil {
-		t.Fatalf("initial workspace add: %v", err)
-	}
 	beadStore := &fakeAgentBeadUpserter{retErr: errors.New("temporary bead failure")}
 
-	firstWorker, _, recovered, err := ensureCrewAgentBead(workspaces, beadStore, townRoot, "bti_ops_match", "neo", worker, nil)
-	if err == nil || firstWorker != worker || recovered {
-		t.Fatalf("initial result = (%v, recovered=%v, err=%v), want created worker with bead error", firstWorker, recovered, err)
+	if err := runCrewAddWith([]string{"neo"}, "bti_ops_match", townRoot, false, workspaces, beadStore); err == nil {
+		t.Fatal("initial command returned nil, want bead failure")
+	}
+	worker, err := workspaces.Get("neo")
+	if err != nil {
+		t.Fatalf("get preserved workspace: %v", err)
 	}
 	statePath := filepath.Join(worker.ClonePath, "state.json")
 	stateBeforeRetry, err := os.ReadFile(statePath)
@@ -127,19 +129,8 @@ func TestEnsureCrewAgentBeadRecoversAfterInitialUpsertFailure(t *testing.T) {
 	}
 
 	beadStore.retErr = nil
-	duplicate, addErr := workspaces.Add("neo", false)
-	if duplicate != nil || !errors.Is(addErr, crew.ErrCrewExists) {
-		t.Fatalf("retry add = (%v, %v), want ErrCrewExists", duplicate, addErr)
-	}
-	retriedWorker, id, recovered, err := ensureCrewAgentBead(workspaces, beadStore, townRoot, "bti_ops_match", "neo", duplicate, addErr)
-	if err != nil {
-		t.Fatalf("retry: %v", err)
-	}
-	if retriedWorker.Name != worker.Name || retriedWorker.ClonePath != worker.ClonePath || !recovered {
-		t.Fatalf("retry result = (%v, recovered=%v), want persisted worker recovered", retriedWorker, recovered)
-	}
-	if id != "bom-bti_ops_match-crew-neo" {
-		t.Fatalf("retry id = %q, want %q", id, "bom-bti_ops_match-crew-neo")
+	if err := runCrewAddWith([]string{"neo"}, "bti_ops_match", townRoot, false, workspaces, beadStore); err != nil {
+		t.Fatalf("retry command: %v", err)
 	}
 	stateAfterRetry, err := os.ReadFile(statePath)
 	if err != nil {
@@ -147,5 +138,10 @@ func TestEnsureCrewAgentBeadRecoversAfterInitialUpsertFailure(t *testing.T) {
 	}
 	if !bytes.Equal(stateAfterRetry, stateBeforeRetry) || beadStore.calls != 2 {
 		t.Fatalf("retry changed workspace state=%v and bead calls=%d, want unchanged workspace and two bead attempts", !bytes.Equal(stateAfterRetry, stateBeforeRetry), beadStore.calls)
+	}
+
+	mixedStore := &fakeAgentBeadUpserter{retErrors: []error{errors.New("first bead failed"), nil}}
+	if err := runCrewAddWith([]string{"morpheus", "trinity"}, "bti_ops_match", townRoot, false, workspaces, mixedStore); err != nil {
+		t.Fatalf("mixed batch with one complete success: %v", err)
 	}
 }
