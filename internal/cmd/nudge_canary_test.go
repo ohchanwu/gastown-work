@@ -156,14 +156,14 @@ func TestConfirmWakeCanaryTurnDistinguishesResponseAndIdleFailures(t *testing.T)
 	}
 }
 
-func TestConfirmWakeCanaryDeliveryRequiresTurnProofAfterQueuedRetry(t *testing.T) {
+func TestConfirmWakeCanaryDeliveryRejectsQueuedOutcome(t *testing.T) {
 	confirmed := false
 	code, err := confirmWakeCanaryDelivery(witness.MayorNotificationQueued, func() (string, error) {
 		confirmed = true
 		return "", nil
 	})
-	if err != nil || code != "" || !confirmed {
-		t.Fatalf("queued retry confirmation = (%q, %v, called=%v), want successful turn proof", code, err, confirmed)
+	if err == nil || code != "notification-queued" || confirmed {
+		t.Fatalf("queued confirmation = (%q, %v, called=%v), want fail-closed without turn confirmation", code, err, confirmed)
 	}
 }
 
@@ -177,6 +177,46 @@ func TestWakeCanaryStartupChallengeRequiresFiniteReply(t *testing.T) {
 	}
 	if strings.Contains(instruction, response) {
 		t.Fatal("startup instruction contains the expected response before the model turn")
+	}
+}
+
+func TestValidateWakeCanaryReceiptEventsRejectsWrongDuplicateAndLateEvidence(t *testing.T) {
+	startedAt := time.Date(2026, 8, 27, 1, 0, 0, 0, time.UTC)
+	completedAt := startedAt.Add(time.Second)
+	valid := wakeCanaryReceiptEvent{
+		SchemaVersion: 1, Event: "prompt_submitted", DeliveryID: "ndg-first",
+		Session: session.MayorSessionName(), Runtime: "codex", SubmittedAt: startedAt.Add(time.Millisecond),
+	}
+	receipts, err := validateWakeCanaryReceiptEvents(
+		[]wakeCanaryReceiptEvent{valid}, nil, session.MayorSessionName(), 1, "private-nonce", startedAt, completedAt,
+	)
+	if err != nil || len(receipts) != 1 || receipts[0].NonceDigest != wakeCanaryDigest("private-nonce") {
+		t.Fatalf("valid receipt proof = %#v, %v", receipts, err)
+	}
+
+	tests := []struct {
+		name     string
+		events   []wakeCanaryReceiptEvent
+		previous []wakeCanaryReceipt
+		turn     int
+		nonce    string
+	}{
+		{name: "duplicate", events: []wakeCanaryReceiptEvent{valid, valid}, previous: receipts, turn: 2},
+		{name: "duplicate nonce", events: []wakeCanaryReceiptEvent{valid, {SchemaVersion: 1, Event: "prompt_submitted", DeliveryID: "ndg-second", Session: session.MayorSessionName(), Runtime: "codex", SubmittedAt: startedAt.Add(2 * time.Millisecond)}}, previous: receipts, turn: 2, nonce: "private-nonce"},
+		{name: "wrong session", events: []wakeCanaryReceiptEvent{{SchemaVersion: 1, Event: "prompt_submitted", DeliveryID: "ndg-wrong-session", Session: "live", Runtime: "codex", SubmittedAt: valid.SubmittedAt}}, turn: 1},
+		{name: "wrong runtime", events: []wakeCanaryReceiptEvent{{SchemaVersion: 1, Event: "prompt_submitted", DeliveryID: "ndg-wrong-runtime", Session: session.MayorSessionName(), Runtime: "claude", SubmittedAt: valid.SubmittedAt}}, turn: 1},
+		{name: "late", events: []wakeCanaryReceiptEvent{{SchemaVersion: 1, Event: "prompt_submitted", DeliveryID: "ndg-late", Session: session.MayorSessionName(), Runtime: "codex", SubmittedAt: completedAt.Add(time.Nanosecond)}}, turn: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nonce := tt.nonce
+			if nonce == "" {
+				nonce = "next-private-nonce"
+			}
+			if got, err := validateWakeCanaryReceiptEvents(tt.events, tt.previous, session.MayorSessionName(), tt.turn, nonce, startedAt, completedAt); err == nil {
+				t.Fatalf("invalid receipt proof accepted: %#v", got)
+			}
+		})
 	}
 }
 
@@ -562,15 +602,27 @@ func TestWakeCanarySessionConfigUsesIsolatedConfiguredMayorPreset(t *testing.T) 
 func TestWriteWakeCanaryStateIsSanitizedAtomicAndPrivate(t *testing.T) {
 	townRoot := t.TempDir()
 	state := wakeCanaryState{
-		SchemaVersion:         2,
+		SchemaVersion:         3,
 		InstalledBinaryCommit: "abc123",
 		MayorPreset:           "codex-mayor",
 		MayorProvider:         "codex",
 		PolecatPreset:         "codex-polecat",
 		PolecatProvider:       "codex",
-		AttemptedAt:           time.Now(),
-		Result:                "passed",
-		LatencyMS:             42,
+		Session:               session.MayorSessionName(),
+		Runtime:               "codex",
+		SessionAuthority:      strings.Repeat("a", 64),
+		Turns:                 1,
+		Submitted:             1,
+		Receipts: []wakeCanaryReceipt{{
+			Turn: 1, DeliveryID: "ndg-opaque", NonceDigest: strings.Repeat("b", 64),
+			SubmittedAt: time.Now(), WindowStartedAt: time.Now().Add(-time.Second), WindowCompletedAt: time.Now().Add(time.Second),
+		}},
+		ReceiptCount:  1,
+		ReceiptDigest: strings.Repeat("c", 64),
+		AttemptedAt:   time.Now(),
+		CompletedAt:   time.Now(),
+		Result:        "passed",
+		LatencyMS:     42,
 	}
 	path, err := writeWakeCanaryState(townRoot, state)
 	if err != nil {
@@ -595,11 +647,11 @@ func TestWriteWakeCanaryStateIsSanitizedAtomicAndPrivate(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 10 || got["schema_version"] != float64(2) || got["result"] != "passed" ||
+	if got["schema_version"] != float64(3) || got["result"] != "passed" || got["receipt_count"] != float64(1) ||
 		got["mayor_preset"] != "codex-mayor" || got["polecat_preset"] != "codex-polecat" {
 		t.Fatalf("state schema = %#v", got)
 	}
-	for _, forbidden := range []string{"session", "nonce", "message", "delivery_id"} {
+	for _, forbidden := range []string{"nonce", "message"} {
 		if _, ok := got[forbidden]; ok {
 			t.Fatalf("state leaked %s: %#v", forbidden, got)
 		}
@@ -619,7 +671,8 @@ func TestConfigureWakeCanarySandboxRolesUsesConfiguredPresetsAndProviders(t *tes
 		t.Fatalf("SaveTownSettings: %v", err)
 	}
 
-	got, err := configureWakeCanarySandboxRoles(&wakeCanarySandbox{TownRoot: t.TempDir()}, townRoot, "")
+	sandboxRoot := t.TempDir()
+	got, err := configureWakeCanarySandboxRoles(&wakeCanarySandbox{TownRoot: sandboxRoot}, townRoot, "")
 	if err != nil {
 		t.Fatalf("configureWakeCanarySandboxRoles: %v", err)
 	}
@@ -628,6 +681,9 @@ func TestConfigureWakeCanarySandboxRolesUsesConfiguredPresetsAndProviders(t *tes
 	}
 	if got.PolecatPreset != "codex-polecat" || got.PolecatProvider != "codex" {
 		t.Fatalf("polecat role evidence = %+v, want codex-polecat/codex", got)
+	}
+	if delay := config.LoadOperationalConfig(sandboxRoot).GetMailConfig().ReplyReminderDelayD(); delay != 0 {
+		t.Fatalf("sandbox reply reminder delay = %v, want disabled", delay)
 	}
 }
 
