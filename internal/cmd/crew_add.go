@@ -132,7 +132,6 @@ func runCrewAddWith(args []string, baseRig, townRoot string, createBranch bool, 
 	var created []string
 	var failed []string
 	var lastWorker *crew.CrewWorker
-	succeeded := 0
 
 	// Process each name
 	for _, arg := range args {
@@ -177,7 +176,6 @@ func runCrewAddWith(args []string, baseRig, townRoot string, createBranch bool, 
 			}
 			continue
 		}
-		succeeded++
 		if recovered {
 			fmt.Printf("%s Recovered crew agent bead: %s\n", style.Bold.Render("✓"), crewID)
 		} else {
@@ -195,13 +193,12 @@ func runCrewAddWith(args []string, baseRig, townRoot string, createBranch bool, 
 		}
 	}
 	if len(failed) > 0 {
-		fmt.Printf("%s Failed to create %d workspace(s): %v\n",
+		fmt.Printf("%s Failed to complete %d crew workspace(s): %v\n",
 			style.Warning.Render("!"), len(failed), failed)
 	}
 
-	// Return error if all failed
-	if succeeded == 0 && len(failed) > 0 {
-		return fmt.Errorf("failed to create any crew workspaces")
+	if len(failed) > 0 {
+		return fmt.Errorf("failed to complete %d crew workspace(s)", len(failed))
 	}
 
 	return nil
