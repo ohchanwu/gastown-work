@@ -453,6 +453,118 @@ exec %q "$@"
 	}
 }
 
+func TestNewSessionWithCommandAndEnvContext_CancellationAfterCommitCleansSessionProcess(t *testing.T) {
+	tm := newTestTmux(t)
+	mkfifo, err := exec.LookPath("mkfifo")
+	if err != nil {
+		t.Skip("mkfifo is required for the committed-session readiness handshake")
+	}
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	unrelated := "gt-test-create-cancel-unrelated-" + suffix
+	_ = tm.KillSession(unrelated)
+	if err := tm.NewSessionWithCommand(unrelated, t.TempDir(), "sleep 30"); err != nil {
+		t.Fatalf("create unrelated session: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(unrelated) })
+
+	session := "gt-test-create-cancel-after-commit-" + suffix
+	realTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := filepath.Join(t.TempDir(), "new-session-committed.fifo")
+	barrierOnce := filepath.Join(t.TempDir(), "new-session-committed-once")
+	if output, err := exec.Command(mkfifo, barrier).CombinedOutput(); err != nil {
+		t.Fatalf("create readiness FIFO %s: %v: %s", barrier, err, output)
+	}
+	type fifoResult struct {
+		payload []byte
+		err     error
+	}
+	readFIFO := func(path string) <-chan fifoResult {
+		result := make(chan fifoResult, 1)
+		go func() {
+			payload, err := os.ReadFile(path)
+			result <- fifoResult{payload: payload, err: err}
+		}()
+		return result
+	}
+	commitBoundary := readFIFO(barrier)
+	wrapperDir := t.TempDir()
+	wrapper := fmt.Sprintf(`#!/bin/sh
+case " $* " in
+	*" new-session "*)
+    if mkdir %q 2>/dev/null; then
+	  output="$(%q "$@")" || exit $?
+	  printf '%%s\n' "$output"
+      printf 'ready\n' > %q
+      exec /bin/sleep 30
+    fi
+    ;;
+esac
+exec %q "$@"
+`, barrierOnce, realTmux, barrier, realTmux)
+	if err := os.WriteFile(filepath.Join(wrapperDir, "tmux"), []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("write tmux barrier wrapper: %v", err)
+	}
+	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(session) })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- tm.NewSessionWithCommandAndEnvContext(ctx, session, t.TempDir(), "sleep 30", nil)
+	}()
+
+	select {
+	case ready := <-commitBoundary:
+		if ready.err != nil || strings.TrimSpace(string(ready.payload)) != "ready" {
+			t.Fatalf("committed new-session handshake = %q, err %v", ready.payload, ready.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for committed new-session handshake")
+	}
+	committedGeneration, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatalf("capture committed attempt generation: %v", err)
+	}
+	ownedPID, err := tm.GetPanePID(committedGeneration.PaneID)
+	if err != nil || strings.TrimSpace(ownedPID) == "" {
+		t.Fatalf("capture attempt-owned pane process: pid=%q err=%v", ownedPID, err)
+	}
+
+	cancel()
+	var creationErr error
+	select {
+	case err := <-errCh:
+		creationErr = err
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("creation error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for bounded failed-creation cleanup")
+	}
+
+	if running, err := tm.HasSession(session); err != nil || running {
+		current, _ := tm.CaptureSessionGeneration(session)
+		t.Fatalf("attempt-owned tmux session survived cancelled creation: running=%v err=%v creation=%v committed=%+v current=%+v", running, err, creationErr, committedGeneration, current)
+	}
+	if running, err := tm.HasSession(unrelated); err != nil || !running {
+		t.Fatalf("unrelated session removed by cancelled creation: running=%v err=%v", running, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for exec.Command("kill", "-0", ownedPID).Run() == nil && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := exec.Command("kill", "-0", ownedPID).Run(); err == nil {
+		state, _ := exec.Command("ps", "-o", "pid=,ppid=,state=,command=", "-p", ownedPID).CombinedOutput()
+		t.Fatalf("attempt-owned pane process %s survived cancelled creation (%v): %s", ownedPID, creationErr, state)
+	}
+}
+
 func TestWaitForRuntimeReadyContext_CancellationStopsDelay(t *testing.T) {
 	tm := newTestTmux(t)
 	waiter, ok := any(tm).(interface {

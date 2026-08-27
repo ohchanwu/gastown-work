@@ -955,10 +955,10 @@ func (t *Tmux) cleanupUnreturnedSessionGeneration(name, nonce string, generation
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), failedSessionCreationCleanupTimeout)
 		defer cleanupCancel()
 		observed, err := t.captureSessionGenerationContext(cleanupCtx, name)
-		if sessionGenerationCleanupTerminal(err) {
+		switch {
+		case errors.Is(err, ErrSessionNotFound), errors.Is(err, ErrNoServer):
 			return nil
-		}
-		if err != nil {
+		case err != nil:
 			return errors.Join(ErrSessionCleanupUnreconciled, err)
 		}
 		if observed.Nonce != nonce {
