@@ -1162,6 +1162,12 @@ func (t *Tmux) StartTransientSessionWithCommandAndEnv(name, workDir, command str
 		Name: name, SessionID: sessionID, PaneID: paneID, Nonce: nonce,
 		ServerPID: serverPID, ServerIdentity: serverIdentity, Transport: t.SessionTransport(),
 	}
+	if err := t.runGuardedSessionGeneration(
+		generation,
+		"set-environment -t "+generation.SessionID+" "+EnvSessionPane+" "+strings.TrimPrefix(generation.PaneID, "%"),
+	); err != nil && !sessionGenerationCleanupTerminal(err) {
+		return SessionGeneration{}, fmt.Errorf("persisting transient tmux pane: %w", err)
+	}
 	return generation, nil
 }
 

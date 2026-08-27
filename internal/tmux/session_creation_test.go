@@ -114,6 +114,36 @@ func TestNewSessionWithCommandAndEnvGenerationReturnsExactReceipt(t *testing.T) 
 	}
 }
 
+func TestStartTransientSessionWithCommandAndEnvPersistsCreatedPane(t *testing.T) {
+	t.Setenv(EnvSessionPane, "0")
+	tm := newTestTmux(t)
+	target := fmt.Sprintf("gt-transient-pane-target-%d", time.Now().UnixNano())
+	finalizer := fmt.Sprintf("gt-transient-pane-finalizer-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_ = tm.KillSession(target)
+		_ = tm.KillSession(finalizer)
+	})
+	if err := tm.NewSessionWithCommand(target, t.TempDir(), "sleep 30"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.StartTransientSessionWithCommandAndEnv(
+		finalizer,
+		t.TempDir(),
+		"sleep 30",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := tm.CaptureSessionGeneration(generation.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !generation.Equal(observed) {
+		t.Fatalf("transient generation = %+v, observed = %+v", generation, observed)
+	}
+}
+
 func TestStartTransientSessionWithCommandAndEnvSurvivesLastOwnedSession(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("transient host-session proof uses POSIX shell commands")
