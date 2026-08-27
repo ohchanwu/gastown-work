@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -16,6 +15,14 @@ import (
 var (
 	patrolReportSummary string
 	patrolReportSteps   string
+	patrolReportUpdate  = func(b *beads.Beads, patrolID string, opts beads.UpdateOptions) error {
+		return b.Update(patrolID, opts)
+	}
+	patrolReportGetRole   = GetRole
+	patrolReportCloseRoot = func(b *beads.Beads, reason string, ids ...string) error {
+		return b.ForceCloseWithReason(reason, ids...)
+	}
+	patrolReportValidate = validatePatrolForCloseout
 )
 
 var patrolReportCmd = &cobra.Command{
@@ -51,7 +58,7 @@ func init() {
 
 func runPatrolReport(cmd *cobra.Command, args []string) error {
 	// Resolve role
-	roleInfo, err := GetRole()
+	roleInfo, err := patrolReportGetRole()
 	if err != nil {
 		return fmt.Errorf("detecting role: %w", err)
 	}
@@ -87,30 +94,55 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("unsupported role for patrol report: %q", roleName)
 	}
 
-	// Find the active patrol
-	patrolID, _, hasPatrol, findErr := findActivePatrol(cfg)
-	if findErr != nil {
-		return fmt.Errorf("finding active patrol: %w", findErr)
+	expectedID, err := snapshotPatrolID(cfg)
+	if err != nil {
+		return fmt.Errorf("snapshotting current patrol: %w", err)
 	}
-	if !hasPatrol {
-		return fmt.Errorf("no active patrol found for %s", cfg.RoleName)
+	return withPatrolCustodyLock(cfg, func(lockedCfg PatrolConfig) error { return runPatrolReportLocked(lockedCfg, expectedID) })
+}
+
+// runPatrolReportLocked performs the full validate/write/close/spawn/proof
+// custody transaction while holding the canonical-assignee cross-process lock.
+func snapshotPatrolID(cfg PatrolConfig) (string, error) {
+	cfg, err := canonicalPatrolConfig(cfg)
+	if err != nil {
+		return "", err
 	}
+	b := cfg.Beads
+	if b == nil {
+		b = beads.New(cfg.BeadsDir)
+	}
+	roots, err := patrolAssignedWork(b, cfg.Assignee)
+	if err != nil {
+		return "", err
+	}
+	for _, root := range roots {
+		if strings.HasPrefix(root.Title, cfg.PatrolMolName) && root.Status == beads.StatusHooked {
+			return root.ID, nil
+		}
+	}
+	return "", fmt.Errorf("no active patrol found for %s", cfg.RoleName)
+}
+
+func runPatrolReportLocked(cfg PatrolConfig, expectedID string) error {
+	if err := verifyPatrolSuccessor(cfg, expectedID); err != nil {
+		return fmt.Errorf("patrol custody changed from expected root %s: %w", expectedID, err)
+	}
+	patrolID := expectedID
 
 	// Close the current patrol root with the summary
 	b := cfg.Beads
 	if b == nil {
 		b = beads.New(cfg.BeadsDir)
 	}
-
 	// Build step audit checklist
 	stepAudit := buildStepAudit(cfg.PatrolMolName, patrolReportSteps)
 
-	// Update the description with the patrol summary and step audit
-	desc := fmt.Sprintf("Patrol report: %s\n\n%s", patrolReportSummary, stepAudit)
-	if err := b.Update(patrolID, beads.UpdateOptions{
-		Description: &desc,
-	}); err != nil {
-		style.PrintWarning("could not update patrol summary: %v", err)
+	if err := patrolReportValidate(b, cfg, patrolID); err != nil {
+		return fmt.Errorf("validating patrol %s before close: %w", patrolID, err)
+	}
+	if err := persistPatrolReport(b, patrolID, patrolReportSummary, stepAudit); err != nil {
+		return fmt.Errorf("updating patrol summary: %w", err)
 	}
 
 	// Print the step audit for visibility
@@ -125,26 +157,42 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	}
 
 	// Close the patrol root
-	if err := b.ForceCloseWithReason("patrol cycle complete: "+patrolReportSummary, patrolID); err != nil {
+	if err := patrolReportCloseRoot(b, "patrol cycle complete: "+patrolReportSummary, patrolID); err != nil {
 		return fmt.Errorf("closing patrol %s: %w", patrolID, err)
+	}
+	closedRoot, err := patrolShow(b, patrolID)
+	if err != nil {
+		return fmt.Errorf("re-reading closed patrol %s: %w", patrolID, err)
+	}
+	if closedRoot.ID != patrolID || closedRoot.Status != "closed" {
+		return fmt.Errorf("patrol %s close was not authoritative", patrolID)
 	}
 
 	fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
 
 	// Start next cycle
-	newPatrolID, err := autoSpawnPatrol(cfg)
+	newPatrolID, err := autoSpawnPatrolLocked(cfg)
 	if err != nil {
-		if newPatrolID != "" {
-			fmt.Fprintf(os.Stderr, "warning: %s\n", err.Error())
-			fmt.Printf("New patrol: %s\n", newPatrolID)
-			return nil
-		}
 		return fmt.Errorf("starting next patrol cycle: %w", err)
+	}
+	if newPatrolID == patrolID {
+		return fmt.Errorf("patrol %s cannot be its own successor", patrolID)
+	}
+	if err := verifyPatrolSuccessor(cfg, newPatrolID); err != nil {
+		return fmt.Errorf("verifying new patrol successor: %w", err)
 	}
 
 	fmt.Printf("%s Started new patrol: %s\n", style.Success.Render("✓"), newPatrolID)
 	if cfg.RoleName == "deacon" {
 		stampDeaconHeartbeatOnReport(cfg.BeadsDir, patrolReportSummary)
+	}
+	return nil
+}
+
+func persistPatrolReport(b *beads.Beads, patrolID, summary, stepAudit string) error {
+	desc := fmt.Sprintf("Patrol report: %s\n\n%s", summary, stepAudit)
+	if err := patrolReportUpdate(b, patrolID, beads.UpdateOptions{Description: &desc}); err != nil {
+		return err
 	}
 	return nil
 }
