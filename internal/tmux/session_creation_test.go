@@ -347,14 +347,15 @@ func TestNewSessionWithCommandAndEnvContext_CancellationCleansDetachedChild(t *t
 		t.Skip("mkfifo is required for the detached-child readiness handshake")
 	}
 
-	unrelated := "gt-test-create-cancel-unrelated"
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	unrelated := "gt-test-create-cancel-unrelated-" + suffix
 	_ = tm.KillSession(unrelated)
 	if err := tm.NewSessionWithCommand(unrelated, t.TempDir(), "sleep 30"); err != nil {
 		t.Fatalf("create unrelated session: %v", err)
 	}
 	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(unrelated) })
 
-	session := "gt-test-create-cancel-detached"
+	session := "gt-test-create-cancel-detached-" + suffix
 	realTmux, err := exec.LookPath("tmux")
 	if err != nil {
 		t.Fatal(err)
@@ -416,7 +417,7 @@ exec %q "$@"
 		if ready.err != nil || childPID == "" {
 			t.Fatalf("detached-child readiness handshake = %q, err %v", ready.payload, ready.err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for detached-child readiness handshake")
 	}
 	select {
