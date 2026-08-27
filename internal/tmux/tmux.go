@@ -594,10 +594,11 @@ func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, work
 		return SessionGeneration{}, err
 	}
 
-	sessionEnv := make(map[string]string, len(env)+1)
+	sessionEnv := make(map[string]string, len(env)+2)
 	for key, value := range env {
 		sessionEnv[key] = value
 	}
+	sessionEnv[EnvSessionPane] = ""
 	nonce := uuid.NewString()
 	sessionEnv[EnvSessionGeneration] = nonce
 
@@ -615,6 +616,12 @@ func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, work
 	}
 	out, err := t.runContext(ctx, args...)
 	if err != nil {
+		if ctx.Err() == nil {
+			return SessionGeneration{}, err
+		}
+		if cleanupErr := t.cleanupUnreturnedSessionGeneration(name, nonce, SessionGeneration{}); cleanupErr != nil {
+			return SessionGeneration{}, errors.Join(err, cleanupErr)
+		}
 		return SessionGeneration{}, err
 	}
 	created := true
@@ -1112,10 +1119,11 @@ func (t *Tmux) StartTransientSessionWithCommandAndEnv(name, workDir, command str
 		return SessionGeneration{}, err
 	}
 
-	sessionEnv := make(map[string]string, len(env)+1)
+	sessionEnv := make(map[string]string, len(env)+2)
 	for key, value := range env {
 		sessionEnv[key] = value
 	}
+	sessionEnv[EnvSessionPane] = ""
 	nonce := uuid.NewString()
 	sessionEnv[EnvSessionGeneration] = nonce
 	args := []string{"new-session", "-d", "-P", "-F", "#{pid}\t#{session_id}\t#{pane_id}", "-s", name}
