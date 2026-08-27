@@ -101,7 +101,7 @@ func TestMailWorkValidation(t *testing.T) {
 	now := time.Date(2026, 8, 24, 7, 45, 0, 0, time.UTC)
 	claim := &WorkClaim{Actor: "gastown/Toast", ClaimedAt: now, Generation: testWorkGeneration()}
 	incompleteGeneration := testWorkGeneration()
-	incompleteGeneration.Custody = ""
+	incompleteGeneration.Nonce = ""
 
 	tests := []struct {
 		name    string
@@ -130,6 +130,29 @@ func TestMailWorkValidation(t *testing.T) {
 			err := tt.work.Validate(tt.state)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Validate(%s) error = %v, wantErr %v", tt.state, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestWorkGenerationValidationRequiresPortableIdentityFields(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*WorkGeneration)
+	}{
+		{name: "name", edit: func(g *WorkGeneration) { g.Name = "" }},
+		{name: "session ID", edit: func(g *WorkGeneration) { g.SessionID = "" }},
+		{name: "nonce", edit: func(g *WorkGeneration) { g.Nonce = "" }},
+		{name: "positive server PID", edit: func(g *WorkGeneration) { g.ServerPID = 0 }},
+		{name: "server identity", edit: func(g *WorkGeneration) { g.ServerIdentity = "" }},
+		{name: "canonical transport", edit: func(g *WorkGeneration) { g.Transport = tmux.SessionTransport{} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			generation := testWorkGeneration()
+			tt.edit(&generation)
+			if err := generation.validate(); err == nil {
+				t.Fatal("validate accepted incomplete generation")
 			}
 		})
 	}

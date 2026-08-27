@@ -53,6 +53,37 @@ func TestMailWorkStoreClaimDirectAndQueue(t *testing.T) {
 	}
 }
 
+func TestPortableMailWorkGenerationWithoutCustodyValidatesClaimsAndRemainsLive(t *testing.T) {
+	generation := testWorkGeneration()
+	generation.Custody = ""
+
+	t.Run("validates", func(t *testing.T) {
+		if err := generation.validate(); err != nil {
+			t.Fatalf("portable generation validation: %v", err)
+		}
+	})
+
+	t.Run("claims", func(t *testing.T) {
+		store := newFakeMailWorkStore(t, testMailWorkIssue(t, WorkRouteDirect))
+		work, err := NewMailWorkStore(store).Claim(context.Background(), "hq-task", "gastown/Toast", generation.Tmux(), nil)
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if work.Claim == nil || !work.Claim.Generation.Equal(generation) {
+			t.Fatalf("claim generation = %+v, want exact %+v", work.Claim, generation)
+		}
+	})
+
+	t.Run("remains live by exact comparison", func(t *testing.T) {
+		state := ClassifyMailWorkGeneration(&generation, func(receipt WorkGeneration) (tmux.SessionGeneration, error) {
+			return receipt.Tmux(), nil
+		})
+		if state != MailWorkGenerationLive {
+			t.Fatalf("generation state = %q, want %q", state, MailWorkGenerationLive)
+		}
+	})
+}
+
 func TestMailWorkStoreClaimIsIdempotentForExactGeneration(t *testing.T) {
 	store := newFakeMailWorkStore(t, testMailWorkIssue(t, WorkRouteDirect))
 	workStore := NewMailWorkStore(store)
@@ -96,6 +127,8 @@ func TestClassifyMailWorkGenerationEvidence(t *testing.T) {
 	generation := testWorkGeneration()
 	replacement := generation.Tmux()
 	replacement.Nonce = "replacement-generation"
+	replacementCustody := generation.Tmux()
+	replacementCustody.Custody = "replacement-custody"
 
 	tests := []struct {
 		name    string
@@ -108,6 +141,7 @@ func TestClassifyMailWorkGenerationEvidence(t *testing.T) {
 			return tmux.SessionGeneration{}, tmux.ErrSessionNotFound
 		}, want: MailWorkGenerationDead},
 		{name: "replaced", receipt: &generation, capture: func(WorkGeneration) (tmux.SessionGeneration, error) { return replacement, nil }, want: MailWorkGenerationReplaced},
+		{name: "custody replaced", receipt: &generation, capture: func(WorkGeneration) (tmux.SessionGeneration, error) { return replacementCustody, nil }, want: MailWorkGenerationReplaced},
 		{name: "missing", want: MailWorkGenerationMissing},
 		{name: "malformed", receipt: &WorkGeneration{}, want: MailWorkGenerationMalformed},
 		{name: "unknown", receipt: &generation, capture: func(WorkGeneration) (tmux.SessionGeneration, error) {

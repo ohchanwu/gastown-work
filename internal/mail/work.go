@@ -73,9 +73,9 @@ func (g WorkGeneration) Equal(other WorkGeneration) bool {
 
 func (g WorkGeneration) validate() error {
 	if strings.TrimSpace(g.Name) == "" || strings.TrimSpace(g.SessionID) == "" ||
-		strings.TrimSpace(g.Nonce) == "" || strings.TrimSpace(g.Custody) == "" ||
+		strings.TrimSpace(g.Nonce) == "" ||
 		g.ServerPID <= 0 || strings.TrimSpace(g.ServerIdentity) == "" {
-		return fmt.Errorf("incomplete session generation custody")
+		return fmt.Errorf("incomplete session generation")
 	}
 	if _, err := tmux.NewTmuxForSessionGeneration(g.Tmux()); err != nil {
 		return fmt.Errorf("invalid session generation: %w", err)
