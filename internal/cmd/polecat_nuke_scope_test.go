@@ -65,6 +65,9 @@ func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 2 {
 		t.Fatalf("real nuke custody proof calls = %d, want initial and lifecycle-locked recheck", calls)
 	}
+	if calls := callsTo(t, file, "provePolecatNukeCustody", "checkPolecatSafety"); calls != 1 {
+		t.Fatalf("custody proof safety rechecks = %d, want 1 inside each proof", calls)
+	}
 }
 
 func TestRunPolecatNukeLockedTeardownFailsClosedOnSessionError(t *testing.T) {
@@ -104,7 +107,9 @@ func TestPolecatNukeDryRunRefusesWhenCustodyProofFails(t *testing.T) {
 	})
 
 	proofCalls := 0
-	targets := []polecatTarget{{rigName: "rig", polecatName: "nitro", r: &rigpkg.Rig{}}}
+	r := &rigpkg.Rig{Name: "rig", Path: t.TempDir()}
+	mgr := polecatpkg.NewManager(r, nil, nil)
+	targets := []polecatTarget{{rigName: "rig", polecatName: "nitro", mgr: mgr, r: r}}
 	output := capturePolecatNukeStdout(t, func() {
 		err := runResolvedPolecatNuke(targets, func(string, string, *polecatpkg.Manager, *rigpkg.Rig, nukePolecatOptions) (polecatNukeCustody, error) {
 			proofCalls++
@@ -126,6 +131,41 @@ func TestPolecatNukeDryRunRefusesWhenCustodyProofFails(t *testing.T) {
 	}
 	if strings.Contains(output, "Would nuke rig/nitro") {
 		t.Fatalf("output falsely advertised nuke:\n%s", output)
+	}
+	for _, action := range []string{"Kill session", "Delete worktree", "Delete branch", "Reset agent bead"} {
+		if strings.Contains(output, action) {
+			t.Fatalf("output advertised blocked action %q:\n%s", action, output)
+		}
+	}
+}
+
+func TestWriteDryRunNukePlanReportsOnlyExecutableActions(t *testing.T) {
+	target := polecatTarget{rigName: "rig", polecatName: "nitro", r: &rigpkg.Rig{Path: "/town/rig"}}
+	tests := []struct {
+		name       string
+		result     *SafetyCheckResult
+		custodyErr error
+		force      bool
+		wantBlock  bool
+		wantAction bool
+	}{
+		{name: "safe", result: &SafetyCheckResult{}, wantAction: true},
+		{name: "safety blocked", result: &SafetyCheckResult{Blocked: true, Reasons: []string{"has active work"}}, wantBlock: true},
+		{name: "forced safety", result: &SafetyCheckResult{Blocked: true, Reasons: []string{"has active work"}}, force: true, wantAction: true},
+		{name: "custody blocked", result: &SafetyCheckResult{}, custodyErr: errors.New("generation changed"), force: true, wantBlock: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out strings.Builder
+			blocked := writeDryRunNukePlan(&out, target, tt.result, tt.custodyErr, tt.force)
+			if blocked != tt.wantBlock {
+				t.Fatalf("blocked = %v, want %v; output=%q", blocked, tt.wantBlock, out.String())
+			}
+			hasAction := strings.Contains(out.String(), "Kill session")
+			if hasAction != tt.wantAction {
+				t.Fatalf("action output = %v, want %v; output=%q", hasAction, tt.wantAction, out.String())
+			}
+		})
 	}
 }
 

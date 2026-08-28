@@ -1176,6 +1176,7 @@ type dogSessionStatus struct {
 	State           dogSessionState
 	GenerationMatch bool
 	Diagnostic      string
+	Err             error
 }
 
 func inspectDogSession(d *dog.Dog, sessions dogSessionController) dogSessionStatus {
@@ -1188,6 +1189,7 @@ func inspectDogSession(d *dog.Dog, sessions dogSessionController) dogSessionStat
 	if err != nil {
 		status.State = dogSessionUnknown
 		status.Diagnostic = "session identity could not be verified"
+		status.Err = err
 		return status
 	}
 	if d.SessionGeneration == nil {
@@ -1259,7 +1261,11 @@ func showDogStatus(mgr *dog.Manager, name string) error {
 		return fmt.Errorf("getting dog %s: %w", name, err)
 	}
 
-	return writeDogStatus(os.Stdout, d, inspectDogSession(d, tmux.NewTmux()), dogStatusJSON)
+	sessionStatus := inspectDogSession(d, tmux.NewTmux())
+	if sessionStatus.Err != nil {
+		return fmt.Errorf("checking dog session %s: %w", sessionStatus.Name, sessionStatus.Err)
+	}
+	return writeDogStatus(os.Stdout, d, sessionStatus, dogStatusJSON)
 }
 
 func showPackStatus(mgr *dog.Manager) error {

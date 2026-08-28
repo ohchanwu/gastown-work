@@ -145,6 +145,23 @@ git worktree add -b polecat/<name>-<timestamp> polecats/<name>
 Crew workspaces (`crew/<name>/`) are full git clones for human developers who need
 independent repos. Polecat sessions are ephemeral and benefit from worktree efficiency.
 
+### Lifecycle custody and closeout
+
+Polecat cleanup binds the normalized description fields and the authoritative
+structured hook/state columns into one generation snapshot. The final live
+revalidation runs inside the same per-agent lock as the atomic state/cleanup
+update. Every distinct current issue, structured hook, description hook, and
+last-source reference must resolve and be terminal; Git and branch-preservation
+discovery errors remain blockers.
+
+`gt polecat nuke` is a local retirement path, not a publication path. Ordinary
+nuke rechecks the full safety snapshot under the polecat lifecycle lock before
+exact-session teardown and incarnation-bound removal. Missing metadata or any
+reference drift fails closed, remote refs remain unchanged, and dry-run lists
+destructive actions only when the real command could execute them. Dog status
+similarly returns tmux transport failures instead of rendering unknown custody
+as a successful human or JSON response.
+
 ## Storage Layer: Dolt SQL Server
 
 All beads data is stored in a single Dolt SQL Server process per town. There is

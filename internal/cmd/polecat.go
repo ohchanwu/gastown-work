@@ -997,14 +997,22 @@ func getGitStateWithTargets(worktreePath string, targets []string) (*GitState, e
 		state.Clean = false
 	}
 
-	branch, _ := worktreeGit.CurrentBranch()
-	if preservation, preserveErr := worktreeGit.BranchPreservationStatus(branch, "origin", targets); preserveErr == nil {
-		state.ComparisonBase = preservation.ComparisonBase
-		state.UnpreservedPatchCount = preservation.UnpreservedPatchCount
-		if preservation.UnpreservedPatchCount > 0 {
-			state.UnpushedCommits = preservation.UnpreservedPatchCount
-			state.Clean = false
-		}
+	branch, err := worktreeGit.CurrentBranch()
+	if err != nil {
+		return nil, fmt.Errorf("current branch: %w", err)
+	}
+	if branch == "" || branch == "HEAD" {
+		return nil, errors.New("current branch: detached HEAD")
+	}
+	preservation, err := worktreeGit.BranchPreservationStatus(branch, "origin", targets)
+	if err != nil {
+		return nil, fmt.Errorf("branch preservation: %w", err)
+	}
+	state.ComparisonBase = preservation.ComparisonBase
+	state.UnpreservedPatchCount = preservation.UnpreservedPatchCount
+	if preservation.UnpreservedPatchCount > 0 {
+		state.UnpushedCommits = preservation.UnpreservedPatchCount
+		state.Clean = false
 	}
 
 	// Check for stashes using Git.StashCount() which filters by current branch.
@@ -1075,8 +1083,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		Branch:  p.Branch,
 		Issue:   p.Issue,
 	}
-	beadTerminal := isAssignedBeadTerminal(bd, status.Issue)
-	workTerminal := beadTerminal
+	workTerminal := isAssignedBeadTerminal(bd, status.Issue)
 	targetRefs, targetRefLookupFailed := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
 	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch}
 	var gitState *GitState
@@ -1116,19 +1123,19 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		status.ActiveMR = fields.ActiveMR
 		input.ActiveMR = fields.ActiveMR
 		hookBead := agentHookBead(agentIssue, fields)
-		hookSafe, hookTerminal, hookBlocker := hookBeadSafeForCleanup(bd, hookBead)
-		workTerminal = beadTerminal || hookTerminal
+		hookSafe, _, hookBlocker := hookBeadSafeForCleanup(bd, hookBead)
+		workRefs := agentWorkReferences(status.Issue, agentIssue, fields)
+		var workBlocker string
+		workTerminal, workBlocker = allWorkReferencesTerminal(bd, workRefs)
 		sourceHint := agentSourceIssueHint(status.Issue, fields)
-		targetRefs, targetRefLookupFailed = recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch, sourceHint)
+		targetRefs, targetRefLookupFailed = recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch, workRefs...)
 		if status.Issue == "" && sourceHint != "" {
 			status.Issue = sourceHint
 		}
-		if !beadTerminal && sourceHint != "" {
-			beadTerminal = isAssignedBeadTerminal(bd, sourceHint)
-			workTerminal = beadTerminal || hookTerminal
-		}
 		if hookBlocker != "" {
 			input.HookBead = hookBead
+		} else if workBlocker != "" {
+			input.HookBead = workBlocker
 		}
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
@@ -1148,10 +1155,11 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			})
 			if status.Issue == "" && activeMRAssessment.SourceIssue != "" {
 				status.Issue = activeMRAssessment.SourceIssue
-			}
-			if activeMRAssessment.SourceTerminal {
-				beadTerminal = true
-				workTerminal = true
+				workRefs = uniqueStrings(append(workRefs, activeMRAssessment.SourceIssue))
+				workTerminal, workBlocker = allWorkReferencesTerminal(bd, workRefs)
+				if input.HookBead == "" && workBlocker != "" {
+					input.HookBead = workBlocker
+				}
 			}
 			if activeMRAssessment.Pending {
 				input.ActiveMRBlocker = activeMRAssessment.Reason
@@ -1186,8 +1194,8 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			agentBeadID,
 			p,
 			fields,
-			func(proof cleanupReconcileProof) error {
-				return recheckPolecatCleanup(mgr, r, rigName, polecatName, bd, p, proof)
+			func(proof cleanupReconcileProof, currentIssue *beads.Issue, currentFields *beads.AgentFields) error {
+				return recheckPolecatCleanup(mgr, r, rigName, polecatName, bd, p, proof, currentIssue, currentFields)
 			},
 		)
 	}
@@ -1349,6 +1357,39 @@ func agentHookBead(agentIssue *beads.Issue, fields *beads.AgentFields) string {
 	return ""
 }
 
+func agentWorkReferences(currentIssue string, agentIssue *beads.Issue, fields *beads.AgentFields) []string {
+	refs := []string{currentIssue}
+	if agentIssue != nil {
+		refs = append(refs, agentIssue.HookBead)
+	}
+	if fields != nil {
+		refs = append(refs, fields.HookBead, fields.LastSourceIssue)
+	}
+	return uniqueStrings(refs)
+}
+
+func allWorkReferencesTerminal(bd issueShower, refs []string) (bool, string) {
+	for _, ref := range refs {
+		if ref == "" {
+			continue
+		}
+		if bd == nil {
+			return false, fmt.Sprintf("work_ref=%s status=unverified", ref)
+		}
+		issue, err := bd.Show(ref)
+		if err != nil {
+			return false, fmt.Sprintf("work_ref=%s status=lookup_error: %v", ref, err)
+		}
+		if issue == nil {
+			return false, fmt.Sprintf("work_ref=%s status=missing", ref)
+		}
+		if !beads.IssueStatus(issue.Status).IsTerminal() {
+			return false, fmt.Sprintf("work_ref=%s status=%s", ref, issue.Status)
+		}
+	}
+	return true, ""
+}
+
 func activeMRGitSafeForWorktree(worktreePath string) bool {
 	g := git.NewGit(worktreePath)
 	branch, err := g.CurrentBranch()
@@ -1387,10 +1428,11 @@ func hookBeadSafeForCleanup(bd issueShower, hookBead string) (safe bool, termina
 }
 
 type cleanupStatusUpdater interface {
-	CompareAndUpdateAgentDescriptionFields(
+	CompareRevalidateAndUpdateAgentDescriptionFields(
 		id string,
 		expected beads.AgentFieldExpectations,
 		updates beads.AgentFieldUpdates,
+		revalidate func(*beads.Issue, *beads.AgentFields) error,
 	) error
 }
 
@@ -1399,7 +1441,7 @@ type cleanupReconcileProof struct {
 	Expected beads.AgentFieldExpectations
 }
 
-type cleanupReconcileRecheck func(cleanupReconcileProof) error
+type cleanupReconcileRecheck func(cleanupReconcileProof, *beads.Issue, *beads.AgentFields) error
 
 func failCleanupReconcile(status *RecoveryStatus, blocker string) {
 	status.NeedsRecovery = true
@@ -1428,19 +1470,18 @@ func reconcileCleanupStatusIfSafe(
 		failCleanupReconcile(status, "cleanup_reconcile_failed: recheck unavailable")
 		return
 	}
-	if err := recheck(proof); err != nil {
-		failCleanupReconcile(status, fmt.Sprintf("cleanup_reconcile_failed: %v", err))
-		return
-	}
 	if updater == nil {
 		failCleanupReconcile(status, "cleanup_reconcile_failed: updater unavailable")
 		return
 	}
 	idle, clean := string(beads.AgentStateIdle), string(polecat.CleanupClean)
-	if err := updater.CompareAndUpdateAgentDescriptionFields(
+	if err := updater.CompareRevalidateAndUpdateAgentDescriptionFields(
 		agentBeadID,
 		proof.Expected,
 		beads.AgentFieldUpdates{AgentState: &idle, CleanupStatus: &clean},
+		func(issue *beads.Issue, current *beads.AgentFields) error {
+			return recheck(proof, issue, current)
+		},
 	); err != nil {
 		prefix := "cleanup_reconcile_failed"
 		if errors.Is(err, beads.ErrAgentFieldsChanged) {
@@ -1479,13 +1520,7 @@ func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat,
 	}
 	return cleanupReconcileProof{
 		Previous: previous,
-		Expected: beads.AgentFieldExpectations{
-			AgentState:    stringPointer(fields.AgentState),
-			Incarnation:   stringPointer(fields.Incarnation),
-			CleanupStatus: stringPointer(fields.CleanupStatus),
-			HookBead:      stringPointer(fields.HookBead),
-			ActiveMR:      stringPointer(fields.ActiveMR),
-		},
+		Expected: fields.LifecycleExpectations(),
 	}, true
 }
 
@@ -1582,6 +1617,8 @@ func recheckPolecatCleanup(
 	bd *beads.Beads,
 	original *polecat.Polecat,
 	proof cleanupReconcileProof,
+	agentIssue *beads.Issue,
+	fields *beads.AgentFields,
 ) error {
 	if mgr == nil || r == nil || bd == nil || original == nil {
 		return errors.New("recheck evidence unavailable")
@@ -1601,34 +1638,27 @@ func recheckPolecatCleanup(
 	sessionName := polecat.NewSessionManager(t, r).SessionName(polecatName)
 	evidence.SessionRunning, evidence.SessionErr = t.HasSession(sessionName)
 
-	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
-	agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
-	if err != nil {
-		return fmt.Errorf("agent_state=lookup_error: %w", err)
-	}
 	evidence.Fields = fields
 	if fields == nil {
 		return validateCleanupRecheckEvidence(evidence, proof)
 	}
 
 	hookBead := agentHookBead(agentIssue, fields)
-	hookSafe, hookTerminal, hookBlocker := hookBeadSafeForCleanup(bd, hookBead)
+	hookSafe, _, hookBlocker := hookBeadSafeForCleanup(bd, hookBead)
 	evidence.HookSafe = hookSafe
 	evidence.HookBlocker = hookBlocker
 
 	sourceHint := agentSourceIssueHint(fresh.Issue, fields)
-	workTerminal := sourceHint == "" && hookBead == ""
-	if sourceHint != "" {
-		workTerminal = isAssignedBeadTerminal(bd, sourceHint)
-	}
-	evidence.WorkTerminal = workTerminal || hookTerminal
+	workRefs := agentWorkReferences(fresh.Issue, agentIssue, fields)
+	workTerminal, _ := allWorkReferencesTerminal(bd, workRefs)
+	evidence.WorkTerminal = workTerminal
 
 	targetRefs, targetRefLookupFailed := recoveryTargetRefs(
 		bd,
 		fresh.Issue,
 		fields.ActiveMR,
 		fresh.Branch,
-		sourceHint,
+		workRefs...,
 	)
 	evidence.TargetRefLookupFailed = targetRefLookupFailed
 	gitState, gitErr := getGitStateWithTargets(fresh.ClonePath, targetRefs)
@@ -2025,7 +2055,8 @@ func runResolvedPolecatNuke(targets []polecatTarget, proveCustody polecatNukeCus
 
 	for _, p := range targets {
 		if polecatNukeDryRun {
-			safetyBlocked := !polecatNukeForce && checkPolecatSafety(p).Blocked
+			result := checkPolecatSafety(p)
+			safetyBlocked := !polecatNukeForce && result.Blocked
 			var custodyErr error
 			if !safetyBlocked {
 				_, custodyErr = proveCustody(
@@ -2036,25 +2067,8 @@ func runResolvedPolecatNuke(targets []polecatTarget, proveCustody polecatNukeCus
 					nukePolecatOptions{Force: polecatNukeForce},
 				)
 			}
-			blocked := safetyBlocked || custodyErr != nil
-			if safetyBlocked {
-				fmt.Printf("Would refuse to nuke %s/%s without --force:\n", p.rigName, p.polecatName)
-			} else if custodyErr != nil {
-				fmt.Printf("Would refuse to nuke %s/%s:\n", p.rigName, p.polecatName)
-				fmt.Printf("  - Custody proof: %v\n", custodyErr)
-			} else {
-				fmt.Printf("Would nuke %s/%s:\n", p.rigName, p.polecatName)
-			}
-			if blocked {
+			if writeDryRunNukePlan(os.Stdout, p, result, custodyErr, polecatNukeForce) {
 				dryRunBlocked++
-			}
-			fmt.Printf("  - Kill session: gt-%s-%s\n", p.rigName, p.polecatName)
-			fmt.Printf("  - Delete worktree: %s/polecats/%s\n", p.r.Path, p.polecatName)
-			fmt.Printf("  - Delete branch (if exists)\n")
-			fmt.Printf("  - Reset agent bead: %s\n", polecatBeadIDForRig(p.r, p.rigName, p.polecatName))
-
-			if custodyErr == nil {
-				displayDryRunSafetyCheck(p)
 			}
 			fmt.Println()
 			continue
@@ -2147,6 +2161,12 @@ func provePolecatNukeCustody(
 	opts nukePolecatOptions,
 ) (polecatNukeCustody, error) {
 	var custody polecatNukeCustody
+	if !opts.Force {
+		target := polecatTarget{rigName: rigName, polecatName: polecatName, mgr: mgr, r: r}
+		if result := checkPolecatSafety(target); result.Blocked {
+			return custody, fmt.Errorf("cannot nuke %s/%s: %s", rigName, polecatName, strings.Join(result.Reasons, "; "))
+		}
+	}
 	if err := checkNukeActiveMRSafety(mgr, polecatName, rigName, opts.Force); err != nil {
 		return custody, err
 	}
@@ -2284,22 +2304,21 @@ func nukeBranchPreservationTargets(
 	}
 	bd := beads.New(r.Path)
 	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
-	_, fields, err := bd.GetAgentBead(agentBeadID)
+	agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
 	if err != nil && !errors.Is(err, beads.ErrNotFound) {
 		return nil, fmt.Errorf("branch preservation agent lookup: %w", err)
 	}
 	activeMR := ""
-	sourceHint := polecatInfo.Issue
+	workRefs := agentWorkReferences(polecatInfo.Issue, agentIssue, fields)
 	if fields != nil {
 		activeMR = fields.ActiveMR
-		sourceHint = agentSourceIssueHint(sourceHint, fields)
 	}
 	targets, lookupFailed := recoveryTargetRefs(
 		bd,
 		polecatInfo.Issue,
 		activeMR,
 		polecatInfo.Branch,
-		sourceHint,
+		workRefs...,
 	)
 	if lookupFailed {
 		return nil, errors.New("branch preservation target lookup failed; run reconciliation before nuke")

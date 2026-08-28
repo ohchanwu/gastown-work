@@ -71,13 +71,13 @@ identity records until a narrow repair exists.
 
 ### Candidate repair
 
-`check-recovery --reconcile-cleanup` now immediately rechecks the polecat
-identity, tmux absence, hook ownership, terminal work, active merge request,
-worktree state, stash state, branch identity, and patch preservation. It then
-uses `CompareAndUpdateAgentDescriptionFields` to change `agent_state` and
-`cleanup_status` together only if the expected agent-bead fields are unchanged.
-Any evidence error or compare-and-set mismatch returns a stable
-`NEEDS_RECOVERY` result and leaves the durable record conservative.
+`check-recovery --reconcile-cleanup` now rechecks polecat identity, tmux
+absence, every distinct work reference, active merge request, worktree/stash
+state, branch identity, and patch preservation while the per-agent lock still
+protects the update. The guarded snapshot includes the structured hook/state
+columns as well as description fields, and changes `agent_state` plus
+`cleanup_status` together. Any lookup, preservation, revalidation, or
+compare-and-set failure returns stable `NEEDS_RECOVERY` and writes nothing.
 
 ## 2. `gt polecat nuke` can push implicitly
 
@@ -126,6 +126,11 @@ manager's historical push-before-remove path. Preservation is proved against
 the polecat's named branch rather than whichever branch happens to be checked
 out. Dynamic bare-origin tests reject any attempted receive and prove both that
 the remote ref set is unchanged and that local custody gates still apply.
+The same lifecycle lock now spans a second full safety proof, exact-session
+teardown, incarnation-bound worktree removal, and local branch deletion.
+Missing polecat metadata or a changed work reference refuses ordinary nuke;
+blocked dry-run output reports blockers without advertising actions that the
+real command would skip.
 
 ## 3. Dog closeout can target a reusable session name
 
@@ -176,7 +181,8 @@ kill can leave durable work state and runtime state disagreeing.
   generation record. Substitution and unknown tmux state fail closed.
 - Human and JSON status report work state separately from `running`, `absent`,
   `stale`, or `unknown` session state. Existing JSON consumers retain the old
-  dog fields while the new diagnostics are additive.
+  dog fields while the new diagnostics are additive. Tmux transport failures
+  return an error before either renderer writes a successful-looking status.
 - Real Cobra subprocess tests cover both dog completion entry points and use
   dedicated tmux sockets to prove the installed routing shape.
 

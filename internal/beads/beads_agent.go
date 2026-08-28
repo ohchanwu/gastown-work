@@ -61,7 +61,29 @@ type AgentFields struct {
 	MRFailed        bool   // True when MR creation was attempted but failed
 	PushFailed      bool   // True when branch push to origin failed (gas-556)
 	CompletionTime  string // RFC3339 timestamp of when gt done was called
+
+	structuredAgentState string
+	structuredHookBead   string
 }
+
+// LifecycleExpectations captures both compatibility description fields and
+// authoritative structured columns for a generation-bound update.
+func (fields *AgentFields) LifecycleExpectations() AgentFieldExpectations {
+	if fields == nil {
+		return AgentFieldExpectations{}
+	}
+	return AgentFieldExpectations{
+		AgentState:           agentStringPointer(fields.AgentState),
+		Incarnation:          agentStringPointer(fields.Incarnation),
+		CleanupStatus:        agentStringPointer(fields.CleanupStatus),
+		ActiveMR:             agentStringPointer(fields.ActiveMR),
+		HookBead:             agentStringPointer(fields.HookBead),
+		structuredAgentState: agentStringPointer(fields.structuredAgentState),
+		structuredHookBead:   agentStringPointer(fields.structuredHookBead),
+	}
+}
+
+func agentStringPointer(value string) *string { return &value }
 
 // Notification level constants
 const (
@@ -503,11 +525,13 @@ type AgentFieldUpdates struct {
 // their observed values before an update may be written. Nil fields are not
 // compared.
 type AgentFieldExpectations struct {
-	AgentState    *string
-	Incarnation   *string
-	CleanupStatus *string
-	ActiveMR      *string
-	HookBead      *string
+	AgentState           *string
+	Incarnation          *string
+	CleanupStatus        *string
+	ActiveMR             *string
+	HookBead             *string
+	structuredAgentState *string
+	structuredHookBead   *string
 }
 
 // ErrAgentFieldsChanged reports that an agent bead changed after the caller
@@ -546,7 +570,7 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return b.updateAgentDescriptionFieldsLocked(id, nil, updates)
+	return b.updateAgentDescriptionFieldsLocked(id, nil, updates, nil)
 }
 
 // CompareAndUpdateAgentDescriptionFields updates an agent description only if
@@ -556,8 +580,28 @@ func (b *Beads) CompareAndUpdateAgentDescriptionFields(
 	expected AgentFieldExpectations,
 	updates AgentFieldUpdates,
 ) (retErr error) {
+	return b.compareRevalidateAndUpdateAgentDescriptionFields(id, expected, updates, nil)
+}
+
+// CompareRevalidateAndUpdateAgentDescriptionFields performs a final live
+// revalidation while the same agent lock protects the guarded update.
+func (b *Beads) CompareRevalidateAndUpdateAgentDescriptionFields(
+	id string,
+	expected AgentFieldExpectations,
+	updates AgentFieldUpdates,
+	revalidate func(*Issue, *AgentFields) error,
+) error {
+	return b.compareRevalidateAndUpdateAgentDescriptionFields(id, expected, updates, revalidate)
+}
+
+func (b *Beads) compareRevalidateAndUpdateAgentDescriptionFields(
+	id string,
+	expected AgentFieldExpectations,
+	updates AgentFieldUpdates,
+	revalidate func(*Issue, *AgentFields) error,
+) (retErr error) {
 	if target := b.agentBeadTarget(); target != b {
-		return target.CompareAndUpdateAgentDescriptionFields(id, expected, updates)
+		return target.compareRevalidateAndUpdateAgentDescriptionFields(id, expected, updates, revalidate)
 	}
 	if err := validateAgentFieldUpdates(updates); err != nil {
 		return err
@@ -574,20 +618,21 @@ func (b *Beads) CompareAndUpdateAgentDescriptionFields(
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return b.updateAgentDescriptionFieldsLocked(id, &expected, updates)
+	return b.updateAgentDescriptionFieldsLocked(id, &expected, updates, revalidate)
 }
 
 func (b *Beads) updateAgentDescriptionFieldsLocked(
 	id string,
 	expected *AgentFieldExpectations,
 	updates AgentFieldUpdates,
+	revalidate func(*Issue, *AgentFields) error,
 ) error {
 	issue, err := b.Show(id)
 	if err != nil {
 		return err
 	}
 
-	fields := ParseAgentFields(issue.Description)
+	fields := agentFieldsFromIssue(issue)
 	if expected != nil {
 		checks := []struct {
 			name    string
@@ -599,11 +644,18 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 			{name: "cleanup_status", want: expected.CleanupStatus, current: fields.CleanupStatus},
 			{name: "active_mr", want: expected.ActiveMR, current: fields.ActiveMR},
 			{name: "hook_bead", want: expected.HookBead, current: fields.HookBead},
+			{name: "structured_agent_state", want: expected.structuredAgentState, current: fields.structuredAgentState},
+			{name: "structured_hook_bead", want: expected.structuredHookBead, current: fields.structuredHookBead},
 		}
 		for _, check := range checks {
 			if check.want != nil && check.current != *check.want {
 				return fmt.Errorf("%w: %s", ErrAgentFieldsChanged, check.name)
 			}
+		}
+	}
+	if revalidate != nil {
+		if err := revalidate(issue, fields); err != nil {
+			return err
 		}
 	}
 
@@ -797,9 +849,19 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 		return nil, nil, fmt.Errorf("issue %s is not an agent bead (type=%s)", id, issue.Type)
 	}
 
+	fields := agentFieldsFromIssue(issue)
+	return issue, fields, nil
+}
+
+func agentFieldsFromIssue(issue *Issue) *AgentFields {
+	if issue == nil {
+		return nil
+	}
 	fields := ParseAgentFields(issue.Description)
 	fields.AgentState = ResolveAgentState(issue.Description, issue.AgentState)
-	return issue, fields, nil
+	fields.structuredAgentState = strings.TrimSpace(issue.AgentState)
+	fields.structuredHookBead = strings.TrimSpace(issue.HookBead)
+	return fields
 }
 
 // InitializeAgentIncarnationIfMissing performs the sole permitted in-place

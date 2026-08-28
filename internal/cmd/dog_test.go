@@ -817,12 +817,13 @@ func TestDogStatusSessionStateClassification(t *testing.T) {
 		wantState  dogSessionState
 		wantMatch  bool
 		wantDiag   bool
+		wantErr    bool
 	}{
 		{name: "absent legacy", controller: &fakeDogSessionController{captureErr: tmux.ErrSessionNotFound}, wantState: dogSessionAbsent},
 		{name: "legacy live unknown", controller: &fakeDogSessionController{captured: oldGeneration}, wantState: dogSessionUnknown, wantDiag: true},
 		{name: "exact running", persisted: dog.SessionGenerationFromTmux(oldGeneration), controller: &fakeDogSessionController{captured: oldGeneration}, wantState: dogSessionRunning, wantMatch: true},
 		{name: "replacement stale", persisted: dog.SessionGenerationFromTmux(oldGeneration), controller: &fakeDogSessionController{captured: newGeneration}, wantState: dogSessionStale, wantDiag: true},
-		{name: "tmux failure unknown", persisted: dog.SessionGenerationFromTmux(oldGeneration), controller: &fakeDogSessionController{captureErr: errors.New("private process detail")}, wantState: dogSessionUnknown, wantDiag: true},
+		{name: "tmux failure unknown", persisted: dog.SessionGenerationFromTmux(oldGeneration), controller: &fakeDogSessionController{captureErr: errors.New("private process detail")}, wantState: dogSessionUnknown, wantDiag: true, wantErr: true},
 	}
 
 	for _, tc := range tests {
@@ -835,10 +836,39 @@ func TestDogStatusSessionStateClassification(t *testing.T) {
 			if (got.Diagnostic != "") != tc.wantDiag {
 				t.Fatalf("diagnostic = %q, want present=%v", got.Diagnostic, tc.wantDiag)
 			}
+			if (got.Err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want present=%v", got.Err, tc.wantErr)
+			}
 			if strings.Contains(got.Diagnostic, "private process detail") {
 				t.Fatalf("diagnostic leaked tmux detail: %q", got.Diagnostic)
 			}
 		})
+	}
+}
+
+func TestShowDogStatusFailsClosedOnSessionTransportError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX tmux stub")
+	}
+	mgr, townRoot := testDogManager(t)
+	now := time.Now()
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{Name: "alpha", State: dog.StateWorking, LastActive: now, CreatedAt: now, UpdatedAt: now})
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte("#!/bin/sh\necho transport-failed >&2\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldJSON := dogStatusJSON
+	dogStatusJSON = true
+	t.Cleanup(func() { dogStatusJSON = oldJSON })
+
+	var gotErr error
+	output := captureStdout(t, func() { gotErr = showDogStatus(mgr, "alpha") })
+	if gotErr == nil || !strings.Contains(gotErr.Error(), "checking dog session hq-dog-alpha") {
+		t.Fatalf("showDogStatus error = %v, want session transport failure", gotErr)
+	}
+	if output != "" {
+		t.Fatalf("showDogStatus output = %q before failed session check, want empty", output)
 	}
 }
 

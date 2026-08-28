@@ -19,7 +19,12 @@ func TestGetGitStateDistinguishesSharedStashes(t *testing.T) {
 	runGitCmd(t, repo, "add", "file.txt")
 	runGitCmd(t, repo, "commit", "-m", "base")
 	runGitCmd(t, repo, "branch", "-M", "main")
+	remote := filepath.Join(dir, "remote.git")
+	runGitCmd(t, "", "init", "--bare", remote)
+	runGitCmd(t, repo, "remote", "add", "origin", remote)
+	runGitCmd(t, repo, "push", "-u", "origin", "main")
 	runGitCmd(t, repo, "checkout", "-b", "other")
+	runGitCmd(t, repo, "push", "-u", "origin", "other")
 	runGitCmd(t, repo, "checkout", "main")
 	runGitCmd(t, repo, "worktree", "add", worktree, "other")
 
@@ -55,6 +60,20 @@ func TestGetGitStateDistinguishesSharedStashes(t *testing.T) {
 	}
 	if state.Clean {
 		t.Fatal("current branch stash must still mark this worktree dirty")
+	}
+}
+
+func TestGetGitStateFailsClosedWithoutPreservationReference(t *testing.T) {
+	repo := t.TempDir()
+	runGitCmd(t, "", "init", repo)
+	runGitCmd(t, repo, "config", "user.email", "test@example.com")
+	runGitCmd(t, repo, "config", "user.name", "Test User")
+	writeTestFile(t, filepath.Join(repo, "file.txt"), "base\n")
+	runGitCmd(t, repo, "add", "file.txt")
+	runGitCmd(t, repo, "commit", "-m", "base")
+
+	if _, err := getGitState(repo); err == nil {
+		t.Fatal("getGitState without an origin/upstream succeeded, want preservation error")
 	}
 }
 

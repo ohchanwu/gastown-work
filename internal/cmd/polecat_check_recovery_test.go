@@ -27,11 +27,19 @@ func (f fakeMRFinder) FindMRForBranchAny(branch string) (*beads.Issue, error) {
 }
 
 type fakeIssueShower struct {
-	issue *beads.Issue
-	err   error
+	issue  *beads.Issue
+	issues map[string]*beads.Issue
+	err    error
 }
 
 func (f fakeIssueShower) Show(issueID string) (*beads.Issue, error) {
+	if f.issues != nil {
+		issue, ok := f.issues[issueID]
+		if !ok {
+			return nil, beads.ErrNotFound
+		}
+		return issue, nil
+	}
 	return f.issue, f.err
 }
 
@@ -43,11 +51,33 @@ type fakeCleanupUpdater struct {
 	calls    int
 }
 
-func (f *fakeCleanupUpdater) CompareAndUpdateAgentDescriptionFields(
+func (f *fakeCleanupUpdater) CompareRevalidateAndUpdateAgentDescriptionFields(
 	id string,
 	expected beads.AgentFieldExpectations,
 	updates beads.AgentFieldUpdates,
+	revalidate func(*beads.Issue, *beads.AgentFields) error,
 ) error {
+	current := &beads.AgentFields{}
+	if expected.AgentState != nil {
+		current.AgentState = *expected.AgentState
+	}
+	if expected.Incarnation != nil {
+		current.Incarnation = *expected.Incarnation
+	}
+	if expected.CleanupStatus != nil {
+		current.CleanupStatus = *expected.CleanupStatus
+	}
+	if expected.ActiveMR != nil {
+		current.ActiveMR = *expected.ActiveMR
+	}
+	if expected.HookBead != nil {
+		current.HookBead = *expected.HookBead
+	}
+	if revalidate != nil {
+		if err := revalidate(&beads.Issue{}, current); err != nil {
+			return err
+		}
+	}
 	f.calls++
 	f.id = id
 	f.expected = expected
@@ -417,7 +447,7 @@ func TestReconcileCleanupStatusIfSafe(t *testing.T) {
 				AgentState:    string(beads.AgentStateStuck),
 				CleanupStatus: string(previous),
 				Incarnation:   "generation-1",
-			}, func(cleanupReconcileProof) error { return nil })
+			}, func(cleanupReconcileProof, *beads.Issue, *beads.AgentFields) error { return nil })
 
 			if updater.calls != 1 {
 				t.Fatalf("CompareAndUpdateAgentDescriptionFields calls = %d, want 1", updater.calls)
@@ -446,7 +476,7 @@ func TestReconcileCleanupStatusIfSafe_FailsClosed(t *testing.T) {
 		AgentState:    string(beads.AgentStateStuck),
 		CleanupStatus: string(polecat.CleanupUnpushed),
 		Incarnation:   "generation-1",
-	}, func(cleanupReconcileProof) error { return nil })
+	}, func(cleanupReconcileProof, *beads.Issue, *beads.AgentFields) error { return nil })
 
 	if status.Verdict != "NEEDS_RECOVERY" || !status.NeedsRecovery || status.SafeToNuke {
 		t.Fatalf("failed update verdict = %q needs=%v safe=%v, want NEEDS_RECOVERY true false", status.Verdict, status.NeedsRecovery, status.SafeToNuke)
@@ -463,7 +493,7 @@ func TestReconcileCleanupStatusIfSafeRechecksEverySafetyBoundary(t *testing.T) {
 			updater := &fakeCleanupUpdater{}
 			reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
 				AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed), Incarnation: "generation-1",
-			}, func(cleanupReconcileProof) error { return errors.New(boundary) })
+			}, func(cleanupReconcileProof, *beads.Issue, *beads.AgentFields) error { return errors.New(boundary) })
 
 			if updater.calls != 0 {
 				t.Fatalf("guarded update calls = %d, want 0", updater.calls)
@@ -536,7 +566,7 @@ func TestReconcileCleanupStatusIfSafeGenerationSubstitution(t *testing.T) {
 	updater := &fakeCleanupUpdater{err: fmt.Errorf("%w: agent_state", beads.ErrAgentFieldsChanged)}
 	reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
 		AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed), Incarnation: "generation-1",
-	}, func(cleanupReconcileProof) error { return nil })
+	}, func(cleanupReconcileProof, *beads.Issue, *beads.AgentFields) error { return nil })
 
 	if status.Reconciled || status.SafeToNuke || status.Verdict != "NEEDS_RECOVERY" {
 		t.Fatalf("status = %#v, want unchanged NEEDS_RECOVERY", status)
@@ -763,6 +793,42 @@ func TestFormatSafetyCheckBlockers(t *testing.T) {
 	want := "gastown/fury: cleanup_status=unknown; active_mr=hq-wisp-1 status=open | gastown/rust: has work on hook (gt-abc)"
 	if got != want {
 		t.Errorf("formatSafetyCheckBlockers() = %q, want %q", got, want)
+	}
+}
+
+func TestAllWorkReferencesTerminalRequiresEveryDistinctReference(t *testing.T) {
+	bd := fakeIssueShower{issues: map[string]*beads.Issue{
+		"current": {ID: "current", Status: "in_progress"},
+		"hook":    {ID: "hook", Status: "closed"},
+		"last":    {ID: "last", Status: "closed"},
+	}}
+	refs := agentWorkReferences("current", &beads.Issue{HookBead: "hook"}, &beads.AgentFields{HookBead: "hook", LastSourceIssue: "last"})
+	terminal, blocker := allWorkReferencesTerminal(bd, refs)
+	if terminal || !strings.Contains(blocker, "current") {
+		t.Fatalf("terminal=%v blocker=%q, want active current reference blocker", terminal, blocker)
+	}
+
+	bd.issues["current"].Status = "closed"
+	terminal, blocker = allWorkReferencesTerminal(bd, refs)
+	if !terminal || blocker != "" {
+		t.Fatalf("terminal=%v blocker=%q, want all terminal", terminal, blocker)
+	}
+}
+
+func TestPolecatMetadataFailureIsAlwaysASafetyBlocker(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		info *polecat.Polecat
+		err  error
+	}{
+		{name: "lookup error", err: errors.New("metadata unavailable")},
+		{name: "nil metadata"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if blocker := polecatMetadataSafetyBlocker(tc.info, tc.err); blocker == "" {
+				t.Fatal("missing polecat metadata was not blocked")
+			}
+		})
 	}
 }
 

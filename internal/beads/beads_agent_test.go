@@ -332,6 +332,79 @@ func TestCompareAndUpdateAgentDescriptionFieldsRejectsChangedExpectations(t *tes
 	}
 }
 
+func TestCompareRevalidateAndUpdateAgentDescriptionFieldsRejectsStructuredDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: stuck\nincarnation: generation-1\nhook_bead: null\ncleanup_status: has_unpushed"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"agent_state":"stuck","hook_bead":"gt-new","description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	expected := agentFieldsFromIssue(&Issue{Description: description, AgentState: "stuck"}).LifecycleExpectations()
+	idle, clean := "idle", "clean"
+	revalidated := false
+
+	err := bd.CompareRevalidateAndUpdateAgentDescriptionFields(
+		"gt-gastown-polecat-nux",
+		expected,
+		AgentFieldUpdates{AgentState: &idle, CleanupStatus: &clean},
+		func(*Issue, *AgentFields) error {
+			revalidated = true
+			return nil
+		},
+	)
+	if !errors.Is(err, ErrAgentFieldsChanged) {
+		t.Fatalf("error = %v, want ErrAgentFieldsChanged", err)
+	}
+	if revalidated {
+		t.Fatal("revalidated after structured hook drift")
+	}
+	if logOutput := readMockBDLog(t, logPath); strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q unexpectedly updated after structured drift", logOutput)
+	}
+}
+
+func TestCompareRevalidateAndUpdateAgentDescriptionFieldsPreservesOtherFields(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: stuck\nincarnation: generation-1\nhook_bead: null\ncleanup_status: has_unpushed\nactive_mr: mr-1\nnotification_level: muted\nbranch: polecat/nux/work\nlast_source_issue: gt-task"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"agent_state":"stuck","description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	fields := agentFieldsFromIssue(&Issue{Description: description, AgentState: "stuck"})
+	idle, clean := "idle", "clean"
+
+	err := bd.CompareRevalidateAndUpdateAgentDescriptionFields(
+		"gt-gastown-polecat-nux",
+		fields.LifecycleExpectations(),
+		AgentFieldUpdates{AgentState: &idle, CleanupStatus: &clean},
+		func(issue *Issue, current *AgentFields) error {
+			if issue == nil || current == nil || current.Branch != "polecat/nux/work" {
+				t.Fatalf("locked snapshot = issue=%+v fields=%+v", issue, current)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("CompareRevalidateAndUpdateAgentDescriptionFields: %v", err)
+	}
+	logOutput := readMockBDLog(t, logPath)
+	for _, want := range []string{"agent_state: idle", "cleanup_status: clean", "active_mr: mr-1", "notification_level: muted", "branch: polecat/nux/work", "last_source_issue: gt-task"} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("mock bd log %q missing preserved field %q", logOutput, want)
+		}
+	}
+}
+
 func TestInitializeAgentIncarnationIfMissingWritesOpaqueGeneration(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mocks for bd")
