@@ -353,7 +353,7 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationRejectsReplacementBeforeMutation
 	beforeCalls, afterCalls := 0, 0
 	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
 		"toast", "stale-generation", true, true, false,
-		func(*Polecat) error { beforeCalls++; return nil },
+		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil },
 		func() error { afterCalls++; return nil },
 	)
 	if !errors.Is(err, ErrPolecatIncarnationChanged) {
@@ -431,14 +431,19 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationShellPreflightDoesNotCommit(t *t
 	defer func() { _ = os.Chdir(originalCWD) }()
 
 	const incarnation = "fixture-generation"
+	beforeCalls := 0
 	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
-		"toast", incarnation, true, true, false, nil, nil,
+		"toast", incarnation, true, true, false,
+		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil }, nil,
 	)
 	if !errors.Is(err, ErrShellInWorktree) {
 		t.Fatalf("error = %v, want ErrShellInWorktree", err)
 	}
 	if errors.Is(err, ErrPolecatRetirementCommitted) {
 		t.Fatalf("shell preflight reported a committed retirement: %v", err)
+	}
+	if beforeCalls != 0 {
+		t.Fatalf("before-remove mutations = %d, want 0 before shell refusal", beforeCalls)
 	}
 	current, getErr := mgr.Get("toast")
 	if getErr != nil {
@@ -449,6 +454,137 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationShellPreflightDoesNotCommit(t *t
 	}
 	if _, statErr := os.Stat(p.ClonePath); statErr != nil {
 		t.Fatalf("worktree changed after shell preflight refusal: %v", statErr)
+	}
+}
+
+func TestRemoveWithOptionsLocalOnlyIfIncarnationActiveMRPreflightDoesNotMutate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	bdPath, err := exec.LookPath("bd")
+	if err != nil {
+		t.Fatalf("find mock bd: %v", err)
+	}
+	script := `#!/bin/sh
+id=""
+seen_show=0
+for arg in "$@"; do
+  if [ "$seen_show" = 0 ]; then
+    [ "$arg" = "show" ] && seen_show=1
+    continue
+  fi
+  case "$arg" in --*) continue ;; esac
+  id="$arg"
+  break
+done
+case "$id" in
+  *-polecat-toast)
+    printf '[{"id":"%s","title":"agent","issue_type":"agent","agent_state":"stuck","description":"agent\\n\\nrole_type: polecat\\nagent_state: stuck\\nincarnation: fixture-generation\\nhook_bead: null\\ncleanup_status: clean\\nactive_mr: mr-open\\nlast_source_issue: task-closed"}]\n' "$id"
+    ;;
+  mr-open)
+    printf '[{"id":"mr-open","title":"MR","issue_type":"merge-request","status":"open","description":"source_issue: task-closed"}]\n'
+    ;;
+  task-closed)
+    printf '[{"id":"task-closed","title":"task","issue_type":"task","status":"closed"}]\n'
+    ;;
+  *) printf '[]\n' ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatalf("replace mock bd: %v", err)
+	}
+
+	beforeCalls := 0
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", "fixture-generation", false, true, false,
+		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil }, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "still pending in merge queue") {
+		t.Fatalf("error = %v, want active-MR refusal", err)
+	}
+	if beforeCalls != 0 {
+		t.Fatalf("before-remove mutations = %d, want 0 before active-MR refusal", beforeCalls)
+	}
+	if _, statErr := os.Stat(p.ClonePath); statErr != nil {
+		t.Fatalf("worktree changed after active-MR refusal: %v", statErr)
+	}
+}
+
+func TestRemoveWithOptionsLocalOnlyIfIncarnationRejectsSameIncarnationSnapshotDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	agentID := mgr.agentBeadID("toast")
+	_, expectedFields, err := mgr.agentBeads().GetAgentBead(agentID)
+	if err != nil || expectedFields == nil {
+		t.Fatalf("capture expected agent fields: fields=%+v err=%v", expectedFields, err)
+	}
+
+	bdPath, err := exec.LookPath("bd")
+	if err != nil {
+		t.Fatalf("find mock bd: %v", err)
+	}
+	updateLog := filepath.Join(t.TempDir(), "updates.log")
+	script := fmt.Sprintf(`#!/bin/sh
+cmd=""
+id=""
+for arg in "$@"; do
+  case "$arg" in --*) continue ;; esac
+  if [ -z "$cmd" ]; then cmd="$arg"; continue; fi
+  id="$arg"
+  break
+done
+case "$cmd" in
+  show)
+    printf '[{"id":"%%s","title":"agent","issue_type":"agent","agent_state":"idle","hook_bead":"gt-new","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle\\nincarnation: fixture-generation\\nhook_bead: gt-new\\ncleanup_status: clean\\nactive_mr: null\\nbranch: polecat/toast/gt-work@abc123\\nlast_source_issue: gt-new"}]\n' "$id"
+    ;;
+  update) printf 'update %%s\n' "$id" >> %q ;;
+esac
+`, updateLog)
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatalf("replace mock bd: %v", err)
+	}
+
+	beforeCalls, afterCalls := 0, 0
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", "fixture-generation", true, true, false,
+		func(*Polecat) (*beads.AgentFields, error) {
+			beforeCalls++
+			return expectedFields, nil
+		},
+		func() error { afterCalls++; return nil },
+	)
+	if !errors.Is(err, beads.ErrAgentFieldsChanged) {
+		t.Fatalf("error = %v, want ErrAgentFieldsChanged", err)
+	}
+	if beforeCalls != 1 || afterCalls != 0 {
+		t.Fatalf("lifecycle callbacks = before:%d after:%d, want 1/0", beforeCalls, afterCalls)
+	}
+	if _, statErr := os.Stat(p.ClonePath); statErr != nil {
+		t.Fatalf("worktree lost after same-incarnation drift: %v", statErr)
+	}
+	if got := managerGitOutput(t, mayorRig, "rev-parse", "--verify", p.Branch); got == "" {
+		t.Fatalf("branch %s lost after same-incarnation drift", p.Branch)
+	}
+	_, currentFields, getErr := mgr.agentBeads().GetAgentBead(agentID)
+	if getErr != nil || currentFields == nil || currentFields.HookBead != "gt-new" {
+		t.Fatalf("drifted bead was not preserved: fields=%+v err=%v", currentFields, getErr)
+	}
+	if data, readErr := os.ReadFile(updateLog); readErr == nil && len(data) != 0 {
+		t.Fatalf("drifted bead was updated: %s", data)
+	} else if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatalf("read update log: %v", readErr)
 	}
 }
 

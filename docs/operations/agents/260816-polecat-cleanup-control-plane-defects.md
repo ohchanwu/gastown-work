@@ -127,10 +127,13 @@ the polecat's named branch rather than whichever branch happens to be checked
 out. Dynamic bare-origin tests reject any attempted receive and prove both that
 the remote ref set is unchanged and that local custody gates still apply.
 The same lifecycle lock now spans a second full safety proof, exact-session
-teardown, incarnation-bound worktree removal, and local branch deletion.
-Missing polecat metadata or a changed work reference refuses ordinary nuke;
-blocked dry-run output reports blockers without advertising actions that the
-real command would skip.
+teardown, post-stop Git/worktree/branch revalidation, full lifecycle-snapshot
+compare-and-set retirement, worktree removal, and local branch deletion.
+Refusal-only active-MR and shell preflights finish before exact-session teardown
+or molecule cleanup. Missing polecat metadata, a changed work reference,
+same-incarnation agent-field drift, or post-proof Git work refuses ordinary
+nuke without deleting the bead, worktree, or branch. Blocked dry-run output
+reports blockers without advertising actions that the real command would skip.
 
 ## 3. Dog closeout can target a reusable session name
 

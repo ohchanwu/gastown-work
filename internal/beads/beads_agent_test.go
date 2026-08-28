@@ -405,6 +405,34 @@ func TestCompareRevalidateAndUpdateAgentDescriptionFieldsPreservesOtherFields(t 
 	}
 }
 
+func TestResetAgentBeadForReuseIfUnchangedRejectsSameIncarnationLifecycleDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	before := "role_type: polecat\nrig: gastown\nagent_state: stuck\nincarnation: generation-1\nhook_bead: null\ncleanup_status: clean\nbranch: polecat/nux/old\nlast_source_issue: gt-old"
+	after := "role_type: polecat\nrig: gastown\nagent_state: stuck\nincarnation: generation-1\nhook_bead: gt-new\ncleanup_status: clean\nbranch: polecat/nux/new\nlast_source_issue: gt-new"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"agent_state":"stuck","hook_bead":"gt-new","description":%q}]`, after)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	expected := agentFieldsFromIssue(&Issue{Description: before, AgentState: "stuck"}).LifecycleExpectations()
+
+	err := bd.ResetAgentBeadForReuseIfUnchanged(
+		"gt-gastown-polecat-nux",
+		"polecat removed",
+		expected,
+	)
+	if !errors.Is(err, ErrAgentFieldsChanged) {
+		t.Fatalf("error = %v, want ErrAgentFieldsChanged", err)
+	}
+	if logOutput := readMockBDLog(t, logPath); strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q unexpectedly reset drifted lifecycle fields", logOutput)
+	}
+}
+
 func TestInitializeAgentIncarnationIfMissingWritesOpaqueGeneration(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mocks for bd")

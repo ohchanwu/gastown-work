@@ -78,6 +78,8 @@ func (fields *AgentFields) LifecycleExpectations() AgentFieldExpectations {
 		CleanupStatus:        agentStringPointer(fields.CleanupStatus),
 		ActiveMR:             agentStringPointer(fields.ActiveMR),
 		HookBead:             agentStringPointer(fields.HookBead),
+		Branch:               agentStringPointer(fields.Branch),
+		LastSourceIssue:      agentStringPointer(fields.LastSourceIssue),
 		structuredAgentState: agentStringPointer(fields.structuredAgentState),
 		structuredHookBead:   agentStringPointer(fields.structuredHookBead),
 	}
@@ -431,10 +433,23 @@ func (b *Beads) ResetAgentBeadForReuseIfIncarnation(id, reason, expectedIncarnat
 	if expectedIncarnation == "" {
 		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
 	}
-	return b.resetAgentBeadForReuse(id, reason, &expectedIncarnation)
+	expected := AgentFieldExpectations{Incarnation: &expectedIncarnation}
+	return b.resetAgentBeadForReuse(id, reason, &expected)
 }
 
-func (b *Beads) resetAgentBeadForReuse(id, reason string, expectedIncarnation *string) error {
+// ResetAgentBeadForReuseIfUnchanged retires only the exact lifecycle snapshot
+// observed by the caller. Mutable same-incarnation work cannot be erased.
+func (b *Beads) ResetAgentBeadForReuseIfUnchanged(id, reason string, expected AgentFieldExpectations) error {
+	if expected.AgentState == nil || expected.Incarnation == nil || expected.CleanupStatus == nil ||
+		expected.ActiveMR == nil || expected.HookBead == nil || expected.Branch == nil ||
+		expected.LastSourceIssue == nil || expected.structuredAgentState == nil || expected.structuredHookBead == nil ||
+		strings.TrimSpace(*expected.Incarnation) == "" {
+		return fmt.Errorf("%w: incomplete lifecycle snapshot", ErrAgentFieldsChanged)
+	}
+	return b.resetAgentBeadForReuse(id, reason, &expected)
+}
+
+func (b *Beads) resetAgentBeadForReuse(id, reason string, expected *AgentFieldExpectations) error {
 	// Lock the agent bead to prevent concurrent read-modify-write races.
 	// Without this, a concurrent CreateOrReopenAgentBead could overwrite
 	// the nuked state we're about to set. See gt-joazs.
@@ -453,9 +468,11 @@ func (b *Beads) resetAgentBeadForReuse(id, reason string, expectedIncarnation *s
 	}
 
 	// Parse existing fields and clear mutable ones
-	fields := ParseAgentFields(issue.Description)
-	if expectedIncarnation != nil && fields.Incarnation != *expectedIncarnation {
-		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	fields := agentFieldsFromIssue(issue)
+	if expected != nil {
+		if err := checkAgentFieldExpectations(fields, *expected); err != nil {
+			return err
+		}
 	}
 	fields.HookBead = ""      // Clear hook_bead
 	fields.ActiveMR = ""      // Clear active_mr
@@ -530,6 +547,8 @@ type AgentFieldExpectations struct {
 	CleanupStatus        *string
 	ActiveMR             *string
 	HookBead             *string
+	Branch               *string
+	LastSourceIssue      *string
 	structuredAgentState *string
 	structuredHookBead   *string
 }
@@ -634,23 +653,8 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 
 	fields := agentFieldsFromIssue(issue)
 	if expected != nil {
-		checks := []struct {
-			name    string
-			want    *string
-			current string
-		}{
-			{name: "agent_state", want: expected.AgentState, current: fields.AgentState},
-			{name: "incarnation", want: expected.Incarnation, current: fields.Incarnation},
-			{name: "cleanup_status", want: expected.CleanupStatus, current: fields.CleanupStatus},
-			{name: "active_mr", want: expected.ActiveMR, current: fields.ActiveMR},
-			{name: "hook_bead", want: expected.HookBead, current: fields.HookBead},
-			{name: "structured_agent_state", want: expected.structuredAgentState, current: fields.structuredAgentState},
-			{name: "structured_hook_bead", want: expected.structuredHookBead, current: fields.structuredHookBead},
-		}
-		for _, check := range checks {
-			if check.want != nil && check.current != *check.want {
-				return fmt.Errorf("%w: %s", ErrAgentFieldsChanged, check.name)
-			}
+		if err := checkAgentFieldExpectations(fields, *expected); err != nil {
+			return err
 		}
 	}
 	if revalidate != nil {
@@ -702,6 +706,33 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 
 	description := FormatAgentDescription(issue.Title, fields)
 	return b.Update(id, UpdateOptions{Description: &description})
+}
+
+func checkAgentFieldExpectations(fields *AgentFields, expected AgentFieldExpectations) error {
+	if fields == nil {
+		return fmt.Errorf("%w: missing agent fields", ErrAgentFieldsChanged)
+	}
+	checks := []struct {
+		name    string
+		want    *string
+		current string
+	}{
+		{name: "agent_state", want: expected.AgentState, current: fields.AgentState},
+		{name: "incarnation", want: expected.Incarnation, current: fields.Incarnation},
+		{name: "cleanup_status", want: expected.CleanupStatus, current: fields.CleanupStatus},
+		{name: "active_mr", want: expected.ActiveMR, current: fields.ActiveMR},
+		{name: "hook_bead", want: expected.HookBead, current: fields.HookBead},
+		{name: "branch", want: expected.Branch, current: fields.Branch},
+		{name: "last_source_issue", want: expected.LastSourceIssue, current: fields.LastSourceIssue},
+		{name: "structured_agent_state", want: expected.structuredAgentState, current: fields.structuredAgentState},
+		{name: "structured_hook_bead", want: expected.structuredHookBead, current: fields.structuredHookBead},
+	}
+	for _, check := range checks {
+		if check.want != nil && check.current != *check.want {
+			return fmt.Errorf("%w: %s", ErrAgentFieldsChanged, check.name)
+		}
+	}
+	return nil
 }
 
 // UpdateAgentCleanupStatus updates the cleanup_status field in an agent bead.

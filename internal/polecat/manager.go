@@ -1181,7 +1181,7 @@ func (m *Manager) RemoveWithOptionsLocalOnly(name string, force, nuclear, selfNu
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "")
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "", nil)
 }
 
 // RemoveWithOptionsLocalOnlyIfIncarnation holds the same per-polecat lifecycle
@@ -1191,7 +1191,7 @@ func (m *Manager) RemoveWithOptionsLocalOnly(name string, force, nuclear, selfNu
 func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 	name, expectedIncarnation string,
 	force, nuclear, selfNuke bool,
-	beforeRemove func(*Polecat) error,
+	beforeRemove func(*Polecat) (*beads.AgentFields, error),
 	afterRemove func() error,
 ) (retErr error) {
 	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
@@ -1216,12 +1216,14 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 		}
 		return fmt.Errorf("%w: expected %s, observed %s", ErrPolecatIncarnationChanged, expectedIncarnation, observed)
 	}
-	if beforeRemove != nil {
-		if err := beforeRemove(current); err != nil {
-			return err
+	beforeRetire := func() (*beads.AgentFields, error) {
+		if beforeRemove != nil {
+			return beforeRemove(current)
 		}
+		_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+		return fields, err
 	}
-	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation); err != nil {
+	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation, beforeRetire); err != nil {
 		return err
 	}
 	if afterRemove != nil {
@@ -1233,10 +1235,15 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 }
 
 func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) error {
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "")
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "", nil)
 }
 
-func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, selfNuke, publishBeforeRemoval bool, expectedIncarnation string) (retErr error) {
+func (m *Manager) removeWithOptionsLockedPolicy(
+	name string,
+	force, nuclear, selfNuke, publishBeforeRemoval bool,
+	expectedIncarnation string,
+	beforeRetire func() (*beads.AgentFields, error),
+) (retErr error) {
 	retirementCommitted := false
 	defer func() {
 		if retErr != nil && retirementCommitted {
@@ -1309,6 +1316,18 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 		}
 	}
 
+	var expectedAgentFields *beads.AgentFields
+	if beforeRetire != nil {
+		fields, beforeErr := beforeRetire()
+		if beforeErr != nil {
+			return beforeErr
+		}
+		expectedAgentFields = fields
+		if expectedAgentFields == nil || expectedAgentFields.Incarnation != expectedIncarnation {
+			return fmt.Errorf("%w: lifecycle snapshot", ErrPolecatIncarnationChanged)
+		}
+	}
+
 	// Reset agent bead FIRST, before any filesystem operations.
 	// This prevents a race where a concurrent sling allocates the same name,
 	// sets hook_bead, and then has it cleared by this cleanup. By resetting
@@ -1318,7 +1337,13 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 	// See gt-14b8o: close/reopen cycle breaks on Dolt backend.
 	agentID := m.agentBeadID(name)
 	var resetErr error
-	if expectedIncarnation != "" {
+	if expectedAgentFields != nil {
+		resetErr = m.agentBeads().ResetAgentBeadForReuseIfUnchanged(
+			agentID,
+			"polecat removed",
+			expectedAgentFields.LifecycleExpectations(),
+		)
+	} else if expectedIncarnation != "" {
 		resetErr = m.agentBeads().ResetAgentBeadForReuseIfIncarnation(agentID, "polecat removed", expectedIncarnation)
 	} else {
 		resetErr = m.resetAgentBeadForReuse(agentID, "polecat removed")

@@ -155,12 +155,15 @@ last-source reference must resolve and be terminal; Git and branch-preservation
 discovery errors remain blockers.
 
 `gt polecat nuke` is a local retirement path, not a publication path. Ordinary
-nuke rechecks the full safety snapshot under the polecat lifecycle lock before
-exact-session teardown and incarnation-bound removal. Missing metadata or any
-reference drift fails closed, remote refs remain unchanged, and dry-run lists
-destructive actions only when the real command could execute them. Dog status
-similarly returns tmux transport failures instead of rendering unknown custody
-as a successful human or JSON response.
+nuke completes refusal-only preflights before its destructive callback, then
+rechecks the full safety snapshot under the polecat lifecycle lock. It stops the
+exact session, revalidates the unchanged Git/worktree/branch snapshot, and
+atomically retires only the unchanged incarnation plus authoritative agent
+fields, including the last source issue. Missing metadata or post-proof drift
+fails closed without deleting bead, worktree, or branch state; remote refs
+remain unchanged, and dry-run lists destructive actions only when the real
+command could execute them. Dog status similarly returns tmux transport failures
+instead of rendering unknown custody as a successful human or JSON response.
 
 ## Storage Layer: Dolt SQL Server
 

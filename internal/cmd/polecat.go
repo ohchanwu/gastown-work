@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -2148,9 +2149,23 @@ type nukePolecatOptions struct {
 
 type polecatNukeCustody struct {
 	PolecatInfo    *polecat.Polecat
+	AgentFields    *beads.AgentFields
 	Session        polecat.SessionCustody
 	BranchToDelete string
 	BranchTargets  []string
+	Git            polecatNukeGitSnapshot
+}
+
+type polecatNukeGitSnapshot struct {
+	WorktreePresent       bool
+	Branch                string
+	Head                  string
+	HasUncommittedChanges bool
+	StashCount            int
+	UnpushedCommits       int
+	ModifiedFiles         []string
+	UntrackedFiles        []string
+	UnmergedFiles         []string
 }
 
 func provePolecatNukeCustody(
@@ -2196,16 +2211,17 @@ func provePolecatNukeCustody(
 		return custody, nil
 	}
 
-	branchTargets, err := nukeBranchPreservationTargets(r, rigName, polecatName, polecatInfo)
+	branchTargets, agentFields, err := nukeBranchPreservationTargets(r, rigName, polecatName, polecatInfo)
 	if err != nil {
 		return polecatNukeCustody{}, err
 	}
-	custody.BranchTargets = branchTargets
-	branchGit := git.NewGit(polecatInfo.ClonePath)
-	if _, statErr := os.Stat(polecatInfo.ClonePath); statErr != nil {
-		branchGit = getRepoGitForRig(r.Path)
+	custody.AgentFields = agentFields
+	if agentFields.Incarnation != polecatInfo.Incarnation {
+		return polecatNukeCustody{}, fmt.Errorf("%w during lifecycle snapshot capture", polecat.ErrPolecatIncarnationChanged)
 	}
-	if err := verifyPreservedLocalPolecatBranch(branchGit, custody.BranchToDelete, branchTargets); err != nil {
+	custody.BranchTargets = branchTargets
+	custody.Git, err = capturePolecatNukeGitCustody(r, custody)
+	if err != nil {
 		return polecatNukeCustody{}, fmt.Errorf("cannot nuke %s/%s: %w", rigName, polecatName, err)
 	}
 	return custody, nil
@@ -2219,6 +2235,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	polecatInfo := custody.PolecatInfo
 	branchToDelete := custody.BranchToDelete
 	branchTargets := custody.BranchTargets
+	retiredIssue := ""
 
 	sessMgr := polecat.NewSessionManager(tmux.NewTmux(), r)
 	// Hold the same lifecycle lock used by spawn/reuse from the second custody
@@ -2229,25 +2246,30 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		opts.Force,
 		true,
 		false,
-		func(current *polecat.Polecat) error {
+		func(_ *polecat.Polecat) (*beads.AgentFields, error) {
 			lockedCustody, lockedErr := provePolecatNukeCustody(polecatName, rigName, mgr, r, opts)
 			if lockedErr != nil {
-				return lockedErr
+				return nil, lockedErr
 			}
 			if lockedCustody.PolecatInfo == nil || lockedCustody.PolecatInfo.Incarnation != polecatInfo.Incarnation ||
 				lockedCustody.BranchToDelete != branchToDelete {
-				return fmt.Errorf("%w during nuke recheck", polecat.ErrPolecatIncarnationChanged)
+				return nil, fmt.Errorf("%w during nuke recheck", polecat.ErrPolecatIncarnationChanged)
 			}
-			return runPolecatNukeLockedTeardown(
-				func() error { return sessMgr.StopSessionCustody(custody.Session) },
-				func() {
-					if current.Issue != "" {
-						nukeCleanupMolecules(current.Issue, r)
-					}
-				},
-			)
+			if err := runPolecatNukeLockedTeardown(
+				func() error { return sessMgr.StopSessionCustody(lockedCustody.Session) },
+				func() error { return verifyPolecatNukeGitCustody(r, lockedCustody) },
+				nil,
+			); err != nil {
+				return nil, err
+			}
+			retiredIssue = lockedCustody.PolecatInfo.Issue
+			branchTargets = lockedCustody.BranchTargets
+			return lockedCustody.AgentFields, nil
 		},
 		func() error {
+			if retiredIssue != "" {
+				nukeCleanupMolecules(retiredIssue, r)
+			}
 			if branchToDelete == "" {
 				return nil
 			}
@@ -2280,11 +2302,17 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	return nil
 }
 
-func runPolecatNukeLockedTeardown(stopExactSession func() error, mutate func()) error {
+func runPolecatNukeLockedTeardown(stopExactSession, revalidateGit func() error, mutate func()) error {
 	if stopExactSession == nil {
 		return errors.New("exact session teardown unavailable")
 	}
 	if err := stopExactSession(); err != nil {
+		return err
+	}
+	if revalidateGit == nil {
+		return errors.New("post-stop Git custody recheck unavailable")
+	}
+	if err := revalidateGit(); err != nil {
 		return err
 	}
 	if mutate != nil {
@@ -2298,15 +2326,18 @@ func nukeBranchPreservationTargets(
 	rigName string,
 	polecatName string,
 	polecatInfo *polecat.Polecat,
-) ([]string, error) {
+) ([]string, *beads.AgentFields, error) {
 	if r == nil || polecatInfo == nil {
-		return nil, errors.New("branch preservation evidence unavailable")
+		return nil, nil, errors.New("branch preservation evidence unavailable")
 	}
 	bd := beads.New(r.Path)
 	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
 	agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
 	if err != nil && !errors.Is(err, beads.ErrNotFound) {
-		return nil, fmt.Errorf("branch preservation agent lookup: %w", err)
+		return nil, nil, fmt.Errorf("branch preservation agent lookup: %w", err)
+	}
+	if fields == nil {
+		return nil, nil, errors.New("branch preservation agent lifecycle snapshot unavailable")
 	}
 	activeMR := ""
 	workRefs := agentWorkReferences(polecatInfo.Issue, agentIssue, fields)
@@ -2321,9 +2352,78 @@ func nukeBranchPreservationTargets(
 		workRefs...,
 	)
 	if lookupFailed {
-		return nil, errors.New("branch preservation target lookup failed; run reconciliation before nuke")
+		return nil, nil, errors.New("branch preservation target lookup failed; run reconciliation before nuke")
 	}
-	return targets, nil
+	return targets, fields, nil
+}
+
+func capturePolecatNukeGitCustody(r *rig.Rig, custody polecatNukeCustody) (polecatNukeGitSnapshot, error) {
+	var snapshot polecatNukeGitSnapshot
+	if r == nil || custody.PolecatInfo == nil {
+		return snapshot, errors.New("Git custody evidence unavailable")
+	}
+
+	branchGit := getRepoGitForRig(r.Path)
+	if _, err := os.Stat(custody.PolecatInfo.ClonePath); err == nil {
+		snapshot.WorktreePresent = true
+		branchGit = git.NewGit(custody.PolecatInfo.ClonePath)
+		branch, err := branchGit.CurrentBranch()
+		if err != nil {
+			return snapshot, fmt.Errorf("resolving current branch: %w", err)
+		}
+		if custody.BranchToDelete != "" && branch != custody.BranchToDelete {
+			return snapshot, fmt.Errorf("current branch changed: got %s, want %s", branch, custody.BranchToDelete)
+		}
+		snapshot.Branch = branch
+		status, err := branchGit.CheckUncommittedWork()
+		if err != nil {
+			return snapshot, fmt.Errorf("capturing worktree state: %w", err)
+		}
+		snapshot.HasUncommittedChanges = status.HasUncommittedChanges
+		snapshot.StashCount = status.StashCount
+		snapshot.UnpushedCommits = status.UnpushedCommits
+		snapshot.ModifiedFiles = sortedStrings(status.ModifiedFiles)
+		snapshot.UntrackedFiles = sortedStrings(status.UntrackedFiles)
+		snapshot.UnmergedFiles = sortedStrings(status.UnmergedFiles)
+	} else if !os.IsNotExist(err) {
+		return snapshot, fmt.Errorf("checking polecat worktree: %w", err)
+	}
+
+	if custody.BranchToDelete == "" {
+		return snapshot, nil
+	}
+	head, err := branchGit.Rev(custody.BranchToDelete)
+	if err != nil {
+		return snapshot, fmt.Errorf("resolving branch head: %w", err)
+	}
+	snapshot.Head = head
+	if err := verifyPreservedLocalPolecatBranch(branchGit, custody.BranchToDelete, custody.BranchTargets); err != nil {
+		return snapshot, err
+	}
+	return snapshot, nil
+}
+
+func verifyPolecatNukeGitCustody(r *rig.Rig, expected polecatNukeCustody) error {
+	current, err := capturePolecatNukeGitCustody(r, expected)
+	if err != nil {
+		return err
+	}
+	if current.WorktreePresent != expected.Git.WorktreePresent ||
+		current.Branch != expected.Git.Branch || current.Head != expected.Git.Head ||
+		current.HasUncommittedChanges != expected.Git.HasUncommittedChanges ||
+		current.StashCount != expected.Git.StashCount || current.UnpushedCommits != expected.Git.UnpushedCommits ||
+		!slices.Equal(current.ModifiedFiles, expected.Git.ModifiedFiles) ||
+		!slices.Equal(current.UntrackedFiles, expected.Git.UntrackedFiles) ||
+		!slices.Equal(current.UnmergedFiles, expected.Git.UnmergedFiles) {
+		return errors.New("Git custody changed after exact session stop")
+	}
+	return nil
+}
+
+func sortedStrings(values []string) []string {
+	result := append([]string(nil), values...)
+	slices.Sort(result)
+	return result
 }
 
 func verifyPreservedLocalPolecatBranch(repoGit *git.Git, branch string, targets []string) error {

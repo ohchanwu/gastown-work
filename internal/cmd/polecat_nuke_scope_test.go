@@ -8,9 +8,11 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	gitpkg "github.com/steveyegge/gastown/internal/git"
 	polecatpkg "github.com/steveyegge/gastown/internal/polecat"
 	rigpkg "github.com/steveyegge/gastown/internal/rig"
 	tmuxpkg "github.com/steveyegge/gastown/internal/tmux"
@@ -65,6 +67,9 @@ func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 2 {
 		t.Fatalf("real nuke custody proof calls = %d, want initial and lifecycle-locked recheck", calls)
 	}
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "verifyPolecatNukeGitCustody"); calls != 1 {
+		t.Fatalf("post-stop Git custody rechecks = %d, want 1", calls)
+	}
 	if calls := callsTo(t, file, "provePolecatNukeCustody", "checkPolecatSafety"); calls != 1 {
 		t.Fatalf("custody proof safety rechecks = %d, want 1 inside each proof", calls)
 	}
@@ -75,6 +80,7 @@ func TestRunPolecatNukeLockedTeardownFailsClosedOnSessionError(t *testing.T) {
 	mutations := 0
 	err := runPolecatNukeLockedTeardown(
 		func() error { return stopErr },
+		func() error { return nil },
 		func() { mutations++ },
 	)
 	if !errors.Is(err, stopErr) {
@@ -89,6 +95,7 @@ func TestRunPolecatNukeLockedTeardownMutatesOnlyAfterExactStop(t *testing.T) {
 	mutations := 0
 	err := runPolecatNukeLockedTeardown(
 		func() error { return nil },
+		func() error { return nil },
 		func() { mutations++ },
 	)
 	if err != nil {
@@ -96,6 +103,79 @@ func TestRunPolecatNukeLockedTeardownMutatesOnlyAfterExactStop(t *testing.T) {
 	}
 	if mutations != 1 {
 		t.Fatalf("post-stop mutations = %d, want 1", mutations)
+	}
+}
+
+func TestRunPolecatNukeLockedTeardownRefusesPostStopGitDrift(t *testing.T) {
+	driftErr := errors.New("Git custody changed after exact session stop")
+	mutations := 0
+	order := make([]string, 0, 3)
+	err := runPolecatNukeLockedTeardown(
+		func() error {
+			order = append(order, "stop")
+			return nil
+		},
+		func() error {
+			order = append(order, "revalidate")
+			return driftErr
+		},
+		func() {
+			order = append(order, "mutate")
+			mutations++
+		},
+	)
+	if !errors.Is(err, driftErr) {
+		t.Fatalf("error = %v, want %v", err, driftErr)
+	}
+	if got := strings.Join(order, ","); got != "stop,revalidate" {
+		t.Fatalf("operation order = %q, want stop,revalidate", got)
+	}
+	if mutations != 0 {
+		t.Fatalf("worktree/branch/bead mutations = %d, want 0", mutations)
+	}
+}
+
+func TestVerifyPolecatNukeGitCustodyRefusesPostProofWork(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "polecat")
+	if err := os.MkdirAll(repo, 0755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	testRunGit(t, repo, "init", "-b", "main")
+	testRunGit(t, repo, "config", "user.email", "test@example.com")
+	testRunGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	testRunGit(t, repo, "add", "README.md")
+	testRunGit(t, repo, "commit", "-m", "fixture")
+	testRunGit(t, repo, "remote", "add", "origin", repo)
+	testRunGit(t, repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+	testRunGit(t, repo, "checkout", "-b", "polecat/test")
+
+	r := &rigpkg.Rig{Name: "rig", Path: t.TempDir()}
+	custody := polecatNukeCustody{
+		PolecatInfo:    &polecatpkg.Polecat{ClonePath: repo},
+		BranchToDelete: "polecat/test",
+		BranchTargets:  []string{"refs/remotes/origin/main"},
+	}
+	baseline, err := capturePolecatNukeGitCustody(r, custody)
+	if err != nil {
+		t.Fatalf("capture baseline custody: %v", err)
+	}
+	custody.Git = baseline
+	if err := os.WriteFile(filepath.Join(repo, "post-proof.txt"), []byte("new work\n"), 0644); err != nil {
+		t.Fatalf("write post-proof work: %v", err)
+	}
+
+	err = verifyPolecatNukeGitCustody(r, custody)
+	if err == nil || !strings.Contains(err.Error(), "Git custody changed") {
+		t.Fatalf("error = %v, want post-proof Git custody refusal", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repo, "post-proof.txt")); statErr != nil {
+		t.Fatalf("post-proof work was lost: %v", statErr)
+	}
+	if _, revErr := gitpkg.NewGit(repo).Rev("polecat/test"); revErr != nil {
+		t.Fatalf("branch lost after Git drift refusal: %v", revErr)
 	}
 }
 
