@@ -159,7 +159,11 @@ nuke completes refusal-only preflights before its destructive callback, then
 rechecks the full safety snapshot under the polecat lifecycle lock. It stops the
 exact session, revalidates the unchanged Git/worktree/branch snapshot, and
 atomically retires only the unchanged incarnation plus authoritative agent
-fields, including the last source issue. Missing metadata or post-proof drift
+fields, including every field reset for reuse. The final registered-worktree
+removal runs inside that same agent lock; a Git refusal is never converted into
+recursive deletion, and direct deletion requires positive standalone-clone
+classification. `gt done` lifecycle and checkpoint writers are bound to the
+incarnation captured at command start. Missing metadata or post-proof drift
 fails closed without deleting bead, worktree, or branch state; remote refs
 remain unchanged, and dry-run lists destructive actions only when the real
 command could execute them. Dog status similarly returns tmux transport failures

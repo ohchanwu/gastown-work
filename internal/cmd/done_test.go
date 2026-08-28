@@ -937,23 +937,23 @@ func TestShouldUpdateAgentStateOnDone(t *testing.T) {
 func TestUpdateAgentStateAfterSubmissionSkipsFailedSubmissions(t *testing.T) {
 	calls := 0
 	old := updateAgentStateOnDoneFn
-	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID string) error {
+	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID, expectedIncarnation string) error {
 		calls++
 		return nil
 	}
 	t.Cleanup(func() { updateAgentStateOnDoneFn = old })
 
-	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", true, false); err != nil {
+	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", true, false); err != nil {
 		t.Fatalf("updateAgentStateAfterSubmission push failure: %v", err)
 	}
-	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", false, true); err != nil {
+	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", false, true); err != nil {
 		t.Fatalf("updateAgentStateAfterSubmission mr failure: %v", err)
 	}
 	if calls != 0 {
 		t.Fatalf("state update calls after failed submissions = %d, want 0", calls)
 	}
 
-	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", false, false); err != nil {
+	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", false, false); err != nil {
 		t.Fatalf("updateAgentStateAfterSubmission clean submission: %v", err)
 	}
 	if calls != 1 {

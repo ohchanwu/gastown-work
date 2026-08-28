@@ -118,14 +118,18 @@ var newDoneSessionKiller = func() doneSessionKiller {
 	return tmux.NewTmux()
 }
 
-var updateAgentStateOnDoneFn = updateAgentStateOnDone
+var updateAgentStateOnDoneFn = updateAgentStateOnDoneIfIncarnation
 
-func updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID string, pushFailed, mrFailed bool) error {
+func updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID, expectedIncarnation string, pushFailed, mrFailed bool) error {
 	if !shouldUpdateAgentStateOnDone(pushFailed, mrFailed) {
 		style.PrintWarning("skipping agent cleanup because push or MR submission failed")
 		return nil
 	}
-	return updateAgentStateOnDoneFn(cwd, townRoot, exitType, issueID)
+	if strings.TrimSpace(expectedIncarnation) == "" {
+		style.PrintWarning("skipping agent lifecycle writes because the starting incarnation was unavailable")
+		return nil
+	}
+	return updateAgentStateOnDoneFn(cwd, townRoot, exitType, issueID, expectedIncarnation)
 }
 
 func resolveDonePolecatWorktree() (donePolecatWorktree, error) {
@@ -853,7 +857,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	worker := info.Worker
 
 	// Get agent bead ID for cross-referencing
-	var agentBeadID string
+	var agentBeadID, agentIncarnation string
 	if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil {
 		if actor := roleInfo.ActorString(); actor != "" {
 			sender = actor
@@ -872,7 +876,15 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// every write fails 'issue not found' and witness zombie detection +
 		// done-resume silently degrade. Best-effort: a failed recreate just
 		// leaves the existing warnings.
-		ensureAgentBeadExists(beads.New(cwd).ForAgentBead(), agentBeadID, ctx)
+		agentBd := beads.New(cwd).ForAgentBead()
+		ensureAgentBeadExists(agentBd, agentBeadID, ctx)
+		if agentBeadID != "" {
+			if incarnation, incarnationErr := agentBd.InitializeAgentIncarnationIfMissing(agentBeadID); incarnationErr != nil {
+				style.PrintWarning("could not bind gt done to agent incarnation: %v", incarnationErr)
+			} else {
+				agentIncarnation = incarnation
+			}
+		}
 
 		// Completion now exits the live polecat session after durable handoff.
 		// The agent bead keeps lifecycle metadata for witness/refinery cleanup.
@@ -926,8 +938,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if agentBeadID != "" {
 		// Agent bead lives in town DB despite rig prefix — bypass routing.
 		bd := beads.New(cwd).ForAgentBead()
-		setDoneIntentLabel(bd, agentBeadID, exitType)
-		checkpoints = readDoneCheckpoints(bd, agentBeadID)
+		setDoneIntentLabel(bd, agentBeadID, agentIncarnation, exitType)
+		checkpoints = readDoneCheckpoints(bd, agentBeadID, agentIncarnation)
 		if len(checkpoints) > 0 {
 			fmt.Printf("%s Resuming gt done from checkpoint (previous run was interrupted)\n", style.Bold.Render("→"))
 		}
@@ -1463,7 +1475,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if agentBeadID != "" {
 			// Agent bead lives in town DB despite rig prefix — bypass routing.
 			cpBd := beads.New(cwd).ForAgentBead()
-			writeDoneCheckpoint(cpBd, agentBeadID, CheckpointPushed, branch)
+			writeDoneCheckpoint(cpBd, agentBeadID, agentIncarnation, CheckpointPushed, branch)
 		}
 
 	afterPush:
@@ -1831,7 +1843,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// via ForAgentBead() to avoid the "issue not found" warning that
 			// leaves active_mr null after every gt done (hq-e73z).
 			if agentBeadID != "" {
-				if err := bd.ForAgentBead().UpdateAgentActiveMR(agentBeadID, mrID); err != nil {
+				if err := bd.ForAgentBead().UpdateAgentActiveMRIfIncarnation(agentBeadID, agentIncarnation, mrID); err != nil {
 					style.PrintWarning("could not update agent bead with active_mr: %v", err)
 				}
 			}
@@ -1858,7 +1870,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if mrID != "" && agentBeadID != "" {
 			// Agent bead lives in town DB despite rig prefix — bypass routing.
 			cpBd := beads.New(cwd).ForAgentBead()
-			writeDoneCheckpoint(cpBd, agentBeadID, CheckpointMRCreated, mrID)
+			writeDoneCheckpoint(cpBd, agentBeadID, agentIncarnation, CheckpointMRCreated, mrID)
 		}
 
 	afterMR:
@@ -1903,7 +1915,7 @@ notifyWitness:
 			PushFailed:     pushFailed,
 			CompletionTime: time.Now().UTC().Format(time.RFC3339),
 		}
-		if err := completionBd.UpdateAgentCompletion(agentBeadID, meta); err != nil {
+		if err := completionBd.UpdateAgentCompletionIfIncarnation(agentBeadID, agentIncarnation, meta); err != nil {
 			style.PrintWarning("could not write completion metadata to agent bead: %v", err)
 		}
 	}
@@ -1912,7 +1924,7 @@ notifyWitness:
 	if agentBeadID != "" {
 		// Agent bead lives in town DB despite rig prefix — bypass routing.
 		cpBd := beads.New(cwd).ForAgentBead()
-		writeDoneCheckpoint(cpBd, agentBeadID, CheckpointWitnessNotified, "ok")
+		writeDoneCheckpoint(cpBd, agentBeadID, agentIncarnation, CheckpointWitnessNotified, "ok")
 	}
 
 	// Log done event (townlog and activity feed)
@@ -1925,7 +1937,7 @@ notifyWitness:
 
 	// Update agent bead state (ZFC: self-report completion). If push/MR failed,
 	// keep the hook intact so Witness can recover the still-open work.
-	if err := updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID, pushFailed, mrFailed); err != nil {
+	if err := updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID, agentIncarnation, pushFailed, mrFailed); err != nil {
 		return err
 	}
 
@@ -2115,12 +2127,12 @@ func shouldNudgeRefinery(exitType, mrID string) bool {
 //
 // Follows the existing idle:N / backoff-until:TIMESTAMP label pattern.
 // Non-fatal: if this fails, gt done continues without the safety net.
-func setDoneIntentLabel(bd *beads.Beads, agentBeadID, exitType string) {
+func setDoneIntentLabel(bd *beads.Beads, agentBeadID, expectedIncarnation, exitType string) {
 	if agentBeadID == "" {
 		return
 	}
 	label := fmt.Sprintf("done-intent:%s:%d", exitType, time.Now().Unix())
-	if err := bd.Update(agentBeadID, beads.UpdateOptions{
+	if err := bd.UpdateAgentIfIncarnation(agentBeadID, expectedIncarnation, beads.UpdateOptions{
 		AddLabels: []string{label},
 	}); err != nil {
 		// Non-fatal: warn but continue
@@ -2131,7 +2143,7 @@ func setDoneIntentLabel(bd *beads.Beads, agentBeadID, exitType string) {
 // clearDoneIntentLabel removes any done-intent:* label from the agent bead.
 // Called at the end of updateAgentStateOnDone on clean exit.
 // Uses read-modify-write pattern (same as clearAgentBackoffUntil).
-func clearDoneIntentLabel(bd *beads.Beads, agentBeadID string) {
+func clearDoneIntentLabel(bd *beads.Beads, agentBeadID, expectedIncarnation string) {
 	if agentBeadID == "" {
 		return
 	}
@@ -2150,7 +2162,7 @@ func clearDoneIntentLabel(bd *beads.Beads, agentBeadID string) {
 		return // No done-intent label to clear
 	}
 
-	if err := bd.Update(agentBeadID, beads.UpdateOptions{
+	if err := bd.UpdateAgentIfIncarnation(agentBeadID, expectedIncarnation, beads.UpdateOptions{
 		RemoveLabels: toRemove,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't clear done-intent label on %s: %v\n", agentBeadID, err)
@@ -2171,12 +2183,12 @@ const (
 // writeDoneCheckpoint writes a checkpoint label on the agent bead.
 // Format: done-cp:<stage>:<value>:<unix-ts>
 // Non-fatal: if this fails, gt done continues without the checkpoint.
-func writeDoneCheckpoint(bd *beads.Beads, agentBeadID string, cp DoneCheckpoint, value string) {
+func writeDoneCheckpoint(bd *beads.Beads, agentBeadID, expectedIncarnation string, cp DoneCheckpoint, value string) {
 	if agentBeadID == "" {
 		return
 	}
 	label := fmt.Sprintf("done-cp:%s:%s:%d", cp, value, time.Now().Unix())
-	if err := bd.Update(agentBeadID, beads.UpdateOptions{
+	if err := bd.UpdateAgentIfIncarnation(agentBeadID, expectedIncarnation, beads.UpdateOptions{
 		AddLabels: []string{label},
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't write checkpoint %s on %s: %v\n", cp, agentBeadID, err)
@@ -2185,13 +2197,16 @@ func writeDoneCheckpoint(bd *beads.Beads, agentBeadID string, cp DoneCheckpoint,
 
 // readDoneCheckpoints reads all done-cp:* labels from the agent bead.
 // Returns a map of checkpoint stage -> value. Empty map if none found.
-func readDoneCheckpoints(bd *beads.Beads, agentBeadID string) map[DoneCheckpoint]string {
+func readDoneCheckpoints(bd *beads.Beads, agentBeadID, expectedIncarnation string) map[DoneCheckpoint]string {
 	checkpoints := make(map[DoneCheckpoint]string)
 	if agentBeadID == "" {
 		return checkpoints
 	}
 	issue, err := bd.Show(agentBeadID)
 	if err != nil {
+		return checkpoints
+	}
+	if fields := beads.ParseAgentFields(issue.Description); expectedIncarnation == "" || fields.Incarnation != expectedIncarnation {
 		return checkpoints
 	}
 	for _, label := range issue.Labels {
@@ -2210,7 +2225,7 @@ func readDoneCheckpoints(bd *beads.Beads, agentBeadID string) map[DoneCheckpoint
 
 // clearDoneCheckpoints removes all done-cp:* labels from the agent bead.
 // Called on clean exit to prevent stale checkpoints from interfering with future runs.
-func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
+func clearDoneCheckpoints(bd *beads.Beads, agentBeadID, expectedIncarnation string) {
 	if agentBeadID == "" {
 		return
 	}
@@ -2227,7 +2242,7 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 	if len(toRemove) == 0 {
 		return
 	}
-	if err := bd.Update(agentBeadID, beads.UpdateOptions{
+	if err := bd.UpdateAgentIfIncarnation(agentBeadID, expectedIncarnation, beads.UpdateOptions{
 		RemoveLabels: toRemove,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't clear done checkpoints on %s: %v\n", agentBeadID, err)
@@ -2247,7 +2262,14 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
+// updateAgentStateOnDone is retained for focused legacy tests. The live gt done
+// path always calls updateAgentStateOnDoneIfIncarnation through the guarded
+// updateAgentStateAfterSubmission entry point.
 func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
+	return updateAgentStateOnDoneIfIncarnation(cwd, townRoot, exitType, issueID, "")
+}
+
+func updateAgentStateOnDoneIfIncarnation(cwd, townRoot, exitType, issueID, expectedIncarnation string) error {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -2399,13 +2421,19 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 	}
 
 doneStateUpdate:
+	updateLifecycleFields := func(updates beads.AgentFieldUpdates) error {
+		if expectedIncarnation == "" {
+			return agentBd.UpdateAgentDescriptionFields(agentBeadID, updates)
+		}
+		return agentBd.UpdateAgentDescriptionFieldsIfIncarnation(agentBeadID, expectedIncarnation, updates)
+	}
 	// Clear hook_bead on the agent bead (gt-qbh). The hq-l6mm5 refactor made
 	// SetHookBead/ClearHookBead no-ops, but the witness still reads the
 	// hook_bead field from the agent bead snapshot. If the hooked bead is a
 	// wisp that gets reaped, the witness can't verify it was closed and flags
 	// the polecat as a zombie. Clearing hook_bead prevents this false positive.
 	emptyHook := ""
-	if err := agentBd.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{HookBead: &emptyHook}); err != nil {
+	if err := updateLifecycleFields(beads.AgentFieldUpdates{HookBead: &emptyHook}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't clear hook_bead on %s: %v\n", agentBeadID, err)
 	}
 
@@ -2421,8 +2449,7 @@ doneStateUpdate:
 	if exitType != ExitCompleted {
 		doneState = "stuck"
 	}
-	// Use UpdateAgentState to sync both column and description (gt-ulom).
-	if err := agentBd.UpdateAgentState(agentBeadID, doneState); err != nil {
+	if err := updateLifecycleFields(beads.AgentFieldUpdates{AgentState: &doneState}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't set agent %s to %s: %v\n", agentBeadID, doneState, err)
 	}
 
@@ -2431,7 +2458,8 @@ doneStateUpdate:
 	if doneCleanupStatus != "" {
 		cleanupStatus := parseCleanupStatus(doneCleanupStatus)
 		if cleanupStatus != polecat.CleanupUnknown {
-			if err := agentBd.UpdateAgentCleanupStatus(agentBeadID, string(cleanupStatus)); err != nil {
+			cleanup := string(cleanupStatus)
+			if err := updateLifecycleFields(beads.AgentFieldUpdates{CleanupStatus: &cleanup}); err != nil {
 				// Non-fatal: don't return — done-intent labels still need clearing (za-o9e)
 				fmt.Fprintf(os.Stderr, "Warning: couldn't update agent %s cleanup status: %v\n", agentBeadID, err)
 			}
@@ -2441,8 +2469,8 @@ doneStateUpdate:
 	// Clear done-intent label and checkpoints on clean exit — gt done completed
 	// successfully. If we don't reach here (crash/stuck), the Witness uses the
 	// lingering labels to detect the zombie and resume from checkpoints.
-	clearDoneIntentLabel(agentBd, agentBeadID)
-	clearDoneCheckpoints(agentBd, agentBeadID)
+	clearDoneIntentLabel(agentBd, agentBeadID, expectedIncarnation)
+	clearDoneCheckpoints(agentBd, agentBeadID, expectedIncarnation)
 	return nil
 }
 

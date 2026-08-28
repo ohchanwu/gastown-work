@@ -99,12 +99,28 @@ type SafetyCheckResult struct {
 // checkPolecatSafety performs safety checks before destructive operations.
 // Returns nil if the polecat is safe to operate on, or a SafetyCheckResult with reasons if blocked.
 func checkPolecatSafety(target polecatTarget) *SafetyCheckResult {
+	polecatInfo, infoErr := target.mgr.Get(target.polecatName)
+	bd := beads.New(target.r.Path)
+	agentBeadID := polecatBeadIDForRig(target.r, target.rigName, target.polecatName)
+	agentIssue, fields, agentErr := bd.GetAgentBead(agentBeadID)
+	return checkPolecatSafetySnapshot(target, polecatInfo, infoErr, bd, agentIssue, fields, agentErr)
+}
+
+// checkPolecatSafetySnapshot evaluates the exact lifecycle snapshot that a
+// destructive caller will later retire. It must not reload agent fields.
+func checkPolecatSafetySnapshot(
+	target polecatTarget,
+	polecatInfo *polecat.Polecat,
+	infoErr error,
+	bd *beads.Beads,
+	agentIssue *beads.Issue,
+	fields *beads.AgentFields,
+	agentErr error,
+) *SafetyCheckResult {
 	result := &SafetyCheckResult{
 		Polecat: fmt.Sprintf("%s/%s", target.rigName, target.polecatName),
 	}
 
-	// Get polecat info for branch name
-	polecatInfo, infoErr := target.mgr.Get(target.polecatName)
 	if blocker := polecatMetadataSafetyBlocker(polecatInfo, infoErr); blocker != "" {
 		result.Reasons = append(result.Reasons, blocker)
 		result.Blocked = true
@@ -112,11 +128,7 @@ func checkPolecatSafety(target polecatTarget) *SafetyCheckResult {
 	}
 
 	// Check 1: Unpushed commits via cleanup_status or git state
-	bd := beads.New(target.r.Path)
-	agentBeadID := polecatBeadIDForRig(target.r, target.rigName, target.polecatName)
-	agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
-
-	if err != nil || fields == nil {
+	if agentErr != nil || fields == nil {
 		// No agent bead - fall back to git check
 		if infoErr == nil && polecatInfo != nil {
 			gitState, gitErr := getGitState(polecatInfo.ClonePath)

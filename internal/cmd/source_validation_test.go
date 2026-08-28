@@ -169,7 +169,7 @@ func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 	doneIssue = "bd-source"
 	doneCleanupStatus = "unpushed"
 	doneSkipVerify = true
-	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID string) error { return nil }
+	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID, expectedIncarnation string) error { return nil }
 	if err := runDone(nil, nil); err != nil {
 		t.Fatalf("runDone: %v", err)
 	}

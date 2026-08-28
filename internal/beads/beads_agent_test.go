@@ -433,6 +433,69 @@ func TestResetAgentBeadForReuseIfUnchangedRejectsSameIncarnationLifecycleDrift(t
 	}
 }
 
+func TestLifecycleExpectationsRejectEveryResetFieldDrift(t *testing.T) {
+	base := &AgentFields{
+		AgentState: "stuck", Incarnation: "generation-1", CleanupStatus: "clean",
+		ActiveMR: "mr-1", Mode: "ralph", HookBead: "gt-work", ExitType: "COMPLETED",
+		MRID: "mr-1", Branch: "polecat/nux/work", LastSourceIssue: "gt-work",
+		MRFailed: true, PushFailed: true, CompletionTime: "2026-08-28T12:00:00Z",
+		structuredAgentState: "stuck", structuredHookBead: "gt-work",
+	}
+	tests := map[string]func(*AgentFields){
+		"agent_state":            func(f *AgentFields) { f.AgentState = "done" },
+		"incarnation":            func(f *AgentFields) { f.Incarnation = "generation-2" },
+		"cleanup_status":         func(f *AgentFields) { f.CleanupStatus = "has_unpushed" },
+		"active_mr":              func(f *AgentFields) { f.ActiveMR = "mr-2" },
+		"mode":                   func(f *AgentFields) { f.Mode = "" },
+		"hook_bead":              func(f *AgentFields) { f.HookBead = "gt-new" },
+		"exit_type":              func(f *AgentFields) { f.ExitType = "DEFERRED" },
+		"mr_id":                  func(f *AgentFields) { f.MRID = "mr-2" },
+		"branch":                 func(f *AgentFields) { f.Branch = "polecat/nux/new" },
+		"last_source_issue":      func(f *AgentFields) { f.LastSourceIssue = "gt-new" },
+		"mr_failed":              func(f *AgentFields) { f.MRFailed = false },
+		"push_failed":            func(f *AgentFields) { f.PushFailed = false },
+		"completion_time":        func(f *AgentFields) { f.CompletionTime = "2026-08-28T12:01:00Z" },
+		"structured_agent_state": func(f *AgentFields) { f.structuredAgentState = "done" },
+		"structured_hook_bead":   func(f *AgentFields) { f.structuredHookBead = "gt-new" },
+	}
+	expected := base.LifecycleExpectations()
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			current := *base
+			mutate(&current)
+			if err := checkAgentFieldExpectations(&current, expected); !errors.Is(err, ErrAgentFieldsChanged) {
+				t.Fatalf("error = %v, want ErrAgentFieldsChanged", err)
+			}
+		})
+	}
+}
+
+func TestUpdateAgentCompletionIfIncarnationRejectsReusedAgent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: working\nincarnation: generation-2\nhook_bead: gt-new"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+
+	err := bd.UpdateAgentCompletionIfIncarnation("gt-gastown-polecat-nux", "generation-1", &CompletionMetadata{ExitType: "COMPLETED"})
+	if !errors.Is(err, ErrAgentFieldsChanged) {
+		t.Fatalf("error = %v, want ErrAgentFieldsChanged", err)
+	}
+	err = bd.UpdateAgentIfIncarnation("gt-gastown-polecat-nux", "generation-1", UpdateOptions{AddLabels: []string{"done-cp:pushed:main:1"}})
+	if !errors.Is(err, ErrAgentFieldsChanged) {
+		t.Fatalf("label writer error = %v, want ErrAgentFieldsChanged", err)
+	}
+	if logOutput := readMockBDLog(t, logPath); strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("stale generation updated replacement bead: %s", logOutput)
+	}
+}
+
 func TestInitializeAgentIncarnationIfMissingWritesOpaqueGeneration(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mocks for bd")

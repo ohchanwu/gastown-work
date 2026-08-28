@@ -126,7 +126,10 @@ var (
 	ErrDiskSpaceLow               = errors.New("insufficient disk space")
 )
 
-var checkDiskSpace = util.CheckDiskSpace
+var (
+	checkDiskSpace      = util.CheckDiskSpace
+	getWorkingDirectory = os.Getwd
+)
 
 // UncommittedWorkError provides details about uncommitted work.
 type UncommittedWorkError struct {
@@ -1181,7 +1184,7 @@ func (m *Manager) RemoveWithOptionsLocalOnly(name string, force, nuclear, selfNu
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "", nil)
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "", nil, false)
 }
 
 // RemoveWithOptionsLocalOnlyIfIncarnation holds the same per-polecat lifecycle
@@ -1223,7 +1226,7 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 		_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
 		return fields, err
 	}
-	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation, beforeRetire); err != nil {
+	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation, beforeRetire, false); err != nil {
 		return err
 	}
 	if afterRemove != nil {
@@ -1235,7 +1238,7 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 }
 
 func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) error {
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "", nil)
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "", nil, false)
 }
 
 func (m *Manager) removeWithOptionsLockedPolicy(
@@ -1243,6 +1246,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	force, nuclear, selfNuke, publishBeforeRemoval bool,
 	expectedIncarnation string,
 	beforeRetire func() (*beads.AgentFields, error),
+	allowStructurallyBrokenDirectRemoval bool,
 ) (retErr error) {
 	retirementCommitted := false
 	defer func() {
@@ -1301,70 +1305,21 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	// is inside the worktree. Once the exact incarnation is reset, a retry can
 	// no longer prove custody with the old receipt.
 	if !selfNuke {
-		cwd, cwdErr := os.Getwd()
-		if cwdErr == nil {
-			cwdAbs, absErr1 := canonicalExistingPath(cwd)
-			cloneAbs, absErr2 := canonicalExistingPath(clonePath)
-			polecatAbs, absErr3 := canonicalExistingPath(polecatDir)
-			if absErr1 != nil || absErr2 != nil || absErr3 != nil {
-				return fmt.Errorf("cannot verify shell safety: failed to resolve paths")
-			}
-			if strings.HasPrefix(cwdAbs, cloneAbs) || strings.HasPrefix(cwdAbs, polecatAbs) {
-				return fmt.Errorf("%w: your shell is in %s\n\nPlease cd elsewhere first, then retry:\n  cd ~/gt\n  gt polecat nuke %s/%s --force",
-					ErrShellInWorktree, cwd, m.rig.Name, name)
-			}
+		cwd, cwdErr := getWorkingDirectory()
+		if cwdErr != nil {
+			return fmt.Errorf("cannot verify shell safety: current directory unavailable: %w", cwdErr)
+		}
+		cwdAbs, absErr1 := canonicalExistingPath(cwd)
+		cloneAbs, absErr2 := canonicalExistingPath(clonePath)
+		polecatAbs, absErr3 := canonicalExistingPath(polecatDir)
+		if absErr1 != nil || absErr2 != nil || absErr3 != nil {
+			return fmt.Errorf("cannot verify shell safety: failed to resolve paths")
+		}
+		if strings.HasPrefix(cwdAbs, cloneAbs) || strings.HasPrefix(cwdAbs, polecatAbs) {
+			return fmt.Errorf("%w: your shell is in %s\n\nPlease cd elsewhere first, then retry:\n  cd ~/gt\n  gt polecat nuke %s/%s --force",
+				ErrShellInWorktree, cwd, m.rig.Name, name)
 		}
 	}
-
-	var expectedAgentFields *beads.AgentFields
-	if beforeRetire != nil {
-		fields, beforeErr := beforeRetire()
-		if beforeErr != nil {
-			return beforeErr
-		}
-		expectedAgentFields = fields
-		if expectedAgentFields == nil || expectedAgentFields.Incarnation != expectedIncarnation {
-			return fmt.Errorf("%w: lifecycle snapshot", ErrPolecatIncarnationChanged)
-		}
-	}
-
-	// Reset agent bead FIRST, before any filesystem operations.
-	// This prevents a race where a concurrent sling allocates the same name,
-	// sets hook_bead, and then has it cleared by this cleanup. By resetting
-	// the agent bead first (clearing fields, setting agent_state="nuked"),
-	// concurrent slings see a clean bead and CreateOrReopenAgentBead can
-	// simply update it without needing close/reopen (which fails on Dolt).
-	// See gt-14b8o: close/reopen cycle breaks on Dolt backend.
-	agentID := m.agentBeadID(name)
-	var resetErr error
-	if expectedAgentFields != nil {
-		resetErr = m.agentBeads().ResetAgentBeadForReuseIfUnchanged(
-			agentID,
-			"polecat removed",
-			expectedAgentFields.LifecycleExpectations(),
-		)
-	} else if expectedIncarnation != "" {
-		resetErr = m.agentBeads().ResetAgentBeadForReuseIfIncarnation(agentID, "polecat removed", expectedIncarnation)
-	} else {
-		resetErr = m.resetAgentBeadForReuse(agentID, "polecat removed")
-	}
-	if resetErr != nil {
-		if expectedIncarnation != "" {
-			return fmt.Errorf("retiring exact agent incarnation: %w", resetErr)
-		}
-		// Only log if not "not found" - it's ok if it doesn't exist
-		if !errors.Is(resetErr, beads.ErrNotFound) {
-			style.PrintWarning("could not reset agent bead %s: %v", agentID, resetErr)
-		}
-	}
-	if expectedIncarnation != "" {
-		retirementCommitted = true
-	}
-
-	// Unassign any work beads still pointing at this polecat (gt-e4u1).
-	// Without this, beads remain assigned to a ghost polecat (status in_progress,
-	// assignee set) after removal, permanently stuck with no one working on them.
-	m.unassignWorkBeads(name)
 
 	// Best-effort: Push the polecat's branch to remote before removing the worktree.
 	// This preserves committed work that hasn't been pushed yet — without this,
@@ -1386,69 +1341,97 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 		}
 	}
 
-	// Get repo base to remove the worktree properly
-	repoGit, err := m.repoBase()
-	if err != nil {
-		// Best-effort: try to prune stale worktree entries from both possible repo locations.
-		// This handles edge cases where the repo base is corrupted but worktree entries exist.
-		bareRepoPath := filepath.Join(m.rig.Path, ".repo.git")
-		if info, statErr := os.Stat(bareRepoPath); statErr == nil && info.IsDir() {
-			bareGit := git.NewGitWithDir(bareRepoPath, "")
-			_ = bareGit.WorktreePrune()
+	repoGit, repoErr := m.repoBase()
+	registeredWorktree, directRemoval, classifyErr := classifyPolecatRemoval(repoGit, repoErr, clonePath)
+	if classifyErr != nil {
+		return classifyErr
+	}
+	filesystemCommitted := false
+	removeFilesystem := func() error {
+		if registeredWorktree {
+			if err := repoGit.WorktreeRemove(clonePath, force); err != nil {
+				structuralErr := VerifyWorktreeExists(clonePath)
+				if !allowStructurallyBrokenDirectRemoval || !IsStructuralWorktreeError(structuralErr) {
+					return fmt.Errorf("removing registered worktree: %w", err)
+				}
+			} else {
+				filesystemCommitted = true
+			}
+		} else if !directRemoval {
+			return errors.New("polecat path is not positively classified for direct removal")
 		}
-		mayorRigPath := filepath.Join(m.rig.Path, "mayor", "rig")
-		if info, statErr := os.Stat(mayorRigPath); statErr == nil && info.IsDir() {
-			mayorGit := git.NewGit(mayorRigPath)
-			_ = mayorGit.WorktreePrune()
+		if removeErr := m.removeAllPath(clonePath); removeErr != nil {
+			return fmt.Errorf("removing leftover clone path: %w", removeErr)
 		}
-		// Fall back to direct removal if repo base not found
-		if removeErr := m.removeAllPath(polecatDir); removeErr != nil {
-			return fmt.Errorf("removing polecat directory without repo base: %w", removeErr)
+		filesystemCommitted = true
+		if polecatDir != clonePath {
+			if removeErr := m.removeAllPath(polecatDir); removeErr != nil {
+				return fmt.Errorf("removing leftover polecat directory: %w", removeErr)
+			}
 		}
-		if verifyErr := verifyRemovalComplete(polecatDir, clonePath); verifyErr != nil {
-			return fmt.Errorf("verifying polecat removal without repo base: %w", verifyErr)
+		if repoGit != nil {
+			_ = repoGit.WorktreePrune()
 		}
-		m.namePool.Release(name)
-		if saveErr := m.namePool.Save(); saveErr != nil {
-			return fmt.Errorf("saving released polecat name: %w", saveErr)
+		if err := verifyRemovalComplete(polecatDir, clonePath); err != nil {
+			return fmt.Errorf("verifying polecat removal: %w", err)
 		}
 		return nil
 	}
 
-	// Try to remove as a worktree first (use force flag for worktree removal too)
-	if err := repoGit.WorktreeRemove(clonePath, force); err != nil {
-		// Fall back to direct removal if worktree removal fails
-		// (e.g., if this is an old-style clone, not a worktree)
-		if removeErr := m.removeAllPath(clonePath); removeErr != nil {
-			return fmt.Errorf("removing clone path: %w", removeErr)
+	var expectedAgentFields *beads.AgentFields
+	if beforeRetire != nil {
+		fields, beforeErr := beforeRetire()
+		if beforeErr != nil {
+			return beforeErr
 		}
+		expectedAgentFields = fields
+		if expectedAgentFields == nil || expectedAgentFields.Incarnation != expectedIncarnation {
+			return fmt.Errorf("%w: lifecycle snapshot", ErrPolecatIncarnationChanged)
+		}
+	}
+
+	agentID := m.agentBeadID(name)
+	var resetErr error
+	if expectedAgentFields != nil {
+		resetErr = m.agentBeads().ResetAgentBeadForReuseIfUnchangedAfter(
+			agentID,
+			"polecat removed",
+			expectedAgentFields.LifecycleExpectations(),
+			func() error {
+				if err := removeFilesystem(); err != nil {
+					return err
+				}
+				filesystemCommitted = true
+				return nil
+			},
+		)
 	} else {
-		// GT-1L3MY9: git worktree remove may leave untracked directories behind.
-		// Clean up any leftover files (overlay files, .beads/, setup hook outputs, etc.)
-		// Use RemoveAll to handle non-empty directories with untracked files.
-		if removeErr := m.removeAllPath(clonePath); removeErr != nil {
-			return fmt.Errorf("removing leftover clone path: %w", removeErr)
+		if expectedIncarnation != "" {
+			resetErr = m.agentBeads().ResetAgentBeadForReuseIfIncarnation(agentID, "polecat removed", expectedIncarnation)
+		} else {
+			resetErr = m.resetAgentBeadForReuse(agentID, "polecat removed")
+		}
+		if resetErr == nil || errors.Is(resetErr, beads.ErrNotFound) {
+			resetErr = removeFilesystem()
 		}
 	}
-
-	// Also remove the parent polecat directory
-	// (for new structure: polecats/<name>/ contains only polecats/<name>/<rigname>/)
-	if polecatDir != clonePath {
-		// GT-1L3MY9: Clean up any orphaned files at polecat level.
-		// Use RemoveAll to handle non-empty directories with leftover files.
-		if removeErr := m.removeAllPath(polecatDir); removeErr != nil {
-			return fmt.Errorf("removing leftover polecat directory: %w", removeErr)
+	if resetErr != nil {
+		if filesystemCommitted {
+			retirementCommitted = true
+		}
+		if expectedIncarnation != "" {
+			return fmt.Errorf("retiring exact agent incarnation: %w", resetErr)
+		}
+		if !errors.Is(resetErr, beads.ErrNotFound) {
+			return resetErr
 		}
 	}
-
-	// Prune any stale worktree entries (non-fatal: cleanup only)
-	_ = repoGit.WorktreePrune()
-
-	// Verify removal succeeded (fixes #618)
-	// The above removal attempts may fail silently on permissions, symlinks, or busy files
-	if err := verifyRemovalComplete(polecatDir, clonePath); err != nil {
-		return fmt.Errorf("verifying polecat removal: %w", err)
+	if expectedIncarnation != "" {
+		retirementCommitted = true
 	}
+
+	// Unassign work only after the exact filesystem-and-bead retirement commits.
+	m.unassignWorkBeads(name)
 
 	// Publish the name as reusable only after exact filesystem cleanup is proven.
 	m.namePool.Release(name)
@@ -1457,6 +1440,60 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	}
 
 	return nil
+}
+
+// classifyPolecatRemoval permits direct deletion only for an absent path or a
+// standalone clone with a real .git directory. Registered worktrees must go
+// through git worktree remove so dirty-state refusals cannot be bypassed.
+func classifyPolecatRemoval(repoGit *git.Git, repoErr error, clonePath string) (registered, direct bool, retErr error) {
+	if repoErr == nil && repoGit != nil {
+		worktrees, err := repoGit.WorktreeList()
+		if err != nil {
+			return false, false, fmt.Errorf("classifying registered worktree: %w", err)
+		}
+		for _, worktree := range worktrees {
+			same, err := sameFilesystemPath(clonePath, worktree.Path)
+			if err == nil && same {
+				return true, false, nil
+			}
+		}
+	}
+
+	info, err := os.Stat(clonePath)
+	if os.IsNotExist(err) {
+		return false, true, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("classifying clone path: %w", err)
+	}
+	if !info.IsDir() {
+		return false, false, fmt.Errorf("clone path is not a directory: %s", clonePath)
+	}
+	gitInfo, gitErr := os.Stat(filepath.Join(clonePath, ".git"))
+	if gitErr == nil && gitInfo.IsDir() {
+		return false, true, nil
+	}
+	if repoErr != nil {
+		return false, false, fmt.Errorf("cannot classify polecat worktree without repo base: %w", repoErr)
+	}
+	return false, false, fmt.Errorf("clone path is neither a registered worktree nor a standalone clone: %s", clonePath)
+}
+
+func sameFilesystemPath(left, right string) (bool, error) {
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	if leftErr == nil && rightErr == nil {
+		return os.SameFile(leftInfo, rightInfo), nil
+	}
+	leftAbs, err := filepath.Abs(left)
+	if err != nil {
+		return false, err
+	}
+	rightAbs, err := filepath.Abs(right)
+	if err != nil {
+		return false, err
+	}
+	return filepath.Clean(leftAbs) == filepath.Clean(rightAbs), nil
 }
 
 func canonicalExistingPath(path string) (string, error) {
@@ -1569,7 +1606,7 @@ func (m *Manager) ReclaimBrokenIdlePolecat(name string) (retErr error) {
 		return fmt.Errorf("not safe to reclaim: %s", blocker)
 	}
 
-	return m.removeWithOptionsLocked(name, false, false, false)
+	return m.removeWithOptionsLockedPolicy(name, false, false, false, true, "", nil, true)
 }
 
 // verifyRemovalComplete checks that polecat directories were actually removed.

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 	polecatpkg "github.com/steveyegge/gastown/internal/polecat"
 	rigpkg "github.com/steveyegge/gastown/internal/rig"
@@ -70,8 +71,47 @@ func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "verifyPolecatNukeGitCustody"); calls != 1 {
 		t.Fatalf("post-stop Git custody rechecks = %d, want 1", calls)
 	}
-	if calls := callsTo(t, file, "provePolecatNukeCustody", "checkPolecatSafety"); calls != 1 {
+	if calls := callsTo(t, file, "provePolecatNukeCustody", "checkPolecatSafetySnapshot"); calls != 1 {
 		t.Fatalf("custody proof safety rechecks = %d, want 1 inside each proof", calls)
+	}
+	helperFile, err := parser.ParseFile(token.NewFileSet(), "polecat_helpers.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse polecat_helpers.go: %v", err)
+	}
+	if calls := callsTo(t, helperFile, "checkPolecatSafetySnapshot", "GetAgentBead"); calls != 0 {
+		t.Fatalf("snapshot safety evaluator reloaded agent fields %d time(s), want 0", calls)
+	}
+}
+
+func TestCheckPolecatSafetySnapshotRejectsActiveHook(t *testing.T) {
+	binDir := t.TempDir()
+	writeBDStub(t, binDir, `#!/bin/sh
+cmd=""
+id=""
+for arg in "$@"; do
+  case "$arg" in --*) continue ;; esac
+  if [ -z "$cmd" ]; then cmd="$arg"; continue; fi
+  id="$arg"
+  break
+done
+case "$cmd:$id" in
+  show:gt-work) printf '%s\n' '[{"id":"gt-work","title":"work","issue_type":"task","status":"in_progress"}]' ;;
+  *) printf '%s\n' '[]' ;;
+esac
+`, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	r := &rigpkg.Rig{Name: "rig", Path: t.TempDir()}
+	if err := os.MkdirAll(filepath.Join(r.Path, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir isolated beads dir: %v", err)
+	}
+	target := polecatTarget{rigName: "rig", polecatName: "nitro", r: r}
+	polecatInfo := &polecatpkg.Polecat{Name: "nitro", Issue: "gt-work", ClonePath: t.TempDir()}
+	agentIssue := &beads.Issue{ID: "gt-rig-polecat-nitro", Description: "hook_bead: gt-work"}
+	fields := &beads.AgentFields{Incarnation: "generation-1", HookBead: "gt-work", CleanupStatus: string(polecatpkg.CleanupClean)}
+
+	result := checkPolecatSafetySnapshot(target, polecatInfo, nil, beads.NewIsolated(r.Path), agentIssue, fields, nil)
+	if !result.Blocked || result.HookBead != "gt-work" {
+		t.Fatalf("active exact-snapshot hook was not blocked: %+v", result)
 	}
 }
 
@@ -176,6 +216,40 @@ func TestVerifyPolecatNukeGitCustodyRefusesPostProofWork(t *testing.T) {
 	}
 	if _, revErr := gitpkg.NewGit(repo).Rev("polecat/test"); revErr != nil {
 		t.Fatalf("branch lost after Git drift refusal: %v", revErr)
+	}
+}
+
+func TestCapturePolecatNukeGitCustodyCoversBranchlessWorktreeStates(t *testing.T) {
+	present := t.TempDir()
+	testRunGit(t, present, "init", "-b", "main")
+	testRunGit(t, present, "config", "user.email", "test@example.com")
+	testRunGit(t, present, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(present, "README.md"), []byte("fixture\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	testRunGit(t, present, "add", "README.md")
+	testRunGit(t, present, "commit", "-m", "fixture")
+	r := &rigpkg.Rig{Name: "rig", Path: t.TempDir()}
+
+	for _, test := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "present", path: present, want: true},
+		{name: "absent", path: filepath.Join(t.TempDir(), "missing"), want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := capturePolecatNukeGitCustody(r, polecatNukeCustody{
+				PolecatInfo: &polecatpkg.Polecat{ClonePath: test.path},
+			})
+			if err != nil {
+				t.Fatalf("capture branchless custody: %v", err)
+			}
+			if got.WorktreePresent != test.want {
+				t.Fatalf("worktree present = %v, want %v", got.WorktreePresent, test.want)
+			}
+		})
 	}
 }
 

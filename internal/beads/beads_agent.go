@@ -77,15 +77,22 @@ func (fields *AgentFields) LifecycleExpectations() AgentFieldExpectations {
 		Incarnation:          agentStringPointer(fields.Incarnation),
 		CleanupStatus:        agentStringPointer(fields.CleanupStatus),
 		ActiveMR:             agentStringPointer(fields.ActiveMR),
+		Mode:                 agentStringPointer(fields.Mode),
 		HookBead:             agentStringPointer(fields.HookBead),
+		ExitType:             agentStringPointer(fields.ExitType),
+		MRID:                 agentStringPointer(fields.MRID),
 		Branch:               agentStringPointer(fields.Branch),
 		LastSourceIssue:      agentStringPointer(fields.LastSourceIssue),
+		MRFailed:             agentBoolPointer(fields.MRFailed),
+		PushFailed:           agentBoolPointer(fields.PushFailed),
+		CompletionTime:       agentStringPointer(fields.CompletionTime),
 		structuredAgentState: agentStringPointer(fields.structuredAgentState),
 		structuredHookBead:   agentStringPointer(fields.structuredHookBead),
 	}
 }
 
 func agentStringPointer(value string) *string { return &value }
+func agentBoolPointer(value bool) *bool       { return &value }
 
 // Notification level constants
 const (
@@ -422,7 +429,7 @@ func labelsForAgentBeadReuse(existing []string) []string {
 //
 // This is the standard nuke path (gt-14b8o).
 func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
-	return b.resetAgentBeadForReuse(id, reason, nil)
+	return b.resetAgentBeadForReuse(id, reason, nil, nil)
 }
 
 // ResetAgentBeadForReuseIfIncarnation retires only the exact polecat lifetime
@@ -434,22 +441,38 @@ func (b *Beads) ResetAgentBeadForReuseIfIncarnation(id, reason, expectedIncarnat
 		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
 	}
 	expected := AgentFieldExpectations{Incarnation: &expectedIncarnation}
-	return b.resetAgentBeadForReuse(id, reason, &expected)
+	return b.resetAgentBeadForReuse(id, reason, &expected, nil)
 }
 
 // ResetAgentBeadForReuseIfUnchanged retires only the exact lifecycle snapshot
 // observed by the caller. Mutable same-incarnation work cannot be erased.
 func (b *Beads) ResetAgentBeadForReuseIfUnchanged(id, reason string, expected AgentFieldExpectations) error {
+	return b.ResetAgentBeadForReuseIfUnchangedAfter(id, reason, expected, nil)
+}
+
+// ResetAgentBeadForReuseIfUnchangedAfter runs the final destructive step while
+// the exact lifecycle snapshot is locked, then retires that same generation.
+func (b *Beads) ResetAgentBeadForReuseIfUnchangedAfter(
+	id, reason string,
+	expected AgentFieldExpectations,
+	beforeReset func() error,
+) error {
 	if expected.AgentState == nil || expected.Incarnation == nil || expected.CleanupStatus == nil ||
-		expected.ActiveMR == nil || expected.HookBead == nil || expected.Branch == nil ||
-		expected.LastSourceIssue == nil || expected.structuredAgentState == nil || expected.structuredHookBead == nil ||
+		expected.ActiveMR == nil || expected.Mode == nil || expected.HookBead == nil ||
+		expected.ExitType == nil || expected.MRID == nil || expected.Branch == nil ||
+		expected.LastSourceIssue == nil || expected.MRFailed == nil || expected.PushFailed == nil ||
+		expected.CompletionTime == nil || expected.structuredAgentState == nil || expected.structuredHookBead == nil ||
 		strings.TrimSpace(*expected.Incarnation) == "" {
 		return fmt.Errorf("%w: incomplete lifecycle snapshot", ErrAgentFieldsChanged)
 	}
-	return b.resetAgentBeadForReuse(id, reason, &expected)
+	return b.resetAgentBeadForReuse(id, reason, &expected, beforeReset)
 }
 
-func (b *Beads) resetAgentBeadForReuse(id, reason string, expected *AgentFieldExpectations) error {
+func (b *Beads) resetAgentBeadForReuse(
+	id, reason string,
+	expected *AgentFieldExpectations,
+	beforeReset func() error,
+) error {
 	// Lock the agent bead to prevent concurrent read-modify-write races.
 	// Without this, a concurrent CreateOrReopenAgentBead could overwrite
 	// the nuked state we're about to set. See gt-joazs.
@@ -471,6 +494,11 @@ func (b *Beads) resetAgentBeadForReuse(id, reason string, expected *AgentFieldEx
 	fields := agentFieldsFromIssue(issue)
 	if expected != nil {
 		if err := checkAgentFieldExpectations(fields, *expected); err != nil {
+			return err
+		}
+	}
+	if beforeReset != nil {
+		if err := beforeReset(); err != nil {
 			return err
 		}
 	}
@@ -546,9 +574,15 @@ type AgentFieldExpectations struct {
 	Incarnation          *string
 	CleanupStatus        *string
 	ActiveMR             *string
+	Mode                 *string
 	HookBead             *string
+	ExitType             *string
+	MRID                 *string
 	Branch               *string
 	LastSourceIssue      *string
+	MRFailed             *bool
+	PushFailed           *bool
+	CompletionTime       *string
 	structuredAgentState *string
 	structuredHookBead   *string
 }
@@ -590,6 +624,22 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	defer func() { _ = fl.Unlock() }()
 
 	return b.updateAgentDescriptionFieldsLocked(id, nil, updates, nil)
+}
+
+// UpdateAgentDescriptionFieldsIfIncarnation applies lifecycle writes only to
+// the generation that the caller originally observed.
+func (b *Beads) UpdateAgentDescriptionFieldsIfIncarnation(
+	id, expectedIncarnation string,
+	updates AgentFieldUpdates,
+) error {
+	if strings.TrimSpace(expectedIncarnation) == "" {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	return b.CompareAndUpdateAgentDescriptionFields(
+		id,
+		AgentFieldExpectations{Incarnation: &expectedIncarnation},
+		updates,
+	)
 }
 
 // CompareAndUpdateAgentDescriptionFields updates an agent description only if
@@ -721,13 +771,30 @@ func checkAgentFieldExpectations(fields *AgentFields, expected AgentFieldExpecta
 		{name: "incarnation", want: expected.Incarnation, current: fields.Incarnation},
 		{name: "cleanup_status", want: expected.CleanupStatus, current: fields.CleanupStatus},
 		{name: "active_mr", want: expected.ActiveMR, current: fields.ActiveMR},
+		{name: "mode", want: expected.Mode, current: fields.Mode},
 		{name: "hook_bead", want: expected.HookBead, current: fields.HookBead},
+		{name: "exit_type", want: expected.ExitType, current: fields.ExitType},
+		{name: "mr_id", want: expected.MRID, current: fields.MRID},
 		{name: "branch", want: expected.Branch, current: fields.Branch},
 		{name: "last_source_issue", want: expected.LastSourceIssue, current: fields.LastSourceIssue},
+		{name: "completion_time", want: expected.CompletionTime, current: fields.CompletionTime},
 		{name: "structured_agent_state", want: expected.structuredAgentState, current: fields.structuredAgentState},
 		{name: "structured_hook_bead", want: expected.structuredHookBead, current: fields.structuredHookBead},
 	}
 	for _, check := range checks {
+		if check.want != nil && check.current != *check.want {
+			return fmt.Errorf("%w: %s", ErrAgentFieldsChanged, check.name)
+		}
+	}
+	boolChecks := []struct {
+		name    string
+		want    *bool
+		current bool
+	}{
+		{name: "mr_failed", want: expected.MRFailed, current: fields.MRFailed},
+		{name: "push_failed", want: expected.PushFailed, current: fields.PushFailed},
+	}
+	for _, check := range boolChecks {
 		if check.want != nil && check.current != *check.want {
 			return fmt.Errorf("%w: %s", ErrAgentFieldsChanged, check.name)
 		}
@@ -747,6 +814,37 @@ func (b *Beads) UpdateAgentCleanupStatus(id string, cleanupStatus string) error 
 // Pass empty string to clear the field (e.g., after merge completes).
 func (b *Beads) UpdateAgentActiveMR(id string, activeMR string) error {
 	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{ActiveMR: &activeMR})
+}
+
+// UpdateAgentActiveMRIfIncarnation prevents a stale polecat process from
+// attaching an MR to a same-name replacement generation.
+func (b *Beads) UpdateAgentActiveMRIfIncarnation(id, expectedIncarnation, activeMR string) error {
+	return b.UpdateAgentDescriptionFieldsIfIncarnation(id, expectedIncarnation, AgentFieldUpdates{ActiveMR: &activeMR})
+}
+
+// UpdateAgentIfIncarnation applies non-description issue updates only when the
+// agent bead still belongs to the caller's generation.
+func (b *Beads) UpdateAgentIfIncarnation(id, expectedIncarnation string, updates UpdateOptions) error {
+	if target := b.agentBeadTarget(); target != b {
+		return target.UpdateAgentIfIncarnation(id, expectedIncarnation, updates)
+	}
+	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
+	if expectedIncarnation == "" {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
+	issue, err := b.Show(id)
+	if err != nil {
+		return err
+	}
+	if fields := agentFieldsFromIssue(issue); fields == nil || fields.Incarnation != expectedIncarnation {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	return b.Update(id, updates)
 }
 
 // ClearAgentActiveMRIfMatches clears active_mr only when it still references
@@ -816,9 +914,22 @@ type CompletionMetadata struct {
 // UpdateAgentCompletion atomically writes all completion metadata fields
 // to an agent bead. Called by gt done to record completion state.
 func (b *Beads) UpdateAgentCompletion(id string, meta *CompletionMetadata) error {
+	return b.updateAgentCompletion(id, "", meta)
+}
+
+// UpdateAgentCompletionIfIncarnation binds completion metadata to the polecat
+// generation that started gt done.
+func (b *Beads) UpdateAgentCompletionIfIncarnation(id, expectedIncarnation string, meta *CompletionMetadata) error {
+	if strings.TrimSpace(expectedIncarnation) == "" {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	return b.updateAgentCompletion(id, expectedIncarnation, meta)
+}
+
+func (b *Beads) updateAgentCompletion(id, expectedIncarnation string, meta *CompletionMetadata) error {
 	mrFailed := meta.MRFailed
 	pushFailed := meta.PushFailed
-	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{
+	updates := AgentFieldUpdates{
 		ExitType:        &meta.ExitType,
 		MRID:            &meta.MRID,
 		Branch:          &meta.Branch,
@@ -826,7 +937,15 @@ func (b *Beads) UpdateAgentCompletion(id string, meta *CompletionMetadata) error
 		MRFailed:        &mrFailed,
 		PushFailed:      &pushFailed,
 		CompletionTime:  &meta.CompletionTime,
-	})
+	}
+	if expectedIncarnation == "" {
+		return b.UpdateAgentDescriptionFields(id, updates)
+	}
+	return b.CompareAndUpdateAgentDescriptionFields(
+		id,
+		AgentFieldExpectations{Incarnation: &expectedIncarnation},
+		updates,
+	)
 }
 
 // ClearAgentCompletion removes all completion metadata fields from an agent bead.

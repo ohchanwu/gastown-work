@@ -128,7 +128,11 @@ out. Dynamic bare-origin tests reject any attempted receive and prove both that
 the remote ref set is unchanged and that local custody gates still apply.
 The same lifecycle lock now spans a second full safety proof, exact-session
 teardown, post-stop Git/worktree/branch revalidation, full lifecycle-snapshot
-compare-and-set retirement, worktree removal, and local branch deletion.
+compare-and-set retirement, worktree removal, and local branch deletion. The
+snapshot covers every reset-for-reuse field, and stale `gt done` writers cannot
+cross an incarnation boundary. Registered-worktree removal executes while the
+agent snapshot remains locked; Git refusal preserves bead, worktree, and branch,
+while recursive deletion is limited to positively identified standalone clones.
 Refusal-only active-MR and shell preflights finish before exact-session teardown
 or molecule cleanup. Missing polecat metadata, a changed work reference,
 same-incarnation agent-field drift, or post-proof Git work refuses ordinary

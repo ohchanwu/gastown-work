@@ -2176,16 +2176,6 @@ func provePolecatNukeCustody(
 	opts nukePolecatOptions,
 ) (polecatNukeCustody, error) {
 	var custody polecatNukeCustody
-	if !opts.Force {
-		target := polecatTarget{rigName: rigName, polecatName: polecatName, mgr: mgr, r: r}
-		if result := checkPolecatSafety(target); result.Blocked {
-			return custody, fmt.Errorf("cannot nuke %s/%s: %s", rigName, polecatName, strings.Join(result.Reasons, "; "))
-		}
-	}
-	if err := checkNukeActiveMRSafety(mgr, polecatName, rigName, opts.Force); err != nil {
-		return custody, err
-	}
-
 	// Resolve branch custody before any local mutation. Nuke is a retirement
 	// operation, not a publication path: unique work must already be preserved.
 	polecatInfo, getErr := mgr.Get(polecatName)
@@ -2198,8 +2188,31 @@ func provePolecatNukeCustody(
 	if strings.TrimSpace(polecatInfo.Incarnation) == "" {
 		return custody, fmt.Errorf("cannot nuke %s/%s: legacy polecat has no durable incarnation; refresh it through the ordinary lifecycle first", rigName, polecatName)
 	}
+	bd := beads.New(r.Path)
+	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
+	agentIssue, agentFields, agentErr := bd.GetAgentBead(agentBeadID)
+	if agentErr != nil {
+		return custody, fmt.Errorf("cannot capture agent lifecycle snapshot for %s/%s: %w", rigName, polecatName, agentErr)
+	}
+	if agentFields == nil {
+		return custody, fmt.Errorf("cannot nuke %s/%s: agent lifecycle snapshot unavailable", rigName, polecatName)
+	}
+	if agentFields.Incarnation != polecatInfo.Incarnation {
+		return custody, fmt.Errorf("%w during lifecycle snapshot capture", polecat.ErrPolecatIncarnationChanged)
+	}
+	if !opts.Force {
+		target := polecatTarget{rigName: rigName, polecatName: polecatName, mgr: mgr, r: r}
+		result := checkPolecatSafetySnapshot(target, polecatInfo, getErr, bd, agentIssue, agentFields, agentErr)
+		if result.Blocked {
+			return custody, fmt.Errorf("cannot nuke %s/%s: %s", rigName, polecatName, strings.Join(result.Reasons, "; "))
+		}
+	}
+	if err := checkNukeActiveMRSafety(mgr, polecatName, rigName, opts.Force); err != nil {
+		return custody, err
+	}
 
 	custody.PolecatInfo = polecatInfo
+	custody.AgentFields = agentFields
 	sessMgr := polecat.NewSessionManager(tmux.NewTmux(), r)
 	sessionCustody, err := sessMgr.CaptureSessionCustody(polecatName)
 	if err != nil {
@@ -2207,17 +2220,10 @@ func provePolecatNukeCustody(
 	}
 	custody.Session = sessionCustody
 	custody.BranchToDelete = polecatInfo.Branch
-	if custody.BranchToDelete == "" {
-		return custody, nil
-	}
 
-	branchTargets, agentFields, err := nukeBranchPreservationTargets(r, rigName, polecatName, polecatInfo)
+	branchTargets, err := nukeBranchPreservationTargets(r, polecatInfo, agentIssue, agentFields)
 	if err != nil {
 		return polecatNukeCustody{}, err
-	}
-	custody.AgentFields = agentFields
-	if agentFields.Incarnation != polecatInfo.Incarnation {
-		return polecatNukeCustody{}, fmt.Errorf("%w during lifecycle snapshot capture", polecat.ErrPolecatIncarnationChanged)
 	}
 	custody.BranchTargets = branchTargets
 	custody.Git, err = capturePolecatNukeGitCustody(r, custody)
@@ -2323,22 +2329,14 @@ func runPolecatNukeLockedTeardown(stopExactSession, revalidateGit func() error, 
 
 func nukeBranchPreservationTargets(
 	r *rig.Rig,
-	rigName string,
-	polecatName string,
 	polecatInfo *polecat.Polecat,
-) ([]string, *beads.AgentFields, error) {
-	if r == nil || polecatInfo == nil {
-		return nil, nil, errors.New("branch preservation evidence unavailable")
+	agentIssue *beads.Issue,
+	fields *beads.AgentFields,
+) ([]string, error) {
+	if r == nil || polecatInfo == nil || fields == nil {
+		return nil, errors.New("branch preservation evidence unavailable")
 	}
 	bd := beads.New(r.Path)
-	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
-	agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
-	if err != nil && !errors.Is(err, beads.ErrNotFound) {
-		return nil, nil, fmt.Errorf("branch preservation agent lookup: %w", err)
-	}
-	if fields == nil {
-		return nil, nil, errors.New("branch preservation agent lifecycle snapshot unavailable")
-	}
 	activeMR := ""
 	workRefs := agentWorkReferences(polecatInfo.Issue, agentIssue, fields)
 	if fields != nil {
@@ -2352,9 +2350,9 @@ func nukeBranchPreservationTargets(
 		workRefs...,
 	)
 	if lookupFailed {
-		return nil, nil, errors.New("branch preservation target lookup failed; run reconciliation before nuke")
+		return nil, errors.New("branch preservation target lookup failed; run reconciliation before nuke")
 	}
-	return targets, fields, nil
+	return targets, nil
 }
 
 func capturePolecatNukeGitCustody(r *rig.Rig, custody polecatNukeCustody) (polecatNukeGitSnapshot, error) {
