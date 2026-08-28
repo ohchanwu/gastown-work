@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -255,7 +256,7 @@ func TestStart_UsesOneDeadlineAndCleansOnlyItsSession(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- m.Start("Toast", SessionStartOptions{WorkDir: workDir, Command: "sh"})
+		done <- m.Start("Toast", SessionStartOptions{WorkDir: workDir, Command: "sh", Incarnation: "fixture-generation"})
 	}()
 
 	select {
@@ -333,9 +334,10 @@ func TestStartContext_CancellationDuringPostReadyFallback(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- m.StartContext(ctx, "Toast", SessionStartOptions{
-			WorkDir: workDir,
-			Command: command,
-			Agent:   "test-runtime",
+			WorkDir:     workDir,
+			Command:     command,
+			Agent:       "test-runtime",
+			Incarnation: "fixture-generation",
 		})
 	}()
 
@@ -387,8 +389,9 @@ func TestStartContextSerializesWithPolecatLifecycleLock(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- NewSessionManager(tm, r).StartContext(context.Background(), "Toast", SessionStartOptions{
-			WorkDir: workDir,
-			Command: "sh",
+			WorkDir:     workDir,
+			Command:     "sh",
+			Incarnation: "fixture-generation",
 		})
 	}()
 	select {
@@ -477,7 +480,9 @@ func TestStartContextFailedCleanupUsesCreationGeneration(t *testing.T) {
 		Name: created.Name, SessionID: "$replacement", Nonce: "replacement", ServerPID: 202, ServerIdentity: "server-new",
 		Transport: created.Transport,
 	}
-	m.newSessionGeneration = func(context.Context, string, string, string, map[string]string) (tmux.SessionGeneration, error) {
+	var createdEnv map[string]string
+	m.newSessionGeneration = func(_ context.Context, _, _, _ string, env map[string]string) (tmux.SessionGeneration, error) {
+		createdEnv = maps.Clone(env)
 		return created, nil
 	}
 	cleanupCalled := false
@@ -493,7 +498,11 @@ func TestStartContextFailedCleanupUsesCreationGeneration(t *testing.T) {
 		return nil
 	}
 
-	err := m.StartContext(context.Background(), "Toast", SessionStartOptions{WorkDir: workDir, Command: "sh"})
+	err := m.StartContext(context.Background(), "Toast", SessionStartOptions{
+		WorkDir:     workDir,
+		Command:     "sh",
+		Incarnation: "fixture-generation",
+	})
 	if err == nil {
 		t.Fatal("StartContext unexpectedly succeeded without a real created session")
 	}
@@ -502,6 +511,9 @@ func TestStartContextFailedCleanupUsesCreationGeneration(t *testing.T) {
 	}
 	if !replacementAlive {
 		t.Fatal("failed-start cleanup targeted same-name replacement generation")
+	}
+	if got := createdEnv[EnvAgentIncarnation]; got != "fixture-generation" {
+		t.Fatalf("%s = %q, want immutable launch receipt %q", EnvAgentIncarnation, got, "fixture-generation")
 	}
 }
 
@@ -539,8 +551,9 @@ func TestStart_ExpiredContextKillsOwnedChildOnly(t *testing.T) {
 	sessionID := m.SessionName("Toast")
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	err := m.Start("Toast", SessionStartOptions{
-		WorkDir: workDir,
-		Command: fmt.Sprintf(`sh -c 'sleep 30 & echo $! > %q; wait'`, pidFile),
+		WorkDir:     workDir,
+		Command:     fmt.Sprintf(`sh -c 'sleep 30 & echo $! > %q; wait'`, pidFile),
+		Incarnation: "fixture-generation",
 	})
 	if err == nil {
 		t.Fatal("Start error = nil, want startup deadline failure")

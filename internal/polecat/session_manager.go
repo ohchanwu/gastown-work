@@ -114,7 +114,16 @@ type SessionStartOptions struct {
 	// If set, GT_AGENT is written to the tmux session environment table so that
 	// IsAgentAlive and waitForPolecatReady read the correct process names.
 	Agent string
+
+	// Incarnation is the immutable agent-bead generation receipt inherited by
+	// this exact session. Completion must present it before lifecycle writes.
+	Incarnation string
 }
+
+// EnvAgentIncarnation binds a polecat process to the agent-bead generation
+// that launched it. Unlike the live bead, this inherited receipt cannot drift
+// when the same polecat name is reused.
+const EnvAgentIncarnation = "GT_AGENT_INCARNATION"
 
 // SessionInfo contains information about a running polecat session.
 type SessionInfo struct {
@@ -438,11 +447,26 @@ func (m *SessionManager) polecatSlot(polecat string) int {
 
 // Start creates and starts a new session for a polecat.
 func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+	if strings.TrimSpace(opts.Incarnation) == "" {
+		lifecycle := m.lifecycle
+		if lifecycle == nil {
+			lifecycle = NewManager(m.rig, nil, m.tmux)
+		}
+		incarnation, err := lifecycle.EnsurePolecatIncarnation(polecat)
+		if err != nil {
+			return fmt.Errorf("resolving polecat launch incarnation: %w", err)
+		}
+		opts.Incarnation = incarnation
+	}
 	return m.StartContext(context.Background(), polecat, opts)
 }
 
 // StartContext creates a polecat session under one caller-cancelable deadline.
 func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts SessionStartOptions) (retErr error) {
+	opts.Incarnation = strings.TrimSpace(opts.Incarnation)
+	if opts.Incarnation == "" {
+		return fmt.Errorf("starting polecat %s without an incarnation receipt", polecat)
+	}
 	lifecycle := m.lifecycle
 	if lifecycle == nil {
 		lifecycle = NewManager(m.rig, nil, m.tmux)
@@ -605,6 +629,7 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 	envVars["GT_POLECAT_PATH"] = workDir
 	envVars["GT_TOWN_ROOT"] = townRoot
 	envVars["GT_RUN"] = runID
+	envVars[EnvAgentIncarnation] = opts.Incarnation
 	envVars["POLECAT_SLOT"] = fmt.Sprintf("%d", m.polecatSlot(polecat))
 	envVars["GT_PROCESS_NAMES"] = strings.Join(config.ResolveProcessNames(runtimeConfig.ResolvedAgent, runtimeConfig.Command, runtimeConfig.Args...), ",")
 	if polecatGitBranch != "" {

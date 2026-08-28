@@ -41,7 +41,7 @@ func (b *Beads) lockAgentBead(id string) (*flock.Flock, error) {
 type AgentFields struct {
 	RoleType          string // polecat, witness, refinery, deacon, mayor
 	Rig               string // Rig name (empty for global agents like mayor/deacon)
-	AgentState        string // spawning, working, done, stuck, escalated, idle, running, nuked
+	AgentState        string // spawning, working, done, stuck, escalated, idle, running, retiring, nuked
 	Incarnation       string // Opaque polecat lifetime ID; immutable until retirement/reuse
 	HookBead          string // Currently pinned work bead ID
 	CleanupStatus     string // ZFC: polecat self-reports git state (clean, has_uncommitted, has_stash, has_unpushed)
@@ -457,6 +457,18 @@ func (b *Beads) ResetAgentBeadForReuseIfUnchangedAfter(
 	expected AgentFieldExpectations,
 	beforeReset func() error,
 ) error {
+	return b.ResetAgentBeadForReuseIfUnchangedRevalidatedAfter(id, reason, expected, nil, beforeReset)
+}
+
+// ResetAgentBeadForReuseIfUnchangedRevalidatedAfter performs the final live
+// proof under the agent lock, durably fences the generation as retiring, runs
+// the destructive callback, and only then clears the retired generation.
+func (b *Beads) ResetAgentBeadForReuseIfUnchangedRevalidatedAfter(
+	id, reason string,
+	expected AgentFieldExpectations,
+	revalidate func(*Issue, *AgentFields) error,
+	beforeReset func() error,
+) error {
 	if expected.AgentState == nil || expected.Incarnation == nil || expected.CleanupStatus == nil ||
 		expected.ActiveMR == nil || expected.Mode == nil || expected.HookBead == nil ||
 		expected.ExitType == nil || expected.MRID == nil || expected.Branch == nil ||
@@ -465,7 +477,7 @@ func (b *Beads) ResetAgentBeadForReuseIfUnchangedAfter(
 		strings.TrimSpace(*expected.Incarnation) == "" {
 		return fmt.Errorf("%w: incomplete lifecycle snapshot", ErrAgentFieldsChanged)
 	}
-	return b.resetAgentBeadForReuse(id, reason, &expected, beforeReset)
+	return b.resetAgentBeadForReuseRevalidated(id, reason, &expected, revalidate, beforeReset)
 }
 
 func (b *Beads) resetAgentBeadForReuse(
@@ -473,6 +485,15 @@ func (b *Beads) resetAgentBeadForReuse(
 	expected *AgentFieldExpectations,
 	beforeReset func() error,
 ) error {
+	return b.resetAgentBeadForReuseRevalidated(id, reason, expected, nil, beforeReset)
+}
+
+func (b *Beads) resetAgentBeadForReuseRevalidated(
+	id, reason string,
+	expected *AgentFieldExpectations,
+	revalidate func(*Issue, *AgentFields) error,
+	beforeReset func() error,
+) (retErr error) {
 	// Lock the agent bead to prevent concurrent read-modify-write races.
 	// Without this, a concurrent CreateOrReopenAgentBead could overwrite
 	// the nuked state we're about to set. See gt-joazs.
@@ -493,10 +514,29 @@ func (b *Beads) resetAgentBeadForReuse(
 	// Parse existing fields and clear mutable ones
 	fields := agentFieldsFromIssue(issue)
 	if expected != nil {
-		if err := checkAgentFieldExpectations(fields, *expected); err != nil {
+		if err := checkAgentFieldExpectationsAllowRetiring(fields, *expected); err != nil {
 			return err
 		}
 	}
+	if revalidate != nil {
+		if err := revalidate(issue, fields); err != nil {
+			return err
+		}
+	}
+	fenced := fields.AgentState == string(AgentStateRetiring)
+	if !fenced {
+		fields.AgentState = string(AgentStateRetiring)
+		description := FormatAgentDescription(issue.Title, fields)
+		if err := target.Update(id, UpdateOptions{Description: &description}); err != nil {
+			return fmt.Errorf("fencing retiring agent generation: %w", err)
+		}
+		fenced = true
+	}
+	defer func() {
+		if retErr != nil && fenced {
+			retErr = errors.Join(ErrAgentRetirementFenced, retErr)
+		}
+	}()
 	if beforeReset != nil {
 		if err := beforeReset(); err != nil {
 			return err
@@ -590,6 +630,10 @@ type AgentFieldExpectations struct {
 // ErrAgentFieldsChanged reports that an agent bead changed after the caller
 // observed it, so the guarded mutation was not written.
 var ErrAgentFieldsChanged = errors.New("agent description fields changed")
+
+// ErrAgentRetirementFenced reports that the old generation is durably barred
+// from lifecycle writes and the interrupted retirement must be resumed.
+var ErrAgentRetirementFenced = errors.New("agent retirement durably fenced")
 
 func validateAgentFieldUpdates(updates AgentFieldUpdates) error {
 	if updates.NotificationLevel == nil {
@@ -759,6 +803,13 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 }
 
 func checkAgentFieldExpectations(fields *AgentFields, expected AgentFieldExpectations) error {
+	if fields != nil && expected.Incarnation != nil && fields.AgentState == string(AgentStateRetiring) {
+		return fmt.Errorf("%w: agent_state", ErrAgentFieldsChanged)
+	}
+	return checkAgentFieldExpectationsAllowRetiring(fields, expected)
+}
+
+func checkAgentFieldExpectationsAllowRetiring(fields *AgentFields, expected AgentFieldExpectations) error {
 	if fields == nil {
 		return fmt.Errorf("%w: missing agent fields", ErrAgentFieldsChanged)
 	}
@@ -841,7 +892,7 @@ func (b *Beads) UpdateAgentIfIncarnation(id, expectedIncarnation string, updates
 	if err != nil {
 		return err
 	}
-	if fields := agentFieldsFromIssue(issue); fields == nil || fields.Incarnation != expectedIncarnation {
+	if fields := agentFieldsFromIssue(issue); fields == nil || fields.Incarnation != expectedIncarnation || fields.AgentState == string(AgentStateRetiring) {
 		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
 	}
 	return b.Update(id, updates)

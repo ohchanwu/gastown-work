@@ -19,6 +19,7 @@ const (
 	AgentStateEscalated    AgentState = "escalated"
 	AgentStateIdle         AgentState = "idle"
 	AgentStateRunning      AgentState = "running"
+	AgentStateRetiring     AgentState = "retiring"
 	AgentStateNuked        AgentState = "nuked"
 	AgentStateAwaitingGate AgentState = "awaiting-gate"
 	// Deacon lifecycle states (hq-sa8de Phase A).
@@ -45,7 +46,7 @@ func ResolveAgentState(description, structured string) string {
 // States like "stuck" and "awaiting-gate" mean the polecat is paused on purpose.
 func (s AgentState) ProtectsFromCleanup() bool {
 	switch s {
-	case AgentStateStuck, AgentStateAwaitingGate, AgentStatePaused:
+	case AgentStateStuck, AgentStateAwaitingGate, AgentStatePaused, AgentStateRetiring:
 		return true
 	default:
 		return false

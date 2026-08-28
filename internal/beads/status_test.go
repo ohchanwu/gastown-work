@@ -11,6 +11,7 @@ func TestAgentStateProtectsFromCleanup(t *testing.T) {
 		{AgentStateStuck, true},
 		{AgentStateAwaitingGate, true},
 		{AgentStatePaused, true},
+		{AgentStateRetiring, true},
 		{AgentStateWorking, false},
 		{AgentStateIdle, false},
 		{AgentStateDone, false},
@@ -43,6 +44,7 @@ func TestAgentStateIsActive(t *testing.T) {
 		{AgentStateStuck, false},
 		{AgentStateNuked, false},
 		{AgentStatePaused, false},
+		{AgentStateRetiring, false},
 	}
 	for _, tt := range tests {
 		if got := tt.state.IsActive(); got != tt.want {

@@ -354,6 +354,7 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationRejectsReplacementBeforeMutation
 	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
 		"toast", "stale-generation", true, true, false,
 		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil },
+		nil,
 		func() error { afterCalls++; return nil },
 	)
 	if !errors.Is(err, ErrPolecatIncarnationChanged) {
@@ -377,7 +378,7 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationHoldsLockThroughAfterRemove(t *t
 	removeDone := make(chan error, 1)
 	go func() {
 		removeDone <- mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
-			"toast", "fixture-generation", true, true, false, nil,
+			"toast", "fixture-generation", true, true, false, nil, nil,
 			func() error {
 				close(afterEntered)
 				<-releaseAfter
@@ -434,7 +435,7 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationShellPreflightDoesNotCommit(t *t
 	beforeCalls := 0
 	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
 		"toast", incarnation, true, true, false,
-		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil }, nil,
+		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil }, nil, nil,
 	)
 	if !errors.Is(err, ErrShellInWorktree) {
 		t.Fatalf("error = %v, want ErrShellInWorktree", err)
@@ -470,7 +471,7 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationGetwdFailureDoesNotMutate(t *tes
 	beforeCalls := 0
 	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
 		"toast", "fixture-generation", true, true, false,
-		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil }, nil,
+		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil }, nil, nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "current directory unavailable") {
 		t.Fatalf("error = %v, want fail-closed getwd error", err)
@@ -532,7 +533,7 @@ esac
 	beforeCalls := 0
 	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
 		"toast", "fixture-generation", false, true, false,
-		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil }, nil,
+		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil }, nil, nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "still pending in merge queue") {
 		t.Fatalf("error = %v, want active-MR refusal", err)
@@ -592,6 +593,7 @@ esac
 			beforeCalls++
 			return expectedFields, nil
 		},
+		nil,
 		func() error { afterCalls++; return nil },
 	)
 	if !errors.Is(err, beads.ErrAgentFieldsChanged) {
@@ -640,13 +642,13 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationPreservesLateDirtyWork(t *testin
 				return nil, writeErr
 			}
 			return expectedFields, nil
-		}, nil,
+		}, nil, nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "registered worktree") {
 		t.Fatalf("error = %v, want dirty registered-worktree refusal", err)
 	}
-	if errors.Is(err, ErrPolecatRetirementCommitted) {
-		t.Fatalf("dirty-work refusal reported committed retirement: %v", err)
+	if !errors.Is(err, ErrPolecatRetirementCommitted) || !errors.Is(err, beads.ErrAgentRetirementFenced) {
+		t.Fatalf("dirty-work refusal did not preserve durable retirement fence: %v", err)
 	}
 	if _, statErr := os.Stat(lateWork); statErr != nil {
 		t.Fatalf("late work was lost: %v", statErr)
@@ -672,7 +674,7 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationRefusesUnclassifiedFilesystem(t 
 
 	const incarnation = "fixture-generation"
 	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
-		"toast", incarnation, true, true, false, nil, nil,
+		"toast", incarnation, true, true, false, nil, nil, nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "cannot classify polecat worktree") {
 		t.Fatalf("error = %v, want worktree classification refusal", err)
@@ -698,7 +700,7 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationDoesNotPublishSuccessAfterWorktr
 	afterCalls := 0
 
 	err := mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
-		"toast", "fixture-generation", true, true, false, nil,
+		"toast", "fixture-generation", true, true, false, nil, nil,
 		func() error {
 			afterCalls++
 			return nil
@@ -709,6 +711,83 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationDoesNotPublishSuccessAfterWorktr
 	}
 	if afterCalls != 0 {
 		t.Fatalf("after-remove branch cleanup ran %d time(s) after residual cleanup failure", afterCalls)
+	}
+}
+
+func TestRemoveWithOptionsLocalOnlyIfIncarnationAllowsMissingCloneRecovery(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	runManagerGit(t, mayorRig, "worktree", "remove", "--force", p.ClonePath)
+	expected := &beads.AgentFields{AgentState: "idle", Incarnation: "fixture-generation", CleanupStatus: "clean", Branch: "polecat/toast/gt-work@abc123"}
+
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", "fixture-generation", true, true, false,
+		func(*Polecat) (*beads.AgentFields, error) { return expected, nil }, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("missing-clone recovery: %v", err)
+	}
+}
+
+func TestRemoveWithOptionsLocalOnlyIfIncarnationDoesNotConfuseSiblingPrefixWithWorktree(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	_, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	sibling := mgr.polecatDir("toast") + "-sibling"
+	if err := os.MkdirAll(sibling, 0755); err != nil {
+		t.Fatalf("mkdir sibling: %v", err)
+	}
+	originalCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(sibling); err != nil {
+		t.Fatalf("Chdir sibling: %v", err)
+	}
+	defer func() { _ = os.Chdir(originalCWD) }()
+	expected := &beads.AgentFields{AgentState: "idle", Incarnation: "fixture-generation", CleanupStatus: "clean", Branch: "polecat/toast/gt-work@abc123"}
+
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", "fixture-generation", true, true, false,
+		func(*Polecat) (*beads.AgentFields, error) { return expected, nil }, nil, nil,
+	)
+	if errors.Is(err, ErrShellInWorktree) {
+		t.Fatalf("sibling-prefix cwd misclassified as worktree: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("removal from sibling cwd: %v", err)
+	}
+}
+
+func TestRemoveWithOptionsLocalOnlyIfIncarnationPreservesDirtyStandaloneClone(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	runManagerGit(t, mayorRig, "worktree", "remove", "--force", p.ClonePath)
+	if err := os.RemoveAll(filepath.Dir(p.ClonePath)); err != nil {
+		t.Fatalf("remove old polecat directory: %v", err)
+	}
+	runManagerGit(t, "", "clone", mayorRig, p.ClonePath)
+	dirtyPath := filepath.Join(p.ClonePath, "README.md")
+	managerWriteFile(t, dirtyPath, "late standalone work\n")
+	expected := &beads.AgentFields{AgentState: "idle", Incarnation: "fixture-generation", CleanupStatus: "clean", Branch: "polecat/toast/gt-work@abc123"}
+
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", "fixture-generation", true, true, false,
+		func(*Polecat) (*beads.AgentFields, error) { return expected, nil }, nil, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "standalone clone has uncommitted work") {
+		t.Fatalf("error = %v, want dirty standalone-clone refusal", err)
+	}
+	if _, statErr := os.Stat(dirtyPath); statErr != nil {
+		t.Fatalf("dirty standalone work was lost: %v", statErr)
 	}
 }
 

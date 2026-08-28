@@ -65,8 +65,8 @@ func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
 	if refs := referencesIdentifier(t, file, "runPolecatNuke", "provePolecatNukeCustody"); refs != 1 {
 		t.Fatalf("runPolecatNuke custody proof references = %d, want 1", refs)
 	}
-	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 2 {
-		t.Fatalf("real nuke custody proof calls = %d, want initial and lifecycle-locked recheck", calls)
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 3 {
+		t.Fatalf("real nuke custody proof calls = %d, want initial, pre-fence, and destructive-boundary rechecks", calls)
 	}
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "verifyPolecatNukeGitCustody"); calls != 1 {
 		t.Fatalf("post-stop Git custody rechecks = %d, want 1", calls)

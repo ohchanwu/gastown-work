@@ -1184,7 +1184,7 @@ func (m *Manager) RemoveWithOptionsLocalOnly(name string, force, nuclear, selfNu
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "", nil, false)
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "", nil, nil, false)
 }
 
 // RemoveWithOptionsLocalOnlyIfIncarnation holds the same per-polecat lifecycle
@@ -1195,6 +1195,7 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 	name, expectedIncarnation string,
 	force, nuclear, selfNuke bool,
 	beforeRemove func(*Polecat) (*beads.AgentFields, error),
+	afterFence func() error,
 	afterRemove func() error,
 ) (retErr error) {
 	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
@@ -1226,7 +1227,7 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 		_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
 		return fields, err
 	}
-	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation, beforeRetire, false); err != nil {
+	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation, beforeRetire, afterFence, false); err != nil {
 		return err
 	}
 	if afterRemove != nil {
@@ -1238,7 +1239,7 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 }
 
 func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) error {
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "", nil, false)
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "", nil, nil, false)
 }
 
 func (m *Manager) removeWithOptionsLockedPolicy(
@@ -1246,6 +1247,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	force, nuclear, selfNuke, publishBeforeRemoval bool,
 	expectedIncarnation string,
 	beforeRetire func() (*beads.AgentFields, error),
+	afterFence func() error,
 	allowStructurallyBrokenDirectRemoval bool,
 ) (retErr error) {
 	retirementCommitted := false
@@ -1309,13 +1311,13 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 		if cwdErr != nil {
 			return fmt.Errorf("cannot verify shell safety: current directory unavailable: %w", cwdErr)
 		}
-		cwdAbs, absErr1 := canonicalExistingPath(cwd)
-		cloneAbs, absErr2 := canonicalExistingPath(clonePath)
-		polecatAbs, absErr3 := canonicalExistingPath(polecatDir)
+		cwdAbs, absErr1 := canonicalPath(cwd)
+		cloneAbs, absErr2 := canonicalPath(clonePath)
+		polecatAbs, absErr3 := canonicalPath(polecatDir)
 		if absErr1 != nil || absErr2 != nil || absErr3 != nil {
 			return fmt.Errorf("cannot verify shell safety: failed to resolve paths")
 		}
-		if strings.HasPrefix(cwdAbs, cloneAbs) || strings.HasPrefix(cwdAbs, polecatAbs) {
+		if pathWithin(cloneAbs, cwdAbs) || pathWithin(polecatAbs, cwdAbs) {
 			return fmt.Errorf("%w: your shell is in %s\n\nPlease cd elsewhere first, then retry:\n  cd ~/gt\n  gt polecat nuke %s/%s --force",
 				ErrShellInWorktree, cwd, m.rig.Name, name)
 		}
@@ -1348,6 +1350,11 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	}
 	filesystemCommitted := false
 	removeFilesystem := func() error {
+		if afterFence != nil {
+			if err := afterFence(); err != nil {
+				return err
+			}
+		}
 		if registeredWorktree {
 			if err := repoGit.WorktreeRemove(clonePath, force); err != nil {
 				structuralErr := VerifyWorktreeExists(clonePath)
@@ -1357,8 +1364,13 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 			} else {
 				filesystemCommitted = true
 			}
-		} else if !directRemoval {
-			return errors.New("polecat path is not positively classified for direct removal")
+		} else {
+			if !directRemoval {
+				return errors.New("polecat path is not positively classified for direct removal")
+			}
+			if err := revalidateStandaloneCloneClean(clonePath); err != nil {
+				return err
+			}
 		}
 		if removeErr := m.removeAllPath(clonePath); removeErr != nil {
 			return fmt.Errorf("removing leftover clone path: %w", removeErr)
@@ -1393,10 +1405,23 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	agentID := m.agentBeadID(name)
 	var resetErr error
 	if expectedAgentFields != nil {
-		resetErr = m.agentBeads().ResetAgentBeadForReuseIfUnchangedAfter(
+		resetErr = m.agentBeads().ResetAgentBeadForReuseIfUnchangedRevalidatedAfter(
 			agentID,
 			"polecat removed",
 			expectedAgentFields.LifecycleExpectations(),
+			func(_ *beads.Issue, currentFields *beads.AgentFields) error {
+				if beforeRetire == nil {
+					return errors.New("final lifecycle proof unavailable")
+				}
+				lockedFields, err := beforeRetire()
+				if err != nil {
+					return err
+				}
+				if lockedFields == nil || currentFields == nil || lockedFields.Incarnation != expectedIncarnation || currentFields.Incarnation != expectedIncarnation {
+					return fmt.Errorf("%w: lifecycle snapshot", ErrPolecatIncarnationChanged)
+				}
+				return nil
+			},
 			func() error {
 				if err := removeFilesystem(); err != nil {
 					return err
@@ -1416,7 +1441,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 		}
 	}
 	if resetErr != nil {
-		if filesystemCommitted {
+		if filesystemCommitted || errors.Is(resetErr, beads.ErrAgentRetirementFenced) {
 			retirementCommitted = true
 		}
 		if expectedIncarnation != "" {
@@ -1496,12 +1521,50 @@ func sameFilesystemPath(left, right string) (bool, error) {
 	return filepath.Clean(leftAbs) == filepath.Clean(rightAbs), nil
 }
 
-func canonicalExistingPath(path string) (string, error) {
+func canonicalPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
 	}
-	return filepath.EvalSymlinks(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	for parent := filepath.Dir(abs); ; parent = filepath.Dir(parent) {
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			rel, relErr := filepath.Rel(parent, abs)
+			if relErr != nil {
+				return "", relErr
+			}
+			return filepath.Clean(filepath.Join(resolved, rel)), nil
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return "", fmt.Errorf("no existing ancestor for %s", path)
+		}
+	}
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)))
+}
+
+func revalidateStandaloneCloneClean(clonePath string) error {
+	if _, err := os.Stat(clonePath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("checking standalone clone before removal: %w", err)
+	}
+	status, err := git.NewGit(clonePath).CheckUncommittedWork()
+	if err != nil {
+		return fmt.Errorf("checking standalone clone before removal: %w", err)
+	}
+	if !status.Clean() {
+		return fmt.Errorf("standalone clone has uncommitted work: %s", status.String())
+	}
+	return nil
 }
 
 func (m *Manager) removeAllPath(path string) error {
@@ -1606,7 +1669,7 @@ func (m *Manager) ReclaimBrokenIdlePolecat(name string) (retErr error) {
 		return fmt.Errorf("not safe to reclaim: %s", blocker)
 	}
 
-	return m.removeWithOptionsLockedPolicy(name, false, false, false, true, "", nil, true)
+	return m.removeWithOptionsLockedPolicy(name, false, false, false, true, "", nil, nil, true)
 }
 
 // verifyRemovalComplete checks that polecat directories were actually removed.

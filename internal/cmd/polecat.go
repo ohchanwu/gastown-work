@@ -2242,6 +2242,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	branchToDelete := custody.BranchToDelete
 	branchTargets := custody.BranchTargets
 	retiredIssue := ""
+	var lockedCustody polecatNukeCustody
 
 	sessMgr := polecat.NewSessionManager(tmux.NewTmux(), r)
 	// Hold the same lifecycle lock used by spawn/reuse from the second custody
@@ -2253,24 +2254,39 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		true,
 		false,
 		func(_ *polecat.Polecat) (*beads.AgentFields, error) {
-			lockedCustody, lockedErr := provePolecatNukeCustody(polecatName, rigName, mgr, r, opts)
+			candidate, lockedErr := provePolecatNukeCustody(polecatName, rigName, mgr, r, opts)
 			if lockedErr != nil {
 				return nil, lockedErr
 			}
-			if lockedCustody.PolecatInfo == nil || lockedCustody.PolecatInfo.Incarnation != polecatInfo.Incarnation ||
-				lockedCustody.BranchToDelete != branchToDelete {
+			if candidate.PolecatInfo == nil || candidate.PolecatInfo.Incarnation != polecatInfo.Incarnation ||
+				candidate.BranchToDelete != branchToDelete {
 				return nil, fmt.Errorf("%w during nuke recheck", polecat.ErrPolecatIncarnationChanged)
 			}
+			lockedCustody = candidate
+			retiredIssue = candidate.PolecatInfo.Issue
+			branchTargets = candidate.BranchTargets
+			return candidate.AgentFields, nil
+		},
+		func() error {
+			boundaryCustody, boundaryErr := provePolecatNukeCustody(polecatName, rigName, mgr, r, opts)
+			if boundaryErr != nil {
+				return boundaryErr
+			}
+			if lockedCustody.PolecatInfo == nil || boundaryCustody.PolecatInfo == nil ||
+				boundaryCustody.PolecatInfo.Incarnation != lockedCustody.PolecatInfo.Incarnation ||
+				boundaryCustody.BranchToDelete != lockedCustody.BranchToDelete {
+				return fmt.Errorf("%w at destructive boundary", polecat.ErrPolecatIncarnationChanged)
+			}
 			if err := runPolecatNukeLockedTeardown(
-				func() error { return sessMgr.StopSessionCustody(lockedCustody.Session) },
-				func() error { return verifyPolecatNukeGitCustody(r, lockedCustody) },
+				func() error { return sessMgr.StopSessionCustody(boundaryCustody.Session) },
+				func() error { return verifyPolecatNukeGitCustody(r, boundaryCustody) },
 				nil,
 			); err != nil {
-				return nil, err
+				return err
 			}
-			retiredIssue = lockedCustody.PolecatInfo.Issue
-			branchTargets = lockedCustody.BranchTargets
-			return lockedCustody.AgentFields, nil
+			retiredIssue = boundaryCustody.PolecatInfo.Issue
+			branchTargets = boundaryCustody.BranchTargets
+			return nil
 		},
 		func() error {
 			if retiredIssue != "" {

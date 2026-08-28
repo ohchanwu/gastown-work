@@ -9,6 +9,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/polecat"
 )
 
 func TestRoutedIssueBeadsUsesTownRoutesForCustomPrefix(t *testing.T) {
@@ -164,6 +165,7 @@ func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 	t.Setenv("GT_RIG", "gastown")
 	t.Setenv("GT_POLECAT", "refuge")
 	t.Setenv("BD_ACTOR", "gastown/polecats/refuge")
+	t.Setenv(polecat.EnvAgentIncarnation, "fixture-generation")
 	t.Chdir(workDir)
 
 	doneIssue = "bd-source"
@@ -325,6 +327,10 @@ if [ "$1" = "show" ] && [ "$2" = "bd-source" ]; then
 fi
 if [ "$1" = "show" ] && [ "$2" = "gt-mr" ]; then
   echo '[{"id":"gt-mr","title":"Merge: bd-source","status":"open","priority":1,"issue_type":"task","labels":["gt:merge-request"],"description":"branch: feature/routed-submit\\ntarget: main\\nsource_issue: bd-source\\nrig: gastown"}]'
+  exit 0
+fi
+if [ "$1" = "show" ] && [ "$2" = "gt-gastown-polecat-refuge" ]; then
+  echo '[{"id":"gt-gastown-polecat-refuge","title":"Polecat refuge","status":"open","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\\nrig: gastown\\nagent_state: working\\nincarnation: fixture-generation\\nhook_bead: bd-source\\ncleanup_status: clean"}]'
   exit 0
 fi
 if [ "$1" = "list" ]; then

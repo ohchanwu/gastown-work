@@ -417,6 +417,25 @@ func cleanupStatusFromWorkState(workStatus *git.UncommittedWorkStatus, branchPus
 	return "clean"
 }
 
+func requireDonePolecatIncarnation(expected string, load func() (*beads.AgentFields, error)) (string, error) {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return "", fmt.Errorf("gt done launch incarnation receipt is missing; restart this polecat session before completing work")
+	}
+	fields, err := load()
+	if err != nil {
+		return "", fmt.Errorf("reading current polecat incarnation: %w", err)
+	}
+	if fields == nil || strings.TrimSpace(fields.Incarnation) != expected {
+		observed := ""
+		if fields != nil {
+			observed = strings.TrimSpace(fields.Incarnation)
+		}
+		return "", fmt.Errorf("%w: launch %s, current %s", polecat.ErrPolecatIncarnationChanged, expected, observed)
+	}
+	return expected, nil
+}
+
 var reviewEvidencePrefixes = []string{
 	"report:",
 	"findings:",
@@ -700,6 +719,24 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	rigName := worktree.rigName
 	polecatName := worktree.polecatName
 	sender := worktree.actor
+	agentBeadID := getAgentBeadID(RoleContext{
+		Role:     RolePolecat,
+		Rig:      rigName,
+		Polecat:  polecatName,
+		TownRoot: townRoot,
+		WorkDir:  cwd,
+	})
+	if agentBeadID == "" {
+		return fmt.Errorf("resolving agent bead for %s/%s", rigName, polecatName)
+	}
+	agentBd := beads.New(cwd).ForAgentBead()
+	agentIncarnation, err := requireDonePolecatIncarnation(os.Getenv(polecat.EnvAgentIncarnation), func() (*beads.AgentFields, error) {
+		_, fields, loadErr := agentBd.GetAgentBead(agentBeadID)
+		return fields, loadErr
+	})
+	if err != nil {
+		return err
+	}
 
 	g := git.NewGit(cwd)
 
@@ -856,39 +893,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	}
 	worker := info.Worker
 
-	// Get agent bead ID for cross-referencing
-	var agentBeadID, agentIncarnation string
-	if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil {
-		if actor := roleInfo.ActorString(); actor != "" {
-			sender = actor
-		}
-		ctx := RoleContext{
-			Role:     roleInfo.Role,
-			Rig:      roleInfo.Rig,
-			Polecat:  roleInfo.Polecat,
-			TownRoot: townRoot,
-			WorkDir:  cwd,
-		}
-		agentBeadID = getAgentBeadID(ctx)
-
-		// Recreate the agent bead if it's missing (hq-xu4p). Done-intent
-		// labels, checkpoints, and active_mr all write to it; when it's gone
-		// every write fails 'issue not found' and witness zombie detection +
-		// done-resume silently degrade. Best-effort: a failed recreate just
-		// leaves the existing warnings.
-		agentBd := beads.New(cwd).ForAgentBead()
-		ensureAgentBeadExists(agentBd, agentBeadID, ctx)
-		if agentBeadID != "" {
-			if incarnation, incarnationErr := agentBd.InitializeAgentIncarnationIfMissing(agentBeadID); incarnationErr != nil {
-				style.PrintWarning("could not bind gt done to agent incarnation: %v", incarnationErr)
-			} else {
-				agentIncarnation = incarnation
-			}
-		}
-
-		// Completion now exits the live polecat session after durable handoff.
-		// The agent bead keeps lifecycle metadata for witness/refinery cleanup.
-	}
 	var assignedIssueIDs []string
 	loadAssignedIssueIDs := func() []string {
 		if assignedIssueIDs == nil && sender != "" {

@@ -433,6 +433,128 @@ func TestResetAgentBeadForReuseIfUnchangedRejectsSameIncarnationLifecycleDrift(t
 	}
 }
 
+func TestResetAgentBeadForReuseFencesBeforeDestructiveCallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: stuck\nincarnation: generation-1\nhook_bead: null\ncleanup_status: clean"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	expected := agentFieldsFromIssue(&Issue{Description: description}).LifecycleExpectations()
+	callbackErr := errors.New("injected destructive callback failure")
+
+	err := bd.ResetAgentBeadForReuseIfUnchangedRevalidatedAfter(
+		"gt-gastown-polecat-nux",
+		"polecat removed",
+		expected,
+		nil,
+		func() error {
+			if log := readMockBDLog(t, logPath); !strings.Contains(log, "agent_state: retiring") {
+				t.Fatalf("destructive callback ran before durable retiring fence: %q", log)
+			}
+			return callbackErr
+		},
+	)
+	if !errors.Is(err, callbackErr) || !errors.Is(err, ErrAgentRetirementFenced) {
+		t.Fatalf("error = %v, want callback error plus retirement fence", err)
+	}
+	logOutput := readMockBDLog(t, logPath)
+	if got := strings.Count(logOutput, "update gt-gastown-polecat-nux"); got != 1 {
+		t.Fatalf("updates after callback failure = %d, want only durable fence; log=%q", got, logOutput)
+	}
+}
+
+func TestResetAgentBeadForReuseRevalidationFailureHasZeroMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: stuck\nincarnation: generation-1\nhook_bead: null\ncleanup_status: clean"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	expected := agentFieldsFromIssue(&Issue{Description: description}).LifecycleExpectations()
+	driftErr := errors.New("work receipt changed")
+	destructiveCalls := 0
+
+	err := bd.ResetAgentBeadForReuseIfUnchangedRevalidatedAfter(
+		"gt-gastown-polecat-nux",
+		"polecat removed",
+		expected,
+		func(*Issue, *AgentFields) error { return driftErr },
+		func() error { destructiveCalls++; return nil },
+	)
+	if !errors.Is(err, driftErr) {
+		t.Fatalf("error = %v, want %v", err, driftErr)
+	}
+	if destructiveCalls != 0 {
+		t.Fatalf("destructive callbacks = %d, want 0", destructiveCalls)
+	}
+	if log := readMockBDLog(t, logPath); strings.Contains(log, "update gt-gastown-polecat-nux") {
+		t.Fatalf("revalidation failure mutated agent bead: %q", log)
+	}
+}
+
+func TestResetAgentBeadForReuseResumesDurablyFencedRetirement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: generation-1\nhook_bead: null\ncleanup_status: clean"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	expected := agentFieldsFromIssue(&Issue{Description: description}).LifecycleExpectations()
+
+	if err := bd.ResetAgentBeadForReuseIfUnchangedRevalidatedAfter(
+		"gt-gastown-polecat-nux", "polecat removed", expected, nil, nil,
+	); err != nil {
+		t.Fatalf("resume fenced retirement: %v", err)
+	}
+	logOutput := readMockBDLog(t, logPath)
+	if got := strings.Count(logOutput, "update gt-gastown-polecat-nux"); got != 1 {
+		t.Fatalf("updates while resuming fenced retirement = %d, want final reset only; log=%q", got, logOutput)
+	}
+	if !strings.Contains(logOutput, "agent_state: nuked") {
+		t.Fatalf("resumed retirement did not reach nuked state: %q", logOutput)
+	}
+}
+
+func TestIncarnationBoundWritersRejectRetiringGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: generation-1\nhook_bead: null\ncleanup_status: clean"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+
+	if err := bd.UpdateAgentCompletionIfIncarnation("gt-gastown-polecat-nux", "generation-1", &CompletionMetadata{ExitType: "COMPLETED"}); !errors.Is(err, ErrAgentFieldsChanged) {
+		t.Fatalf("completion error = %v, want ErrAgentFieldsChanged", err)
+	}
+	if err := bd.UpdateAgentIfIncarnation("gt-gastown-polecat-nux", "generation-1", UpdateOptions{AddLabels: []string{"done-cp:pushed"}}); !errors.Is(err, ErrAgentFieldsChanged) {
+		t.Fatalf("label error = %v, want ErrAgentFieldsChanged", err)
+	}
+	if log := readMockBDLog(t, logPath); strings.Contains(log, "update gt-gastown-polecat-nux") {
+		t.Fatalf("retiring generation accepted lifecycle write: %q", log)
+	}
+}
+
 func TestLifecycleExpectationsRejectEveryResetFieldDrift(t *testing.T) {
 	base := &AgentFields{
 		AgentState: "stuck", Incarnation: "generation-1", CleanupStatus: "clean",

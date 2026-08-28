@@ -961,6 +961,37 @@ func TestUpdateAgentStateAfterSubmissionSkipsFailedSubmissions(t *testing.T) {
 	}
 }
 
+func TestRequireDonePolecatIncarnationRejectsStaleLaunchReceipt(t *testing.T) {
+	tests := []struct {
+		name     string
+		receipt  string
+		observed string
+		wantErr  string
+	}{
+		{name: "matching launch generation", receipt: "generation-1", observed: "generation-1"},
+		{name: "old process after same-name reuse", receipt: "generation-1", observed: "generation-2", wantErr: "incarnation changed"},
+		{name: "old process after retirement reset", receipt: "generation-1", observed: "", wantErr: "incarnation changed"},
+		{name: "missing immutable receipt", observed: "generation-2", wantErr: "launch incarnation receipt is missing"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := requireDonePolecatIncarnation(tt.receipt, func() (*beads.AgentFields, error) {
+				return &beads.AgentFields{Incarnation: tt.observed}, nil
+			})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tt.receipt {
+				t.Fatalf("incarnation = %q, error = %v; want %q, nil", got, err, tt.receipt)
+			}
+		})
+	}
+}
+
 func TestShouldRetirePolecatSessionAfterDone(t *testing.T) {
 	tests := []struct {
 		name          string
