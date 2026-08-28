@@ -91,6 +91,8 @@ A three-tier watchdog system keeps agents healthy:
 - **Deacon** - Background supervisor running continuous patrol cycles across all rigs.
 - **Dogs** - Infrastructure workers dispatched by the Deacon for maintenance tasks (e.g., Boot for triage).
 
+Operational incident: [Direct actionable mail can bypass the Beads work lifecycle](docs/operations/agents/260822-witness-review-work-invisible.md).
+
 ### Refinery 🏭
 
 Per-rig merge queue processor. When polecats complete work via `gt done`, the Refinery batches merge requests, runs verification gates, and merges to main using a Bors-style bisecting queue. Failed MRs are isolated and either fixed inline or re-dispatched.

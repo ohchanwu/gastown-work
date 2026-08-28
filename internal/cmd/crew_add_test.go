@@ -1,20 +1,26 @@
 package cmd
 
 import (
+	"bytes"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/crew"
+	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/rig"
 )
 
 type fakeAgentBeadUpserter struct {
-	gotID    string
-	gotTitle string
-	gotField *beads.AgentFields
-	retErr   error
-	calls    int
+	gotID     string
+	gotTitle  string
+	gotField  *beads.AgentFields
+	retErr    error
+	retErrors []error
+	calls     int
 }
 
 // CreateOrReopenAgentBead captures invocation details so tests can assert on
@@ -24,6 +30,9 @@ func (f *fakeAgentBeadUpserter) CreateOrReopenAgentBead(id, title string, fields
 	f.gotID = id
 	f.gotTitle = title
 	f.gotField = fields
+	if len(f.retErrors) >= f.calls {
+		return nil, f.retErrors[f.calls-1]
+	}
 	if f.retErr != nil {
 		return nil, f.retErr
 	}
@@ -84,4 +93,78 @@ func TestUpsertCrewAgentBead(t *testing.T) {
 			t.Fatalf("id = %q, want empty on error", id)
 		}
 	})
+}
+
+func TestRunCrewAddRecoversAfterInitialUpsertFailure(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(`{"prefix":"bom-","path":"bti_ops_match"}`+"\n"), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	rigPath := filepath.Join(townRoot, "bti_ops_match")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+	bareRepo := filepath.Join(townRoot, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", bareRepo).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, output)
+	}
+	workspaces := crew.NewManager(&rig.Rig{Name: "bti_ops_match", Path: rigPath, GitURL: bareRepo}, git.NewGit(rigPath))
+	beadStore := &fakeAgentBeadUpserter{retErr: errors.New("temporary bead failure")}
+
+	if err := runCrewAddWith([]string{"neo"}, "bti_ops_match", townRoot, false, workspaces, beadStore); err == nil {
+		t.Fatal("initial command returned nil, want bead failure")
+	}
+	worker, err := workspaces.Get("neo")
+	if err != nil {
+		t.Fatalf("get preserved workspace: %v", err)
+	}
+	statePath := filepath.Join(worker.ClonePath, "state.json")
+	stateBeforeRetry, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state before retry: %v", err)
+	}
+
+	beadStore.retErr = nil
+	if err := runCrewAddWith([]string{"neo"}, "bti_ops_match", townRoot, false, workspaces, beadStore); err != nil {
+		t.Fatalf("retry command: %v", err)
+	}
+	stateAfterRetry, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state after retry: %v", err)
+	}
+	if !bytes.Equal(stateAfterRetry, stateBeforeRetry) || beadStore.calls != 2 {
+		t.Fatalf("retry changed workspace state=%v and bead calls=%d, want unchanged workspace and two bead attempts", !bytes.Equal(stateAfterRetry, stateBeforeRetry), beadStore.calls)
+	}
+
+	mixedStore := &fakeAgentBeadUpserter{retErrors: []error{errors.New("first bead failed"), nil}}
+	if err := runCrewAddWith([]string{"morpheus", "trinity"}, "bti_ops_match", townRoot, false, workspaces, mixedStore); err == nil {
+		t.Fatal("mixed batch returned nil with an incomplete identity")
+	}
+	morpheus, err := workspaces.Get("morpheus")
+	if err != nil {
+		t.Fatalf("get failed mixed-batch workspace: %v", err)
+	}
+	if _, err := workspaces.Get("trinity"); err != nil || mixedStore.gotID != "bom-bti_ops_match-crew-trinity" {
+		t.Fatalf("successful mixed-batch identity = (%q, %v), want trinity workspace and bead", mixedStore.gotID, err)
+	}
+	morpheusState, err := os.ReadFile(filepath.Join(morpheus.ClonePath, "state.json"))
+	if err != nil {
+		t.Fatalf("read failed identity workspace state: %v", err)
+	}
+
+	mixedStore.retErrors = nil
+	if err := runCrewAddWith([]string{"morpheus"}, "bti_ops_match", townRoot, false, workspaces, mixedStore); err != nil {
+		t.Fatalf("retry failed mixed-batch identity: %v", err)
+	}
+	retriedState, err := os.ReadFile(filepath.Join(morpheus.ClonePath, "state.json"))
+	if err != nil {
+		t.Fatalf("read retried identity workspace state: %v", err)
+	}
+	if !bytes.Equal(retriedState, morpheusState) || mixedStore.calls != 3 || mixedStore.gotID != "bom-bti_ops_match-crew-morpheus" {
+		t.Fatalf("mixed retry changed workspace=%v, calls=%d, last bead=%q", !bytes.Equal(retriedState, morpheusState), mixedStore.calls, mixedStore.gotID)
+	}
 }

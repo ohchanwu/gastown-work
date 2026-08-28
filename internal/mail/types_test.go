@@ -979,3 +979,21 @@ func TestNewMessageFanOutCopiesGetUniqueIDs(t *testing.T) {
 		t.Error("copy with empty ID should fail validation before sendToSingle regenerates it")
 	}
 }
+
+func TestActionableWorkReadStateComesOnlyFromReadLabel(t *testing.T) {
+	closed := (&BeadsMessage{
+		ID: "hq-closed", Title: "work", Assignee: "gastown/Toast", Status: "closed",
+		Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"},
+	}).ToMessage()
+	if closed.Read {
+		t.Fatal("closed work was treated as read without a read label")
+	}
+
+	blocked := (&BeadsMessage{
+		ID: "hq-blocked", Title: "work", Assignee: "gastown/Toast", Status: "blocked",
+		Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/", "read"},
+	}).ToMessage()
+	if !blocked.Read {
+		t.Fatal("blocked work ignored its read label")
+	}
+}

@@ -12,7 +12,26 @@ import (
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/session"
 )
+
+func validCanaryEvidence(now time.Time) CanaryEvidence {
+	receipts := make([]canaryReceipt, 20)
+	for index := range receipts {
+		startedAt := now.Add(time.Duration(index) * time.Second)
+		receipts[index] = canaryReceipt{
+			Turn: index + 1, DeliveryID: fmt.Sprintf("ndg-%02d", index+1), NonceDigest: fmt.Sprintf("%064x", index+1),
+			SubmittedAt: startedAt.Add(time.Millisecond), WindowStartedAt: startedAt, WindowCompletedAt: startedAt.Add(time.Second),
+		}
+	}
+	return CanaryEvidence{
+		SchemaVersion: 3, BinaryCommit: "candidate", Result: "passed",
+		MayorPreset: "codex", MayorProvider: "codex", PolecatPreset: "codex", PolecatProvider: "codex",
+		Session: session.MayorSessionName(), Runtime: "codex", SessionAuthority: strings.Repeat("b", 64),
+		Turns: 20, Submitted: 20, Receipts: receipts, ReceiptCount: 20, ReceiptDigest: canaryReceiptDigest(receipts),
+		AttemptedAt: now, CompletedAt: now.Add(20 * time.Second),
+	}
+}
 
 func TestEvaluateControlPlaneNamesConfirmedFailures(t *testing.T) {
 	now := time.Date(2026, 8, 1, 4, 0, 0, 0, time.UTC)
@@ -74,8 +93,11 @@ func TestEvaluateControlPlaneNamesConfirmedFailures(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			canary := validCanaryEvidence(now)
 			evidence := ControlPlaneEvidence{
 				Now: now, CanonicalDoltReachable: true, InstalledBinaryCommit: "candidate",
+				MayorPreset: "codex", MayorProvider: "codex", PolecatPreset: "codex", PolecatProvider: "codex",
+				Canary: &canary,
 			}
 			tt.mutate(&evidence)
 
@@ -85,6 +107,76 @@ func TestEvaluateControlPlaneNamesConfirmedFailures(t *testing.T) {
 			}
 			if got.Failures[0].Subsystem != tt.subsystem || got.Failures[0].Diagnostic != tt.diagnostic {
 				t.Fatalf("failure = %#v, want subsystem %q diagnostic %q", got.Failures[0], tt.subsystem, tt.diagnostic)
+			}
+		})
+	}
+}
+
+func TestEvaluateControlPlaneRejectsPassedCanaryWithoutReceiptProof(t *testing.T) {
+	evidence := ControlPlaneEvidence{
+		CanonicalDoltReachable: true,
+		InstalledBinaryCommit:  "candidate",
+		MayorPreset:            "codex-mayor",
+		MayorProvider:          "codex",
+		PolecatPreset:          "codex-polecat",
+		PolecatProvider:        "codex",
+		Canary: &CanaryEvidence{
+			SchemaVersion: 2, BinaryCommit: "candidate", MayorPreset: "codex-mayor", MayorProvider: "codex",
+			PolecatPreset: "codex-polecat", PolecatProvider: "codex", Result: "passed",
+		},
+	}
+
+	got := EvaluateControlPlane(evidence)
+	if got.Healthy || len(got.Failures) != 1 || got.Failures[0].Subsystem != "wake-canary" {
+		t.Fatalf("verdict = %#v, want proofless passed canary rejected", got)
+	}
+}
+
+func TestEvaluateControlPlaneRejectsMissingCanaryProof(t *testing.T) {
+	got := EvaluateControlPlane(ControlPlaneEvidence{CanonicalDoltReachable: true})
+	if got.Healthy || len(got.Failures) != 1 || got.Failures[0].Subsystem != "wake-canary" {
+		t.Fatalf("verdict = %#v, want missing canary proof rejected", got)
+	}
+}
+
+func TestEvaluateControlPlaneRejectsInvalidReceiptAuthority(t *testing.T) {
+	now := time.Date(2026, 8, 27, 1, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		mutate func(*CanaryEvidence)
+	}{
+		{name: "missing receipt", mutate: func(c *CanaryEvidence) { c.Receipts = c.Receipts[:19] }},
+		{name: "duplicate receipt", mutate: func(c *CanaryEvidence) {
+			c.Receipts[19].DeliveryID = c.Receipts[0].DeliveryID
+			c.ReceiptDigest = canaryReceiptDigest(c.Receipts)
+		}},
+		{name: "duplicate nonce", mutate: func(c *CanaryEvidence) {
+			c.Receipts[19].NonceDigest = c.Receipts[0].NonceDigest
+			c.ReceiptDigest = canaryReceiptDigest(c.Receipts)
+		}},
+		{name: "wrong session", mutate: func(c *CanaryEvidence) { c.Session = "live" }},
+		{name: "wrong runtime", mutate: func(c *CanaryEvidence) { c.Runtime = "claude" }},
+		{name: "late receipt", mutate: func(c *CanaryEvidence) {
+			c.Receipts[19].SubmittedAt = c.Receipts[19].WindowCompletedAt.Add(time.Nanosecond)
+			c.ReceiptDigest = canaryReceiptDigest(c.Receipts)
+		}},
+		{name: "changed digest", mutate: func(c *CanaryEvidence) { c.ReceiptDigest = strings.Repeat("c", 64) }},
+		{name: "missing session authority", mutate: func(c *CanaryEvidence) { c.SessionAuthority = "" }},
+		{name: "invalid session authority", mutate: func(c *CanaryEvidence) { c.SessionAuthority = strings.Repeat("z", 64) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			canary := validCanaryEvidence(now)
+			canary.MayorPreset = "codex-mayor"
+			canary.PolecatPreset = "codex-polecat"
+			tt.mutate(&canary)
+			got := EvaluateControlPlane(ControlPlaneEvidence{
+				CanonicalDoltReachable: true, InstalledBinaryCommit: "candidate",
+				MayorPreset: "codex-mayor", MayorProvider: "codex", PolecatPreset: "codex-polecat", PolecatProvider: "codex",
+				Canary: &canary,
+			})
+			if got.Healthy || len(got.Failures) != 1 || got.Failures[0].Subsystem != "wake-canary" {
+				t.Fatalf("verdict = %#v, want invalid receipt authority rejected", got)
 			}
 		})
 	}
@@ -159,8 +251,8 @@ func TestCollectControlPlaneNonDoltDoesNotProbeDolt(t *testing.T) {
 	}
 
 	got, err := collectControlPlaneNonDolt(t.TempDir(), "candidate", sources)
-	if err != nil || !got.Healthy || len(got.Failures) != 0 {
-		t.Fatalf("non-Dolt verdict = %#v, %v", got, err)
+	if err != nil || got.Healthy || len(got.Failures) != 1 || got.Failures[0].Subsystem != "wake-canary" {
+		t.Fatalf("non-Dolt verdict = %#v, %v; want missing canary proof only", got, err)
 	}
 }
 
@@ -201,12 +293,8 @@ func TestEvaluateControlPlaneIgnoresNonActionableEvidence(t *testing.T) {
 		InstalledBinaryCommit:  "candidate",
 		MayorMail:              []MailEvidence{{Priority: "low", Type: "notification", WrittenAt: now.Add(-time.Hour)}},
 		WakeDeliveries:         []WakeEvidence{{Priority: "normal", QueuedAt: now.Add(-time.Hour)}},
-		Canary: &CanaryEvidence{
-			BinaryCommit: "candidate", Result: "passed",
-			MayorPreset: "codex", MayorProvider: "codex",
-			PolecatPreset: "codex", PolecatProvider: "codex",
-		},
-		MayorPreset: "codex", MayorProvider: "codex",
+		Canary:                 func() *CanaryEvidence { canary := validCanaryEvidence(now); return &canary }(),
+		MayorPreset:            "codex", MayorProvider: "codex",
 		PolecatPreset: "codex", PolecatProvider: "codex",
 	}
 
@@ -217,6 +305,7 @@ func TestEvaluateControlPlaneIgnoresNonActionableEvidence(t *testing.T) {
 }
 
 func TestEvaluateControlPlaneRejectsCanaryForDifferentConfiguredRoles(t *testing.T) {
+	canary := validCanaryEvidence(time.Now())
 	got := EvaluateControlPlane(ControlPlaneEvidence{
 		Now:                    time.Now(),
 		CanonicalDoltReachable: true,
@@ -225,14 +314,7 @@ func TestEvaluateControlPlaneRejectsCanaryForDifferentConfiguredRoles(t *testing
 		MayorProvider:          "codex",
 		PolecatPreset:          "codex-polecat",
 		PolecatProvider:        "codex",
-		Canary: &CanaryEvidence{
-			BinaryCommit:    "candidate",
-			Result:          "passed",
-			MayorPreset:     "codex",
-			MayorProvider:   "codex",
-			PolecatPreset:   "codex",
-			PolecatProvider: "codex",
-		},
+		Canary:                 &canary,
 	})
 
 	if got.Healthy || len(got.Failures) != 1 || got.Failures[0].Subsystem != "wake-canary" {
@@ -241,11 +323,6 @@ func TestEvaluateControlPlaneRejectsCanaryForDifferentConfiguredRoles(t *testing
 }
 
 func TestEvaluateControlPlaneRejectsStaleOrWrongProviderCanary(t *testing.T) {
-	base := CanaryEvidence{
-		BinaryCommit: "candidate", Result: "passed",
-		MayorPreset: "codex-mayor", MayorProvider: "codex",
-		PolecatPreset: "codex-polecat", PolecatProvider: "codex",
-	}
 	tests := []struct {
 		name   string
 		mutate func(*CanaryEvidence)
@@ -256,7 +333,9 @@ func TestEvaluateControlPlaneRejectsStaleOrWrongProviderCanary(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			canary := base
+			canary := validCanaryEvidence(time.Now())
+			canary.MayorPreset = "codex-mayor"
+			canary.PolecatPreset = "codex-polecat"
 			tt.mutate(&canary)
 			got := EvaluateControlPlane(ControlPlaneEvidence{
 				Now: time.Now(), CanonicalDoltReachable: true, InstalledBinaryCommit: "candidate",
@@ -272,9 +351,16 @@ func TestEvaluateControlPlaneRejectsStaleOrWrongProviderCanary(t *testing.T) {
 
 func TestEvaluateControlPlaneKeepsRetryingUrgentWakeHealthyBeforeDeadline(t *testing.T) {
 	now := time.Now()
+	canary := validCanaryEvidence(now)
 	got := EvaluateControlPlane(ControlPlaneEvidence{
 		Now:                    now,
 		CanonicalDoltReachable: true,
+		InstalledBinaryCommit:  "candidate",
+		MayorPreset:            "codex",
+		MayorProvider:          "codex",
+		PolecatPreset:          "codex",
+		PolecatProvider:        "codex",
+		Canary:                 &canary,
 		WakeDeliveries: []WakeEvidence{{
 			Priority: "urgent", QueuedAt: now.Add(-time.Second), Attempts: 1,
 			FailureCode: "submission-unconfirmed",
@@ -286,8 +372,12 @@ func TestEvaluateControlPlaneKeepsRetryingUrgentWakeHealthyBeforeDeadline(t *tes
 }
 
 func TestEvaluateControlPlaneCanonicalDoltFailureOutranksCleanup(t *testing.T) {
+	now := time.Now()
+	canary := validCanaryEvidence(now)
 	got := EvaluateControlPlane(ControlPlaneEvidence{
-		Now: time.Now(), CanonicalDoltReachable: false, ActionableDoltLeaks: 3,
+		Now: now, CanonicalDoltReachable: false, ActionableDoltLeaks: 3,
+		InstalledBinaryCommit: "candidate", MayorPreset: "codex", MayorProvider: "codex",
+		PolecatPreset: "codex", PolecatProvider: "codex", Canary: &canary,
 	})
 	if len(got.Failures) != 1 || got.Failures[0].Subsystem != "dolt" || got.Failures[0].Diagnostic != "gt dolt status" {
 		t.Fatalf("verdict = %#v, want canonical status diagnostic", got)

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func runMailThread(cmd *cobra.Command, args []string) error {
@@ -122,6 +124,32 @@ func runMailReply(cmd *cobra.Command, args []string) error {
 		} else {
 			subject = "Re: " + original.Subject
 		}
+	}
+	if mailReplyComplete {
+		defer waitForMailNotifications(router)
+		return withCurrentMailWorkStore(func(ctx context.Context, store *mail.MailWorkStore, actor string, generation tmux.SessionGeneration) error {
+			result, err := store.Complete(ctx, msgID, actor, generation, subject, messageBody)
+			if err != nil {
+				return fmt.Errorf("completing mail work: %w", err)
+			}
+			if result.Created {
+				router.NotifyPersisted(&mail.Message{
+					ID:       result.ReplyID,
+					From:     actor,
+					To:       original.From,
+					Subject:  subject,
+					Body:     messageBody,
+					Type:     mail.TypeReply,
+					ReplyTo:  msgID,
+					ThreadID: original.ThreadID,
+				})
+			}
+			if err := router.ClearReplyReminders(from, original.ThreadID); err != nil {
+				style.PrintWarning("could not clear satisfied reply reminders: %v", err)
+			}
+			fmt.Printf("%s Mail work completed with reply %s\n", style.Bold.Render("✓"), result.ReplyID)
+			return nil
+		})
 	}
 
 	// Create reply message

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/delivery"
 	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
@@ -42,16 +45,45 @@ type wakeCanaryResult struct {
 }
 
 type wakeCanaryState struct {
-	SchemaVersion         int       `json:"schema_version"`
-	InstalledBinaryCommit string    `json:"installed_binary_commit"`
-	MayorPreset           string    `json:"mayor_preset"`
-	MayorProvider         string    `json:"mayor_provider"`
-	PolecatPreset         string    `json:"polecat_preset"`
-	PolecatProvider       string    `json:"polecat_provider"`
-	AttemptedAt           time.Time `json:"attempted_at"`
-	Result                string    `json:"result"`
-	LatencyMS             int64     `json:"latency_ms"`
-	FailureCode           string    `json:"failure_code"`
+	SchemaVersion         int                 `json:"schema_version"`
+	InstalledBinaryCommit string              `json:"installed_binary_commit"`
+	MayorPreset           string              `json:"mayor_preset"`
+	MayorProvider         string              `json:"mayor_provider"`
+	PolecatPreset         string              `json:"polecat_preset"`
+	PolecatProvider       string              `json:"polecat_provider"`
+	Session               string              `json:"session"`
+	Runtime               string              `json:"runtime"`
+	SessionAuthority      string              `json:"session_authority"`
+	Turns                 int                 `json:"turns"`
+	Submitted             int                 `json:"submitted"`
+	Queued                int                 `json:"queued"`
+	Failed                int                 `json:"failed"`
+	Receipts              []wakeCanaryReceipt `json:"receipts"`
+	ReceiptCount          int                 `json:"receipt_count"`
+	ReceiptDigest         string              `json:"receipt_digest"`
+	AttemptedAt           time.Time           `json:"attempted_at"`
+	CompletedAt           time.Time           `json:"completed_at,omitempty"`
+	Result                string              `json:"result"`
+	LatencyMS             int64               `json:"latency_ms"`
+	FailureCode           string              `json:"failure_code"`
+}
+
+type wakeCanaryReceipt struct {
+	Turn              int       `json:"turn"`
+	DeliveryID        string    `json:"delivery_id"`
+	NonceDigest       string    `json:"nonce_digest"`
+	SubmittedAt       time.Time `json:"submitted_at"`
+	WindowStartedAt   time.Time `json:"window_started_at"`
+	WindowCompletedAt time.Time `json:"window_completed_at"`
+}
+
+type wakeCanaryReceiptEvent struct {
+	SchemaVersion int       `json:"schema_version"`
+	Event         string    `json:"event"`
+	DeliveryID    string    `json:"delivery_id"`
+	Session       string    `json:"session"`
+	Runtime       string    `json:"runtime"`
+	SubmittedAt   time.Time `json:"submitted_at"`
 }
 
 type wakeCanaryRoles struct {
@@ -82,6 +114,7 @@ func configureWakeCanarySandboxRoles(sandbox *wakeCanarySandbox, sourceTownRoot,
 	settings.RoleAgents = map[string]string{
 		constants.RoleMayor: mayor.ResolvedAgent, constants.RolePolecat: polecat.ResolvedAgent,
 	}
+	settings.Operational = &config.OperationalConfig{Mail: &config.MailThresholds{ReplyReminderDelay: "0s"}}
 	return roles, config.SaveTownSettings(config.TownSettingsPath(sandbox.TownRoot), settings)
 }
 
@@ -143,8 +176,10 @@ func annotateWakeCanaryIdleFailure(observer wakeCanaryIdleObserver, sessionName 
 
 func confirmWakeCanaryDelivery(outcome witness.MayorNotificationOutcome, confirm func() (string, error)) (string, error) {
 	switch outcome {
-	case witness.MayorNotificationSubmitted, witness.MayorNotificationQueued:
+	case witness.MayorNotificationSubmitted:
 		return confirm()
+	case witness.MayorNotificationQueued:
+		return "notification-queued", errors.New("Mayor notification was queued")
 	case witness.MayorNotificationWakeFailed:
 		return "notification-failed", errors.New("Mayor notification wake failed")
 	default:
@@ -335,10 +370,11 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 		ID: "wake-" + nudge.NewDeliveryID(), Session: sessionName, Turns: turns, StartedAt: time.Now(),
 	}
 	state := wakeCanaryState{
-		SchemaVersion: 2, InstalledBinaryCommit: resolveCommitHash(),
+		SchemaVersion: 3, InstalledBinaryCommit: resolveCommitHash(),
 		MayorPreset: roles.MayorPreset, MayorProvider: roles.MayorProvider,
 		PolecatPreset: roles.PolecatPreset, PolecatProvider: roles.PolecatProvider,
-		AttemptedAt: result.StartedAt, Result: "running",
+		Session: sessionName, Runtime: "codex", Turns: turns,
+		AttemptedAt: result.StartedAt, Result: "running", Receipts: []wakeCanaryReceipt{},
 	}
 	statePath, err := writeWakeCanaryState(evidenceRoot, state)
 	if err != nil {
@@ -347,6 +383,11 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 	fail := func(code string, cause error) (wakeCanaryResult, string, error) {
 		state.Result = "failed"
 		state.FailureCode = code
+		state.Submitted = result.Submitted
+		state.Queued = result.Queued
+		state.Failed = result.Failed
+		state.ReceiptCount = len(state.Receipts)
+		state.ReceiptDigest = wakeCanaryDigest(state.Receipts)
 		state.LatencyMS = time.Since(result.StartedAt).Milliseconds()
 		_ = writeWakeCanaryStateAt(statePath, state)
 		return result, statePath, cause
@@ -366,9 +407,19 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 	if err := t.ArmClientAttachmentLatch(sessionName); err != nil {
 		return fail("client-latch-failed", fmt.Errorf("arming client attachment latch: %w", err))
 	}
+	generation, err := t.CaptureSessionGeneration(sessionName)
+	if err != nil {
+		return fail("session-authority-failed", fmt.Errorf("capturing isolated Mayor authority: %w", err))
+	}
+	state.SessionAuthority = wakeCanaryDigest(generation)
 	router := mail.NewRouterWithTownRootAndTmux(runtimeTownRoot, runtimeTownRoot, t)
 
 	for turn := 1; turn <= turns; turn++ {
+		observed, authorityErr := t.CaptureSessionGeneration(sessionName)
+		if authorityErr != nil || !generation.Equal(observed) {
+			result.Failed++
+			return fail("session-authority-changed", fmt.Errorf("isolated Mayor session authority changed before turn %d", turn))
+		}
 		attached, attachmentErr := t.ClientAttachmentObserved(sessionName)
 		if attachmentErr != nil {
 			result.Failed++
@@ -390,6 +441,7 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 			result.Failed++
 			return fail("nudge-lock-contended", fmt.Errorf("acquiring exclusive canary nudge lease: %w", leaseErr))
 		}
+		windowStartedAt := time.Now().UTC()
 		outcome, sendErr := witness.DeliverMayorNotification(router,
 			fmt.Sprintf("Wake canary %d/%d: reverse nonce %s", turn, turns, nonce),
 			"Reply in the active model turn with the nonce reversed.")
@@ -420,20 +472,111 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 			result.Failed++
 			return fail("human-client-attached", fmt.Errorf("canary tmux client attached during model turn"))
 		}
+		windowCompletedAt := time.Now().UTC()
+		observed, authorityErr = t.CaptureSessionGeneration(sessionName)
+		if authorityErr != nil || !generation.Equal(observed) {
+			result.Failed++
+			return fail("session-authority-changed", fmt.Errorf("isolated Mayor session authority changed during turn %d", turn))
+		}
+		events, receiptErr := readWakeCanaryReceiptEvents(runtimeTownRoot, sessionName)
+		if receiptErr != nil {
+			result.Failed++
+			return fail("receipt-read-failed", receiptErr)
+		}
+		state.Receipts, receiptErr = validateWakeCanaryReceiptEvents(events, state.Receipts, sessionName, turn, nonce, windowStartedAt, windowCompletedAt)
+		if receiptErr != nil {
+			result.Failed++
+			return fail("receipt-proof-failed", receiptErr)
+		}
 		result.Submitted++
+		state.Submitted = result.Submitted
+		state.Queued = result.Queued
+		state.Failed = result.Failed
+		state.ReceiptCount = len(state.Receipts)
+		state.ReceiptDigest = wakeCanaryDigest(state.Receipts)
+		if err := writeWakeCanaryStateAt(statePath, state); err != nil {
+			return result, statePath, err
+		}
 	}
 
-	result.CompletedAt = time.Now()
+	result.CompletedAt = time.Now().UTC()
 	if result.Submitted != turns || result.Queued != 0 || result.Failed != 0 {
 		return fail("count-mismatch", fmt.Errorf("wake canary failed: %d/%d submitted, %d queued, %d failed", result.Submitted, turns, result.Queued, result.Failed))
 	}
 	state.Result = "passed"
 	state.FailureCode = ""
+	state.CompletedAt = result.CompletedAt
 	state.LatencyMS = time.Since(result.StartedAt).Milliseconds()
 	if err := writeWakeCanaryStateAt(statePath, state); err != nil {
 		return result, statePath, err
 	}
 	return result, statePath, nil
+}
+
+func readWakeCanaryReceiptEvents(townRoot, sessionName string) ([]wakeCanaryReceiptEvent, error) {
+	f, err := os.Open(delivery.ReceiptPath(townRoot, sessionName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading private canary receipts: %w", err)
+	}
+	defer f.Close()
+
+	var events []wakeCanaryReceiptEvent
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var event wakeCanaryReceiptEvent
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			return nil, fmt.Errorf("invalid private canary receipt")
+		}
+		events = append(events, event)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading private canary receipts: %w", err)
+	}
+	return events, nil
+}
+
+func validateWakeCanaryReceiptEvents(events []wakeCanaryReceiptEvent, previous []wakeCanaryReceipt, sessionName string, turn int, nonce string, startedAt, completedAt time.Time) ([]wakeCanaryReceipt, error) {
+	if len(events) != len(previous)+1 || turn != len(previous)+1 {
+		return nil, fmt.Errorf("turn %d requires exactly one new receipt", turn)
+	}
+	seen := make(map[string]struct{}, len(events))
+	for index, event := range events {
+		if event.SchemaVersion != 1 || event.Event != "prompt_submitted" || event.Session != sessionName || event.Runtime != "codex" || event.DeliveryID == "" || event.SubmittedAt.IsZero() {
+			return nil, fmt.Errorf("turn %d has invalid receipt authority", turn)
+		}
+		if _, duplicate := seen[event.DeliveryID]; duplicate {
+			return nil, fmt.Errorf("turn %d has a duplicate receipt", turn)
+		}
+		seen[event.DeliveryID] = struct{}{}
+		if index < len(previous) && (event.DeliveryID != previous[index].DeliveryID || !event.SubmittedAt.Equal(previous[index].SubmittedAt)) {
+			return nil, fmt.Errorf("turn %d changed prior receipt evidence", turn)
+		}
+	}
+	current := events[len(events)-1]
+	if !current.SubmittedAt.After(startedAt) || current.SubmittedAt.After(completedAt) {
+		return nil, fmt.Errorf("turn %d receipt is outside its authority window", turn)
+	}
+	nonceDigest := wakeCanaryDigest(nonce)
+	for _, receipt := range previous {
+		if receipt.NonceDigest == nonceDigest {
+			return nil, fmt.Errorf("turn %d reused a nonce", turn)
+		}
+	}
+	receipts := append([]wakeCanaryReceipt(nil), previous...)
+	receipts = append(receipts, wakeCanaryReceipt{
+		Turn: turn, DeliveryID: current.DeliveryID, NonceDigest: nonceDigest,
+		SubmittedAt: current.SubmittedAt, WindowStartedAt: startedAt, WindowCompletedAt: completedAt,
+	})
+	return receipts, nil
+}
+
+func wakeCanaryDigest(value any) string {
+	data, _ := json.Marshal(value)
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
 }
 
 func reverseString(value string) string {

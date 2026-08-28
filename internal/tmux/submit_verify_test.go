@@ -157,6 +157,8 @@ func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
 		{name: "real Codex dim composer after spacer", content: "transcript\n\x1b[1;2m›\x1b[0m \x1b[2mxxxx xxxx xxxx xxxx xxx xxx xxx\x1b[0m\n", cursorX: 2, cursorY: 1, want: true},
 		{name: "codex steady cursor row without glyph", content: "completed output\n\nfooter\n", cursorX: 1, cursorY: 1, want: true},
 		{name: "codex steady spacer cursor row without glyph", content: "completed output\n\nfooter\n", cursorX: 2, cursorY: 1, want: true},
+		{name: "codex idle composer with cursor below prompt", content: strings.Repeat("completed output\n", 19) + "› \x1b[2mAsk anything\x1b[0m\ncomposer footer\nstatus\n", cursorX: 2, cursorY: 21, want: true},
+		{name: "stale submitted prompt with cursor below output", content: strings.Repeat("completed output\n", 19) + "› submitted delivery\nquiet output\nstatus\n", cursorX: 2, cursorY: 21, want: false},
 		{name: "staged prompt cursor after content", content: "transcript\n\x1b[1;2m›\x1b[0m staged delivery\n", cursorX: 16, cursorY: 1, want: false},
 		{name: "stale submitted prompt", content: "› initialize the canary\nquiet startup output\n", cursorX: 0, cursorY: 1, want: false},
 		{name: "busy without composer", content: "• Working (esc to interrupt)\n", cursorX: 0, cursorY: 0, want: false},

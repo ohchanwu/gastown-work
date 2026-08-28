@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -21,50 +24,59 @@ import (
 // If a queue name is provided, claims from that specific queue.
 // If no queue name is provided, claims from any queue the caller is eligible for.
 func runMailClaim(cmd *cobra.Command, args []string) error {
-	// Find workspace
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
-
-	// Get caller identity
-	caller := detectSender()
+	caller := mail.AddressToIdentity(detectSender())
 	beadsDir := beads.ResolveBeadsDir(townRoot)
 	bd := beads.NewWithBeadsDir(townRoot, beadsDir)
+	generation, err := captureCurrentMailWorkGeneration()
+	if err != nil {
+		return err
+	}
+	openCtx, openCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	store, cleanup, err := bd.OpenStore(openCtx)
+	openCancel()
+	if err != nil {
+		return fmt.Errorf("opening mail work store: %w", err)
+	}
+	defer cleanup()
+	workStore := mail.NewMailWorkStore(store)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	queueEligible := func(queue, actor string) bool {
+		fields, lookupErr := findMailQueueFields(bd, queue)
+		return lookupErr == nil && fields.Status == beads.QueueStatusActive && beads.MatchClaimPattern(fields.ClaimPattern, actor)
+	}
+	if mailClaimID != "" {
+		work, claimErr := workStore.Claim(ctx, mailClaimID, caller, generation, queueEligible)
+		if claimErr != nil {
+			return fmt.Errorf("claiming mail work: %w", claimErr)
+		}
+		if ackErr := mail.AcknowledgeDeliveryBead(townRoot, beadsDir, mailClaimID, caller); ackErr != nil {
+			fmt.Fprintf(os.Stderr, "gt mail claim: delivery ack failed for %s: %v\n", mailClaimID, ackErr)
+		}
+		fmt.Printf("%s Claimed %s mail work\n", style.Bold.Render("✓"), work.Route)
+		fmt.Printf("  ID: %s\n", mailClaimID)
+		return nil
+	}
 
 	var queueName string
 	var queueFields *beads.QueueFields
 
 	if len(args) > 0 {
-		// Specific queue requested
 		queueName = args[0]
-
-		// Look up the queue bead
-		queueID := beads.QueueBeadID(queueName, true) // Try town-level first
-		issue, fields, err := bd.GetQueueBead(queueID)
+		queueFields, err = findMailQueueFields(bd, queueName)
 		if err != nil {
-			return fmt.Errorf("looking up queue: %w", err)
+			return err
 		}
-		if issue == nil {
-			// Try rig-level
-			queueID = beads.QueueBeadID(queueName, false)
-			issue, fields, err = bd.GetQueueBead(queueID)
-			if err != nil {
-				return fmt.Errorf("looking up queue: %w", err)
-			}
-			if issue == nil {
-				return fmt.Errorf("unknown queue: %s", queueName)
-			}
-		}
-		queueFields = fields
-
-		// Check if caller is eligible
 		if !beads.MatchClaimPattern(queueFields.ClaimPattern, caller) {
 			return fmt.Errorf("not eligible to claim from queue %s (caller: %s, pattern: %s)",
 				queueName, caller, queueFields.ClaimPattern)
 		}
 	} else {
-		// No queue specified - find any queue the caller can claim from
 		eligibleIssues, eligibleFields, err := bd.FindEligibleQueues(caller)
 		if err != nil {
 			return fmt.Errorf("finding eligible queues: %w", err)
@@ -75,17 +87,13 @@ func runMailClaim(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		// Use the first eligible queue
 		queueFields = eligibleFields[0]
 		queueName = queueFields.Name
 		if queueName == "" {
-			// Fallback to ID-based name
 			queueName = eligibleIssues[0].ID
 		}
 	}
 
-	// List unclaimed messages in the queue
-	// Queue messages have queue:<name> label and no claimed-by label
 	messages, err := listUnclaimedQueueMessages(beadsDir, queueName)
 	if err != nil {
 		return fmt.Errorf("listing queue messages: %w", err)
@@ -96,41 +104,23 @@ func runMailClaim(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Try to claim messages in order. Post-claim verification prevents the
-	// TOCTOU race where two workers list the same unclaimed message and both
-	// attempt to claim it. After writing our claim labels we re-read the
-	// message; if someone else's claimed-by label is present instead, we lost
-	// the race and move on to the next candidate.
 	var claimed *queueMessage
 	for i := range messages {
 		candidate := &messages[i]
-
-		// Attempt to claim: add claimed-by and claimed-at labels
-		if err := claimQueueMessage(beadsDir, candidate.ID, caller); err != nil {
-			return fmt.Errorf("claiming message: %w", err)
+		_, claimErr := workStore.Claim(ctx, candidate.ID, caller, generation, func(queue, actor string) bool {
+			return queue == queueName && queueFields.Status == beads.QueueStatusActive && beads.MatchClaimPattern(queueFields.ClaimPattern, actor)
+		})
+		if errors.Is(claimErr, mail.ErrMailWorkConflict) {
+			continue
 		}
-
-		// Post-claim verification: re-read and confirm we won the race
-		info, err := getQueueMessageInfo(beadsDir, candidate.ID)
-		if err != nil {
-			return fmt.Errorf("verifying claim: %w", err)
+		if claimErr != nil {
+			return fmt.Errorf("claiming message: %w", claimErr)
 		}
-
-		if info.ClaimedBy == caller {
-			// Delivery ack runs after claim verification so only the
-			// winning claimant writes ack labels. Non-fatal: the claim
-			// itself already succeeded.
-			if ackErr := mail.AcknowledgeDeliveryBead(townRoot, beadsDir, candidate.ID, mail.AddressToIdentity(caller)); ackErr != nil {
-				fmt.Fprintf(os.Stderr, "gt mail claim: delivery ack failed for %s: %v\n", candidate.ID, ackErr)
-			}
-			claimed = candidate
-			break
+		if ackErr := mail.AcknowledgeDeliveryBead(townRoot, beadsDir, candidate.ID, caller); ackErr != nil {
+			fmt.Fprintf(os.Stderr, "gt mail claim: delivery ack failed for %s: %v\n", candidate.ID, ackErr)
 		}
-
-		// Another worker claimed it first — remove our stale labels and try next
-		if releaseErr := releaseQueueMessage(beadsDir, candidate.ID, caller); releaseErr != nil {
-			style.PrintWarning("could not release stale claim on %s: %v", candidate.ID, releaseErr)
-		}
+		claimed = candidate
+		break
 	}
 
 	if claimed == nil {
@@ -158,6 +148,19 @@ func runMailClaim(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func findMailQueueFields(bd *beads.Beads, queueName string) (*beads.QueueFields, error) {
+	for _, townLevel := range []bool{true, false} {
+		issue, fields, err := bd.GetQueueBead(beads.QueueBeadID(queueName, townLevel))
+		if err != nil {
+			return nil, fmt.Errorf("looking up queue: %w", err)
+		}
+		if issue != nil && fields != nil {
+			return fields, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown queue: %s", queueName)
+}
+
 // queueMessage represents a message in a queue.
 type queueMessage struct {
 	ID          string
@@ -178,6 +181,7 @@ func listUnclaimedQueueMessages(beadsDir, queueName string) ([]queueMessage, err
 		"--label", "queue:" + queueName,
 		"--status", "open",
 		"--label", "gt:message",
+		"--label", mail.MailWorkLabel,
 		"--json",
 		"--limit", "0",
 	}
@@ -254,194 +258,17 @@ func listUnclaimedQueueMessages(beadsDir, queueName string) ([]queueMessage, err
 	return messages, nil
 }
 
-// claimQueueMessage claims a message by adding claimed-by and claimed-at labels.
-func claimQueueMessage(beadsDir, messageID, claimant string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-
-	args := []string{"label", "add", messageID,
-		"claimed-by:" + claimant,
-		"claimed-at:" + now,
-	}
-
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(),
-		"BEADS_DIR="+beadsDir,
-		"BD_ACTOR="+claimant,
-	)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return fmt.Errorf("%s", errMsg)
-		}
-		return err
-	}
-
-	return nil
-}
-
-// runMailRelease releases a claimed queue message back to its queue.
-func runMailRelease(cmd *cobra.Command, args []string) error {
+func runMailRelease(_ *cobra.Command, args []string) error {
 	messageID := args[0]
-
-	// Find workspace
-	townRoot, err := workspace.FindFromCwdOrError()
-	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace: %w", err)
-	}
-
-	beadsDir := beads.ResolveBeadsDir(townRoot)
-
-	// Get caller identity
-	caller := detectSender()
-
-	// Get message details to verify ownership and find queue
-	msgInfo, err := getQueueMessageInfo(beadsDir, messageID)
-	if err != nil {
-		return fmt.Errorf("getting message: %w", err)
-	}
-
-	// Verify message exists and is a queue message
-	if msgInfo.QueueName == "" {
-		return fmt.Errorf("message %s is not a queue message (no queue label)", messageID)
-	}
-
-	// Verify caller is the one who claimed it
-	if msgInfo.ClaimedBy == "" {
-		return fmt.Errorf("message %s is not claimed", messageID)
-	}
-	if msgInfo.ClaimedBy != caller {
-		return fmt.Errorf("message %s was claimed by %s, not %s", messageID, msgInfo.ClaimedBy, caller)
-	}
-
-	// Release the message: remove claimed-by and claimed-at labels
-	if err := releaseQueueMessage(beadsDir, messageID, caller); err != nil {
-		return fmt.Errorf("releasing message: %w", err)
-	}
-
-	fmt.Printf("%s Released message back to queue %s\n", style.Bold.Render("✓"), msgInfo.QueueName)
-	fmt.Printf("  ID: %s\n", messageID)
-	fmt.Printf("  Subject: %s\n", msgInfo.Title)
-
-	return nil
-}
-
-// queueMessageInfo holds details about a queue message.
-type queueMessageInfo struct {
-	ID        string
-	Title     string
-	QueueName string
-	ClaimedBy string
-	ClaimedAt *time.Time
-	Status    string
-}
-
-// getQueueMessageInfo retrieves information about a queue message.
-func getQueueMessageInfo(beadsDir, messageID string) (*queueMessageInfo, error) {
-	args := []string{"show", messageID, "--json"}
-
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if strings.Contains(errMsg, "not found") {
-			return nil, fmt.Errorf("message not found: %s", messageID)
+	return withCurrentMailWorkStore(func(ctx context.Context, store *mail.MailWorkStore, actor string, generation tmux.SessionGeneration) error {
+		work, err := store.Release(ctx, messageID, actor, generation)
+		if err != nil {
+			return fmt.Errorf("releasing mail work: %w", err)
 		}
-		if errMsg != "" {
-			return nil, fmt.Errorf("%s", errMsg)
-		}
-		return nil, err
-	}
-
-	// Parse JSON output - bd show --json returns an array
-	var issues []struct {
-		ID     string   `json:"id"`
-		Title  string   `json:"title"`
-		Labels []string `json:"labels"`
-		Status string   `json:"status"`
-	}
-
-	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
-		return nil, fmt.Errorf("parsing message: %w", err)
-	}
-
-	if len(issues) == 0 {
-		return nil, fmt.Errorf("message not found: %s", messageID)
-	}
-
-	issue := issues[0]
-	info := &queueMessageInfo{
-		ID:     issue.ID,
-		Title:  issue.Title,
-		Status: issue.Status,
-	}
-
-	// Extract fields from labels
-	for _, label := range issue.Labels {
-		if strings.HasPrefix(label, "queue:") {
-			info.QueueName = strings.TrimPrefix(label, "queue:")
-		} else if strings.HasPrefix(label, "claimed-by:") {
-			info.ClaimedBy = strings.TrimPrefix(label, "claimed-by:")
-		} else if strings.HasPrefix(label, "claimed-at:") {
-			ts := strings.TrimPrefix(label, "claimed-at:")
-			if t, err := time.Parse(time.RFC3339, ts); err == nil {
-				info.ClaimedAt = &t
-			}
-		}
-	}
-	return info, nil
-}
-
-// releaseQueueMessage releases a claimed message by removing claim labels.
-// Both claimed-by and claimed-at are removed in a single bd command to prevent
-// orphaned labels if the process crashes between separate removal steps.
-func releaseQueueMessage(beadsDir, messageID, actor string) error {
-	// Get current message info to find the exact claim labels
-	info, err := getQueueMessageInfo(beadsDir, messageID)
-	if err != nil {
-		return err
-	}
-
-	// Collect labels to remove in a single atomic operation
-	var labelsToRemove []string
-	if info.ClaimedBy != "" {
-		labelsToRemove = append(labelsToRemove, "claimed-by:"+info.ClaimedBy)
-	}
-	if info.ClaimedAt != nil {
-		labelsToRemove = append(labelsToRemove, "claimed-at:"+info.ClaimedAt.Format(time.RFC3339))
-	}
-
-	if len(labelsToRemove) == 0 {
+		fmt.Printf("%s Released %s mail work\n", style.Bold.Render("✓"), work.Route)
+		fmt.Printf("  ID: %s\n", messageID)
 		return nil
-	}
-
-	// Remove all claim labels in a single bd command
-	args := append([]string{"label", "remove", messageID}, labelsToRemove...)
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(os.Environ(),
-		"BEADS_DIR="+beadsDir,
-		"BD_ACTOR="+actor,
-	)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" && !strings.Contains(errMsg, "does not have label") {
-			return fmt.Errorf("%s", errMsg)
-		}
-	}
-
-	return nil
+	})
 }
 
 // Queue management commands (beads-native)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -816,7 +817,7 @@ exit 1
 	t.Setenv("BD_LOG", logPath)
 
 	m := NewMailboxWithBeadsDir("gastown/synth", t.TempDir(), beadsDir)
-	msgs, err := m.listFromDir(beadsDir)
+	msgs, err := m.listFromDir(beadsDir, false)
 	if err != nil {
 		t.Fatalf("listFromDir: %v", err)
 	}
@@ -863,6 +864,9 @@ exit 1
 	}
 	if got := strings.Count(string(logBytes), "sql "); got != 1 {
 		t.Fatalf("bd sql calls = %d, want 1; log:\n%s", got, string(logBytes))
+	}
+	if got := strings.Count(string(logBytes), "--status=all"); got != 2 {
+		t.Fatalf("bd all-status issue queries = %d, want 2; log:\n%s", got, string(logBytes))
 	}
 }
 
@@ -1239,4 +1243,31 @@ func TestMailboxLegacyAtomicArchive(t *testing.T) {
 	if archived[0].ID != "msg-002" {
 		t.Errorf("Archived message ID = %q, want msg-002", archived[0].ID)
 	}
+}
+
+func TestAppendBeadsMessagesKeepsActiveWorkAndAllAddsClosedWork(t *testing.T) {
+	items := []BeadsMessage{
+		{ID: "open", Status: "open", Assignee: "gastown/Toast", Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"}},
+		{ID: "active", Status: "in_progress", Assignee: "gastown/Toast", Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"}},
+		{ID: "blocked", Status: "blocked", Assignee: "gastown/Toast", Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"}},
+		{ID: "closed-work", Status: "closed", Assignee: "gastown/Toast", Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"}},
+		{ID: "closed-mail", Status: "closed", Assignee: "gastown/Toast", Labels: []string{"gt:message", "from:mayor/"}},
+	}
+
+	normal := appendBeadsMessages(nil, map[string]bool{}, items, true, false)
+	if got := messageIDs(normal); !reflect.DeepEqual(got, []string{"open", "active", "blocked"}) {
+		t.Fatalf("normal inbox = %v", got)
+	}
+	all := appendBeadsMessages(nil, map[string]bool{}, items, true, true)
+	if got := messageIDs(all); !reflect.DeepEqual(got, []string{"open", "active", "blocked", "closed-work"}) {
+		t.Fatalf("all inbox = %v", got)
+	}
+}
+
+func messageIDs(messages []*Message) []string {
+	ids := make([]string, 0, len(messages))
+	for _, message := range messages {
+		ids = append(ids, message.ID)
+	}
+	return ids
 }

@@ -8,14 +8,21 @@ import (
 )
 
 type fakeInboxLister struct {
-	calls    int
-	messages []*mail.Message
-	err      error
+	calls       int
+	allCalls    int
+	messages    []*mail.Message
+	allMessages []*mail.Message
+	err         error
 }
 
 func (f *fakeInboxLister) List() ([]*mail.Message, error) {
 	f.calls++
 	return f.messages, f.err
+}
+
+func (f *fakeInboxLister) ListAll() ([]*mail.Message, error) {
+	f.allCalls++
+	return f.allMessages, f.err
 }
 
 func TestLoadInboxSnapshotListsOnceAndCounts(t *testing.T) {
@@ -27,7 +34,7 @@ func TestLoadInboxSnapshotListsOnceAndCounts(t *testing.T) {
 		},
 	}
 
-	messages, total, unread, err := loadInboxSnapshot(box, false)
+	messages, total, unread, err := loadInboxSnapshot(box, false, false)
 	if err != nil {
 		t.Fatalf("loadInboxSnapshot returned error: %v", err)
 	}
@@ -51,7 +58,7 @@ func TestLoadInboxSnapshotUnreadOnlyFiltersAfterSingleList(t *testing.T) {
 		},
 	}
 
-	messages, total, unread, err := loadInboxSnapshot(box, true)
+	messages, total, unread, err := loadInboxSnapshot(box, true, false)
 	if err != nil {
 		t.Fatalf("loadInboxSnapshot returned error: %v", err)
 	}
@@ -73,11 +80,28 @@ func TestLoadInboxSnapshotPropagatesListError(t *testing.T) {
 	wantErr := errors.New("list failed")
 	box := &fakeInboxLister{err: wantErr}
 
-	_, _, _, err := loadInboxSnapshot(box, false)
+	_, _, _, err := loadInboxSnapshot(box, false, false)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)
 	}
 	if box.calls != 1 {
 		t.Fatalf("List calls = %d, want 1", box.calls)
+	}
+}
+
+func TestLoadInboxSnapshotAllUsesClosedWorkView(t *testing.T) {
+	box := &fakeInboxLister{
+		messages:    []*mail.Message{{ID: "open"}},
+		allMessages: []*mail.Message{{ID: "open"}, {ID: "closed-work", Read: true}},
+	}
+	messages, total, unread, err := loadInboxSnapshot(box, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if box.calls != 0 || box.allCalls != 1 {
+		t.Fatalf("List/ListAll calls = %d/%d", box.calls, box.allCalls)
+	}
+	if len(messages) != 2 || total != 2 || unread != 1 {
+		t.Fatalf("snapshot = %d messages, %d total, %d unread", len(messages), total, unread)
 	}
 }

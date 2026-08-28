@@ -1,8 +1,11 @@
 package health
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -37,12 +40,34 @@ type ConvoyEvidence struct {
 }
 
 type CanaryEvidence struct {
-	BinaryCommit    string
-	MayorPreset     string
-	MayorProvider   string
-	PolecatPreset   string
-	PolecatProvider string
-	Result          string
+	SchemaVersion    int
+	BinaryCommit     string
+	MayorPreset      string
+	MayorProvider    string
+	PolecatPreset    string
+	PolecatProvider  string
+	Session          string
+	Runtime          string
+	SessionAuthority string
+	Turns            int
+	Submitted        int
+	Queued           int
+	Failed           int
+	Receipts         []canaryReceipt
+	ReceiptCount     int
+	ReceiptDigest    string
+	AttemptedAt      time.Time
+	CompletedAt      time.Time
+	Result           string
+}
+
+type canaryReceipt struct {
+	Turn              int       `json:"turn"`
+	DeliveryID        string    `json:"delivery_id"`
+	NonceDigest       string    `json:"nonce_digest"`
+	SubmittedAt       time.Time `json:"submitted_at"`
+	WindowStartedAt   time.Time `json:"window_started_at"`
+	WindowCompletedAt time.Time `json:"window_completed_at"`
 }
 
 type ControlPlaneEvidence struct {
@@ -79,12 +104,25 @@ type ConvoyCheckState struct {
 }
 
 type canaryState struct {
-	InstalledBinaryCommit string `json:"installed_binary_commit"`
-	MayorPreset           string `json:"mayor_preset"`
-	MayorProvider         string `json:"mayor_provider"`
-	PolecatPreset         string `json:"polecat_preset"`
-	PolecatProvider       string `json:"polecat_provider"`
-	Result                string `json:"result"`
+	SchemaVersion         int             `json:"schema_version"`
+	InstalledBinaryCommit string          `json:"installed_binary_commit"`
+	MayorPreset           string          `json:"mayor_preset"`
+	MayorProvider         string          `json:"mayor_provider"`
+	PolecatPreset         string          `json:"polecat_preset"`
+	PolecatProvider       string          `json:"polecat_provider"`
+	Session               string          `json:"session"`
+	Runtime               string          `json:"runtime"`
+	SessionAuthority      string          `json:"session_authority"`
+	Turns                 int             `json:"turns"`
+	Submitted             int             `json:"submitted"`
+	Queued                int             `json:"queued"`
+	Failed                int             `json:"failed"`
+	Receipts              []canaryReceipt `json:"receipts"`
+	ReceiptCount          int             `json:"receipt_count"`
+	ReceiptDigest         string          `json:"receipt_digest"`
+	AttemptedAt           time.Time       `json:"attempted_at"`
+	CompletedAt           time.Time       `json:"completed_at"`
+	Result                string          `json:"result"`
 }
 
 type controlPlaneSources struct {
@@ -130,15 +168,60 @@ func EvaluateControlPlane(evidence ControlPlaneEvidence) ControlPlaneVerdict {
 	if evidence.ConvoyCheck != nil && (evidence.ConvoyCheck.TimedOut || evidence.ConvoyCheck.Duration > wakeDeadline) {
 		add("convoy", "gt convoy check --dry-run --json")
 	}
-	if canary := evidence.Canary; canary != nil {
+	if canary := evidence.Canary; canary == nil {
+		add("wake-canary", "gt nudge-canary --help")
+	} else {
 		if canary.BinaryCommit != evidence.InstalledBinaryCommit || canary.Result != "passed" ||
 			canary.MayorPreset != evidence.MayorPreset || canary.MayorProvider != evidence.MayorProvider ||
-			canary.PolecatPreset != evidence.PolecatPreset || canary.PolecatProvider != evidence.PolecatProvider {
+			canary.PolecatPreset != evidence.PolecatPreset || canary.PolecatProvider != evidence.PolecatProvider ||
+			!validCanaryReceiptProof(canary) {
 			add("wake-canary", "gt nudge-canary --help")
 		}
 	}
 
 	return ControlPlaneVerdict{Healthy: len(failures) == 0, Failures: failures}
+}
+
+func validCanaryReceiptProof(canary *CanaryEvidence) bool {
+	const requiredTurns = 20
+	if canary.SchemaVersion != 3 || canary.Session != session.MayorSessionName() || canary.Runtime != "codex" ||
+		!validSHA256(canary.SessionAuthority) || canary.Turns != requiredTurns || canary.Submitted != requiredTurns ||
+		canary.Queued != 0 || canary.Failed != 0 || canary.ReceiptCount != requiredTurns || len(canary.Receipts) != requiredTurns ||
+		canary.AttemptedAt.IsZero() || canary.CompletedAt.Before(canary.AttemptedAt) || canary.ReceiptDigest != canaryReceiptDigest(canary.Receipts) {
+		return false
+	}
+	seen := make(map[string]struct{}, requiredTurns)
+	nonces := make(map[string]struct{}, requiredTurns)
+	for index, receipt := range canary.Receipts {
+		if receipt.Turn != index+1 || receipt.DeliveryID == "" || !validSHA256(receipt.NonceDigest) ||
+			receipt.WindowStartedAt.Before(canary.AttemptedAt) || receipt.WindowCompletedAt.After(canary.CompletedAt) ||
+			!receipt.SubmittedAt.After(receipt.WindowStartedAt) || receipt.SubmittedAt.After(receipt.WindowCompletedAt) {
+			return false
+		}
+		if index > 0 && receipt.WindowStartedAt.Before(canary.Receipts[index-1].WindowCompletedAt) {
+			return false
+		}
+		if _, duplicate := seen[receipt.DeliveryID]; duplicate {
+			return false
+		}
+		seen[receipt.DeliveryID] = struct{}{}
+		if _, duplicate := nonces[receipt.NonceDigest]; duplicate {
+			return false
+		}
+		nonces[receipt.NonceDigest] = struct{}{}
+	}
+	return true
+}
+
+func validSHA256(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func canaryReceiptDigest(receipts []canaryReceipt) string {
+	data, _ := json.Marshal(receipts)
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
 }
 
 func CollectControlPlane(townRoot, installedBinaryCommit string) (ControlPlaneVerdict, error) {
@@ -234,9 +317,13 @@ func collectControlPlaneWithDolt(townRoot, installedBinaryCommit string, sources
 			return ControlPlaneVerdict{}, errors.New("reading wake canary evidence failed")
 		}
 		evidence.Canary = &CanaryEvidence{
-			BinaryCommit: state.InstalledBinaryCommit, Result: state.Result,
+			SchemaVersion: state.SchemaVersion, BinaryCommit: state.InstalledBinaryCommit, Result: state.Result,
 			MayorPreset: state.MayorPreset, MayorProvider: state.MayorProvider,
 			PolecatPreset: state.PolecatPreset, PolecatProvider: state.PolecatProvider,
+			Session: state.Session, Runtime: state.Runtime, SessionAuthority: state.SessionAuthority,
+			Turns: state.Turns, Submitted: state.Submitted, Queued: state.Queued, Failed: state.Failed,
+			Receipts: state.Receipts, ReceiptCount: state.ReceiptCount, ReceiptDigest: state.ReceiptDigest,
+			AttemptedAt: state.AttemptedAt, CompletedAt: state.CompletedAt,
 		}
 	} else if !os.IsNotExist(err) {
 		return ControlPlaneVerdict{}, errors.New("reading wake canary evidence failed")

@@ -319,8 +319,12 @@ func observeIdlePane(escContent, promptPrefix string, cursorX, cursorY int) Idle
 		promptX := runeIndex(lines[i], prefix)
 		if observation.CodexPrompt {
 			inputX := promptX + len(prefix)
-			observation.Idle = promptX >= 0 && cursorY == i &&
+			promptOnCursor := cursorY == i &&
 				(cursorX == inputX || cursorX == inputX+1 && len(content) > 0 && allDim(contentDim))
+			cursorBelowComposer := observation.PromptRows == 1 && cursorY == i+2 && cursorX == inputX+1 &&
+				!observation.CursorRowBlank && !observation.NonEmptyAfterCursor &&
+				(len(content) == 0 || allDim(contentDim))
+			observation.Idle = promptX >= 0 && (promptOnCursor || cursorBelowComposer)
 			return observation
 		}
 		if len(content) == 0 || allDim(contentDim) {

@@ -4,6 +4,7 @@ package mail
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -80,8 +81,16 @@ type Message struct {
 	// Timestamp is when the message was sent.
 	Timestamp time.Time `json:"timestamp"`
 
-	// Read indicates if the message has been read (closed in beads).
+	// Read indicates presentation state. Legacy mail also treats closed as read.
 	Read bool `json:"read"`
+
+	// Status is the Beads issue status. Enrolled task mail uses it as work state.
+	Status WorkState `json:"status,omitempty"`
+
+	// Labels and Metadata retain the Beads work record fields needed by the
+	// actionable-mail lifecycle.
+	Labels   []string        `json:"labels,omitempty"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 
 	// Priority is the message priority.
 	Priority Priority `json:"priority"`
@@ -137,6 +146,10 @@ type Message struct {
 	// (no nudge, no banner). Set by the CLI when --no-notify is passed.
 	// In-memory only — not serialized.
 	SuppressNotify bool `json:"-"`
+
+	// mailWork is set by Router.Send only for a newly enrolled task. Keeping it
+	// internal prevents callers from bypassing routing and persistence checks.
+	mailWork bool
 }
 
 // NewMessage creates a new message with a generated ID and thread ID.
@@ -260,10 +273,10 @@ func (m *Message) Validate() error {
 	}
 
 	// ClaimedBy/ClaimedAt only valid for queue messages
-	if m.ClaimedBy != "" && m.Queue == "" {
+	if m.ClaimedBy != "" && m.Queue == "" && !m.IsActionableWork() {
 		return fmt.Errorf("claimed_by is only valid for queue messages")
 	}
-	if m.ClaimedAt != nil && m.Queue == "" {
+	if m.ClaimedAt != nil && m.Queue == "" && !m.IsActionableWork() {
 		return fmt.Errorf("claimed_at is only valid for queue messages")
 	}
 
@@ -279,7 +292,13 @@ func (m *Message) ValidateStored() error {
 	}
 	logical := *m
 	if logical.Queue != "" {
-		if logical.Channel != "" || logical.To != "queue:"+logical.Queue {
+		activeQueueWork := logical.IsActionableWork() &&
+			(logical.Status == WorkStateInProgress || logical.Status == WorkStateBlocked || logical.Status == WorkStateClosed)
+		validAssignee := logical.To == "queue:"+logical.Queue
+		if activeQueueWork {
+			validAssignee = logical.ClaimedBy != "" && AddressToIdentity(logical.To) == AddressToIdentity(logical.ClaimedBy)
+		}
+		if logical.Channel != "" || !validAssignee {
 			return fmt.Errorf("stored queue message has inconsistent route")
 		}
 		logical.To = ""
@@ -321,16 +340,17 @@ func generateThreadID() string {
 // BeadsMessage represents a message as returned by bd list/show commands.
 // Messages are beads issues with type=message and metadata stored in labels.
 type BeadsMessage struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`       // Subject
-	Description string    `json:"description"` // Body
-	Assignee    string    `json:"assignee"`    // To identity (for direct messages)
-	Priority    int       `json:"priority"`    // 0=urgent, 1=high, 2=normal, 3=low
-	Status      string    `json:"status"`      // open=unread, closed=read
-	CreatedAt   time.Time `json:"created_at"`
-	Labels      []string  `json:"labels"` // Metadata labels (from:X, thread:X, reply-to:X, msg-type:X, cc:X, queue:X, channel:X, claimed-by:X, claimed-at:X)
-	Pinned      bool      `json:"pinned,omitempty"`
-	Wisp        bool      `json:"ephemeral,omitempty"` // Ephemeral message (not synced to git)
+	ID          string          `json:"id"`
+	Title       string          `json:"title"`       // Subject
+	Description string          `json:"description"` // Body
+	Assignee    string          `json:"assignee"`    // To identity (for direct messages)
+	Priority    int             `json:"priority"`    // 0=urgent, 1=high, 2=normal, 3=low
+	Status      string          `json:"status"`      // open=unread, closed=read
+	CreatedAt   time.Time       `json:"created_at"`
+	Labels      []string        `json:"labels"` // Metadata labels (from:X, thread:X, reply-to:X, msg-type:X, cc:X, queue:X, channel:X, claimed-by:X, claimed-at:X)
+	Pinned      bool            `json:"pinned,omitempty"`
+	Wisp        bool            `json:"ephemeral,omitempty"` // Ephemeral message (not synced to git)
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
 
 	// Cached parsed values (populated by ParseLabels)
 	sender    string
@@ -437,6 +457,10 @@ func (bm *BeadsMessage) ToMessage() *Message {
 	for _, cc := range bm.cc {
 		ccAddrs = append(ccAddrs, identityToAddress(cc))
 	}
+	read := bm.HasLabel("read")
+	if !bm.HasLabel(MailWorkLabel) {
+		read = read || bm.Status == "closed"
+	}
 
 	return &Message{
 		ID:              bm.ID,
@@ -445,7 +469,10 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		Subject:         bm.Title,
 		Body:            bm.Description,
 		Timestamp:       bm.CreatedAt,
-		Read:            bm.Status == "closed" || bm.HasLabel("read"),
+		Read:            read,
+		Status:          WorkState(bm.Status),
+		Labels:          append([]string(nil), bm.Labels...),
+		Metadata:        append(json.RawMessage(nil), bm.Metadata...),
 		Priority:        priority,
 		Type:            msgType,
 		ThreadID:        bm.threadID,

@@ -60,6 +60,16 @@ func TestWaitPendingNotificationsDistinguishesQueued(t *testing.T) {
 	}
 }
 
+func TestNotifyPersistedSkipsNilSuppressedAndSelfMail(t *testing.T) {
+	r := NewRouterWithTownRoot(t.TempDir(), t.TempDir())
+	r.NotifyPersisted(nil)
+	r.NotifyPersisted(&Message{From: "gastown/Toast", To: "gastown/Toast"})
+	r.NotifyPersisted(&Message{From: "gastown/Toast", To: "gastown/Furiosa", SuppressNotify: true})
+	if err := r.WaitPendingNotifications(); err != nil {
+		t.Fatalf("WaitPendingNotifications() = %v", err)
+	}
+}
+
 func TestDetectTownRoot(t *testing.T) {
 	// Unset GT_TOWN_ROOT/GT_ROOT so tests exercise workspace.Find fallback.
 	// (The real session always has these set; this tests the detection logic itself.)
@@ -2233,6 +2243,131 @@ func containsLabel(labels []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestRouterMailWorkEnrollment(t *testing.T) {
+	router := &Router{}
+	base := Message{
+		From:    "mayor/",
+		To:      "gastown/Toast",
+		Subject: "Repair the system",
+		Type:    TypeTask,
+	}
+	tests := []struct {
+		name string
+		edit func(*Message)
+		want bool
+	}{
+		{name: "permanent direct task", want: true},
+		{name: "permanent queue task", edit: func(m *Message) { m.To = "queue:repairs" }, want: true},
+		{name: "ephemeral task", edit: func(m *Message) { m.Wisp = true }},
+		{name: "protocol wisp subject", edit: func(m *Message) { m.Subject = "NUDGE repair" }},
+		{name: "notification", edit: func(m *Message) { m.Type = TypeNotification }},
+		{name: "reply", edit: func(m *Message) { m.Type = TypeReply }},
+		{name: "escalation", edit: func(m *Message) { m.Type = TypeEscalation }},
+		{name: "self handoff", edit: func(m *Message) { m.To = m.From }},
+		{name: "human recipient", edit: func(m *Message) { m.To = "overseer" }},
+		{name: "group", edit: func(m *Message) { m.To = "@witnesses" }},
+		{name: "list", edit: func(m *Message) { m.To = "list:operators" }},
+		{name: "channel", edit: func(m *Message) { m.To = "channel:ops" }},
+		{name: "announce", edit: func(m *Message) { m.To = "announce:ops" }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := base
+			if tt.edit != nil {
+				tt.edit(&msg)
+			}
+			if got := router.shouldEnrollMailWork(&msg); got != tt.want {
+				t.Fatalf("shouldEnrollMailWork() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMailWorkCreateFields(t *testing.T) {
+	msg := &Message{From: "mayor/", To: "gastown/Toast", Type: TypeTask, mailWork: true}
+	labels := buildMessageLabels(msg, true)
+	if !containsLabel(labels, MailWorkLabel) {
+		t.Fatalf("labels %v missing %q", labels, MailWorkLabel)
+	}
+
+	args, err := appendMailWorkCreateMetadata([]string{"create"}, msg, WorkRouteDirect)
+	if err != nil {
+		t.Fatalf("appendMailWorkCreateMetadata: %v", err)
+	}
+	if len(args) != 3 || args[1] != "--metadata" {
+		t.Fatalf("create args = %v, want metadata flag", args)
+	}
+	work, err := ParseMailWorkMetadata(json.RawMessage(args[2]))
+	if err != nil || work.Validate(WorkStateOpen) != nil || work.Route != WorkRouteDirect {
+		t.Fatalf("initial metadata = %+v, parse error = %v", work, err)
+	}
+
+	plain, err := appendMailWorkCreateMetadata([]string{"create"}, &Message{}, WorkRouteDirect)
+	if err != nil || len(plain) != 1 {
+		t.Fatalf("plain create args = %v, error = %v", plain, err)
+	}
+}
+
+func TestRouterSendPersistsMailWorkEnrollment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a bash bd stub")
+	}
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	argsPath := filepath.Join(binDir, "create.args")
+	script := "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > " + strconv.Quote(argsPath) + "\necho hq-task\n"
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	router := NewRouterWithTownRoot(townRoot, townRoot)
+	msg := &Message{
+		From:           "mayor/",
+		To:             "deacon/",
+		Subject:        "Repair the system",
+		Body:           "Follow the approved plan",
+		Type:           TypeTask,
+		ThreadID:       "thread-task",
+		SuppressNotify: true,
+	}
+	if err := router.Send(msg); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read create args: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(args)), "\n")
+	metadata := ""
+	labels := ""
+	for i, line := range lines {
+		if line == "--metadata" && i+1 < len(lines) {
+			metadata = lines[i+1]
+		}
+		if line == "--labels" && i+1 < len(lines) {
+			labels = lines[i+1]
+		}
+	}
+	if !strings.Contains(labels, MailWorkLabel) {
+		t.Fatalf("create labels %q missing %q", labels, MailWorkLabel)
+	}
+	work, err := ParseMailWorkMetadata(json.RawMessage(metadata))
+	if err != nil || work.Validate(WorkStateOpen) != nil || work.Route != WorkRouteDirect {
+		t.Fatalf("persisted metadata = %+v, error = %v", work, err)
+	}
 }
 
 // --- enqueueReplyReminder tests ---

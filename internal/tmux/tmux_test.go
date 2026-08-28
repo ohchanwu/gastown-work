@@ -1055,7 +1055,10 @@ func TestSessionGenerationPanePIDIgnoresMutableActivePane(t *testing.T) {
 }
 
 func TestLegacySessionGenerationBindsOnePaneAndRejectsAmbiguousPanes(t *testing.T) {
-	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-legacy-pane-%d", time.Now().UnixNano()))
+	tm := NewTmuxWithSocketAndEnv(
+		fmt.Sprintf("gt-generation-legacy-pane-%d", time.Now().UnixNano()),
+		[]string{"PATH=" + os.Getenv("PATH")},
+	)
 	session := "gt-generation-legacy-pane"
 	defer func() { _ = tm.KillServer() }()
 
@@ -1096,7 +1099,10 @@ func TestLegacySessionGenerationBindsOnePaneAndRejectsAmbiguousPanes(t *testing.
 }
 
 func TestLegacySessionGenerationRejectsOnePaneABAAtMutation(t *testing.T) {
-	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-legacy-pane-aba-%d", time.Now().UnixNano()))
+	tm := NewTmuxWithSocketAndEnv(
+		fmt.Sprintf("gt-generation-legacy-pane-aba-%d", time.Now().UnixNano()),
+		[]string{"PATH=" + os.Getenv("PATH")},
+	)
 	session := "gt-generation-legacy-pane-aba"
 	defer func() { _ = tm.KillServer() }()
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -125,21 +126,38 @@ type DNDInfo struct {
 
 // AgentRuntime represents the runtime state of an agent.
 type AgentRuntime struct {
-	Name              string `json:"name"`                         // Display name (e.g., "mayor", "witness")
-	Address           string `json:"address"`                      // Full address (e.g., "greenplace/witness")
-	Session           string `json:"session"`                      // tmux session name
-	Role              string `json:"role"`                         // Role type
-	Running           bool   `json:"running"`                      // Is tmux session running?
-	ACP               bool   `json:"acp"`                          // Is ACP session active?
-	HasWork           bool   `json:"has_work"`                     // Has pinned work?
-	WorkTitle         string `json:"work_title,omitempty"`         // Title of pinned work
-	HookBead          string `json:"hook_bead,omitempty"`          // Pinned bead ID from agent bead
-	State             string `json:"state,omitempty"`              // Agent state from agent bead
-	NotificationLevel string `json:"notification_level,omitempty"` // Notification level (verbose, normal, muted)
-	UnreadMail        int    `json:"unread_mail"`                  // Number of unread messages
-	FirstSubject      string `json:"first_subject,omitempty"`      // Subject of first unread message
-	AgentAlias        string `json:"agent_alias,omitempty"`        // Configured agent name (e.g., "opus-46", "pi")
-	AgentInfo         string `json:"agent_info,omitempty"`         // Runtime summary (e.g., "claude/opus", "pi/kimi-k2p5")
+	Name              string            `json:"name"`          // Display name (e.g., "mayor", "witness")
+	Address           string            `json:"address"`       // Full address (e.g., "greenplace/witness")
+	Session           string            `json:"session"`       // tmux session name
+	Role              string            `json:"role"`          // Role type
+	Running           bool              `json:"running"`       // Is tmux session running?
+	ACP               bool              `json:"acp"`           // Is ACP session active?
+	HasWork           bool              `json:"has_work"`      // Has pinned work?
+	HasMailWork       bool              `json:"has_mail_work"` // Has claimed actionable mail?
+	HasAnyWork        bool              `json:"has_any_work"`  // Has primary or mail work?
+	MailWork          []MailWorkRuntime `json:"mail_work,omitempty"`
+	PendingMailWork   int               `json:"pending_mail_work"`
+	WorkTitle         string            `json:"work_title,omitempty"`         // Title of pinned work
+	HookBead          string            `json:"hook_bead,omitempty"`          // Pinned bead ID from agent bead
+	State             string            `json:"state,omitempty"`              // Agent state from agent bead
+	NotificationLevel string            `json:"notification_level,omitempty"` // Notification level (verbose, normal, muted)
+	UnreadMail        int               `json:"unread_mail"`                  // Number of unread messages
+	FirstSubject      string            `json:"first_subject,omitempty"`      // Subject of first unread message
+	AgentAlias        string            `json:"agent_alias,omitempty"`        // Configured agent name (e.g., "opus-46", "pi")
+	AgentInfo         string            `json:"agent_info,omitempty"`         // Runtime summary (e.g., "claude/opus", "pi/kimi-k2p5")
+}
+
+type MailWorkRuntime struct {
+	ID               string         `json:"id"`
+	ThreadID         string         `json:"thread_id,omitempty"`
+	Subject          string         `json:"subject"`
+	Route            mail.WorkRoute `json:"route"`
+	Status           mail.WorkState `json:"status"`
+	ClaimedBy        string         `json:"claimed_by"`
+	ClaimedAt        time.Time      `json:"claimed_at"`
+	GenerationID     string         `json:"generation_id"`
+	GenerationLive   bool           `json:"generation_live"`
+	LastTransitionAt time.Time      `json:"last_transition_at"`
 }
 
 // RigStatus represents status of a single rig.
@@ -1314,6 +1332,16 @@ func renderAgentDetails(w io.Writer, agent AgentRuntime, indent string, hooks []
 	}
 
 	fmt.Fprintf(w, "%s  hook: %s\n", indent, hookStr)
+	for _, work := range agent.MailWork {
+		liveness := "generation dead or changed"
+		if work.GenerationLive {
+			liveness = "generation live"
+		}
+		fmt.Fprintf(w, "%s  mail work: %s %s → %s (%s)\n", indent, work.Status, work.ID, truncateWithEllipsis(work.Subject, 35), liveness)
+	}
+	if agent.PendingMailWork > 0 {
+		fmt.Fprintf(w, "%s  pending task mail: %d\n", indent, agent.PendingMailWork)
+	}
 
 	// Line 4: Notification mode (DND)
 	if agent.NotificationLevel == beads.NotifyMuted {
@@ -1416,6 +1444,7 @@ func renderAgentCompactWithSuffix(w io.Writer, agent AgentRuntime, indent string
 	if agent.UnreadMail > 0 {
 		mailSuffix = fmt.Sprintf(" 📬%d", agent.UnreadMail)
 	}
+	mailSuffix += formatMailWorkCompact(agent)
 
 	// Agent runtime info
 	agentSuffix := ""
@@ -1462,6 +1491,7 @@ func renderAgentCompact(w io.Writer, agent AgentRuntime, indent string, hooks []
 	if agent.UnreadMail > 0 {
 		mailSuffix = fmt.Sprintf(" 📬%d", agent.UnreadMail)
 	}
+	mailSuffix += formatMailWorkCompact(agent)
 
 	// Agent runtime info
 	agentSuffix := ""
@@ -1471,6 +1501,31 @@ func renderAgentCompact(w io.Writer, agent AgentRuntime, indent string, hooks []
 
 	// Print single line: name + status + agent-info + hook + mail
 	fmt.Fprintf(w, "%s%-12s %s%s%s%s\n", indent, agent.Name, statusIndicator, agentSuffix, hookSuffix, mailSuffix)
+}
+
+func formatMailWorkCompact(agent AgentRuntime) string {
+	active, blocked := 0, 0
+	for _, work := range agent.MailWork {
+		if work.Status == mail.WorkStateBlocked {
+			blocked++
+		} else {
+			active++
+		}
+	}
+	var fields []string
+	if active > 0 {
+		fields = append(fields, fmt.Sprintf("active:%d", active))
+	}
+	if blocked > 0 {
+		fields = append(fields, fmt.Sprintf("blocked:%d", blocked))
+	}
+	if agent.PendingMailWork > 0 {
+		fields = append(fields, fmt.Sprintf("pending:%d", agent.PendingMailWork))
+	}
+	if len(fields) == 0 {
+		return ""
+	}
+	return " ✉" + strings.Join(fields, " ✉")
 }
 
 // buildStatusIndicator creates the visual status indicator for an agent.
@@ -1686,6 +1741,7 @@ func discoverGlobalAgents(townRoot string, allSessions map[string]bool, allAgent
 			if !skipMail {
 				populateMailInfo(&agent, mailRouter)
 			}
+			agent.HasAnyWork = agent.HasWork || agent.HasMailWork
 
 			agents[idx] = agent
 		}(i, def)
@@ -1719,6 +1775,55 @@ func populateMailInfo(agent *AgentRuntime, router *mail.Router) {
 			firstSubjectSet = true
 		}
 	}
+	populateMailWorkInfo(agent, messages, mailWorkGenerationLive)
+}
+
+func populateMailWorkInfo(agent *AgentRuntime, messages []*mail.Message, generationLive func(mail.WorkGeneration) bool) {
+	if agent == nil {
+		return
+	}
+	identity := mail.AddressToIdentity(agent.Address)
+	for _, message := range messages {
+		if message == nil || !message.IsActionableWork() {
+			continue
+		}
+		work, err := mail.ParseMailWorkMetadata(message.Metadata)
+		if err != nil || work.Validate(message.Status) != nil {
+			continue
+		}
+		if message.Status == mail.WorkStateOpen {
+			agent.PendingMailWork++
+			continue
+		}
+		if (message.Status != mail.WorkStateInProgress && message.Status != mail.WorkStateBlocked) ||
+			work.Claim == nil || mail.AddressToIdentity(work.Claim.Actor) != identity {
+			continue
+		}
+		lastTransition := work.Claim.ClaimedAt
+		if work.Blocked != nil {
+			lastTransition = work.Blocked.At
+		}
+		encoded, _ := json.Marshal(work.Claim.Generation)
+		digest := sha256.Sum256(encoded)
+		agent.MailWork = append(agent.MailWork, MailWorkRuntime{
+			ID: message.ID, ThreadID: message.ThreadID, Subject: message.Subject,
+			Route: work.Route, Status: message.Status, ClaimedBy: work.Claim.Actor,
+			ClaimedAt: work.Claim.ClaimedAt, GenerationID: fmt.Sprintf("%x", digest[:8]),
+			GenerationLive:   generationLive != nil && generationLive(work.Claim.Generation),
+			LastTransitionAt: lastTransition,
+		})
+	}
+	agent.HasMailWork = len(agent.MailWork) > 0
+	agent.HasAnyWork = agent.HasWork || agent.HasMailWork
+}
+
+func mailWorkGenerationLive(generation mail.WorkGeneration) bool {
+	transport, err := tmux.NewTmuxForSessionGeneration(generation.Tmux())
+	if err != nil {
+		return false
+	}
+	current, err := transport.CaptureSessionGeneration(generation.Name)
+	return err == nil && current.Equal(generation.Tmux())
 }
 
 // detectCurrentDNDStatus returns DND status for the currently resolved role context.
@@ -1869,6 +1974,7 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 			if !skipMail {
 				populateMailInfo(&agent, mailRouter)
 			}
+			agent.HasAnyWork = agent.HasWork || agent.HasMailWork
 
 			agents[idx] = agent
 		}(i, def)

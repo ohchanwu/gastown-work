@@ -150,6 +150,20 @@ func (r *Router) recordNotificationResult(err error) {
 	r.notifyMu.Unlock()
 }
 
+// NotifyPersisted wakes the recipient for a message that was already written
+// transactionally by a caller such as MailWorkStore.Complete.
+func (r *Router) NotifyPersisted(msg *Message) {
+	if msg == nil || msg.SuppressNotify || isSelfMail(msg.From, msg.To) {
+		return
+	}
+	msgCopy := *msg
+	r.notifyWg.Add(1)
+	go func() {
+		defer r.notifyWg.Done()
+		r.recordNotificationResult(r.notifyRecipient(&msgCopy))
+	}()
+}
+
 // isListAddress returns true if the address uses list:name syntax.
 func isListAddress(address string) bool {
 	return strings.HasPrefix(address, "list:")
@@ -309,6 +323,9 @@ func (r *Router) buildLabels(msg *Message) []string {
 func buildMessageLabels(msg *Message, includeDelivery bool) []string {
 	var labels []string
 	labels = append(labels, "gt:message")
+	if msg.mailWork {
+		labels = append(labels, MailWorkLabel)
+	}
 	if msg.Type == TypeEscalation {
 		labels = append(labels, "gt:escalation")
 	}
@@ -928,6 +945,23 @@ func (r *Router) shouldBeWisp(msg *Message) bool {
 	return false
 }
 
+func (r *Router) shouldEnrollMailWork(msg *Message) bool {
+	if msg == nil || msg.Type != TypeTask || msg.Wisp || r.shouldBeWisp(msg) || msg.To == "" {
+		return false
+	}
+	if AddressToIdentity(msg.From) == AddressToIdentity(msg.To) {
+		return false
+	}
+	if AddressToIdentity(msg.To) == "overseer" {
+		return false
+	}
+	if isQueueAddress(msg.To) {
+		return true
+	}
+	return !isListAddress(msg.To) && !isGroupAddress(msg.To) &&
+		!isAnnounceAddress(msg.To) && !isChannelAddress(msg.To)
+}
+
 // Send delivers a message via beads message.
 // Routes the message to the correct beads database based on recipient address.
 // Supports fan-out for:
@@ -937,6 +971,8 @@ func (r *Router) shouldBeWisp(msg *Message) bool {
 // - Queues (queue:name) - stores single message for worker claiming
 // - Announces (announce:name) - bulletin board, no claiming, retention-limited
 func (r *Router) Send(msg *Message) error {
+	msg.mailWork = r.shouldEnrollMailWork(msg)
+
 	// Check for mailing list address
 	if isListAddress(msg.To) {
 		return r.sendToList(msg)
@@ -1219,6 +1255,10 @@ func (r *Router) sendToSingle(msg *Message) error {
 		"--assignee", toIdentity,
 		"-d", msg.Body,
 	}
+	args, metadataErr := appendMailWorkCreateMetadata(args, msg, WorkRouteDirect)
+	if metadataErr != nil {
+		return metadataErr
+	}
 
 	// Add priority flag
 	beadsPriority := PriorityToBeads(msg.Priority)
@@ -1273,14 +1313,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Notification is async: the durable write is complete, so the caller
 	// doesn't block on idle probing (up to 1s per recipient in fan-out).
 	// Callers that exit soon after Send should call WaitPendingNotifications.
-	if !msg.SuppressNotify && !isSelfMail(msg.From, msg.To) {
-		msgCopy := *msg // copy to avoid data race if caller mutates msg
-		r.notifyWg.Add(1)
-		go func() {
-			defer r.notifyWg.Done()
-			r.recordNotificationResult(r.notifyRecipient(&msgCopy))
-		}()
-	}
+	r.NotifyPersisted(msg)
 
 	return nil
 }
@@ -1350,6 +1383,10 @@ func (r *Router) sendToQueue(msg *Message) error {
 		"--assignee", msg.To, // queue:name
 		"-d", msg.Body,
 	}
+	args, err = appendMailWorkCreateMetadata(args, msg, WorkRouteQueue)
+	if err != nil {
+		return err
+	}
 
 	// Add priority flag
 	beadsPriority := PriorityToBeads(msg.Priority)
@@ -1384,6 +1421,17 @@ func (r *Router) sendToQueue(msg *Message) error {
 	// No notification for queue messages - workers poll or check on their own schedule
 
 	return nil
+}
+
+func appendMailWorkCreateMetadata(args []string, msg *Message, route WorkRoute) ([]string, error) {
+	if msg == nil || !msg.mailWork {
+		return args, nil
+	}
+	metadata, err := EncodeMailWorkMetadata(nil, &WorkMetadata{Schema: MailWorkSchema, Route: route})
+	if err != nil {
+		return nil, fmt.Errorf("encoding initial mail work metadata: %w", err)
+	}
+	return append(args, "--metadata", string(metadata)), nil
 }
 
 // sendToAnnounce delivers a message to an announce channel (bulletin board).

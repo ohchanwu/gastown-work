@@ -218,6 +218,7 @@ func TestPrefixMismatchCheck_Fix(t *testing.T) {
 	}
 
 	check := NewPrefixMismatchCheck()
+	check.prefixGetter = &mockDBPrefixGetter{prefixes: map[string]string{filepath.Join(tmpDir, "gastown"): "gt"}}
 	ctx := &CheckContext{TownRoot: tmpDir}
 
 	// First verify there's a mismatch
@@ -248,6 +249,15 @@ func TestPrefixMismatchCheck_Fix(t *testing.T) {
 	}
 	if cfg.Rigs["gastown"].BeadsConfig.Prefix != "gt" {
 		t.Errorf("expected prefix 'gt' after fix, got %q", cfg.Rigs["gastown"].BeadsConfig.Prefix)
+	}
+}
+
+func TestReconciledPrefixRequiresRouteAndDatabaseAgreement(t *testing.T) {
+	if got, err := reconciledPrefix("ga", "gt", "gt"); err != nil || got != "gt" {
+		t.Fatalf("got %q, err %v; want route/database prefix gt", got, err)
+	}
+	if _, err := reconciledPrefix("ga", "gt", "ga"); err == nil {
+		t.Fatal("expected route/database disagreement to fail closed")
 	}
 }
 

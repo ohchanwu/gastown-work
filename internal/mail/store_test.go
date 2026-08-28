@@ -3,6 +3,7 @@ package mail
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -200,5 +201,74 @@ func TestMailboxStoreListByThreadReturnsStoreFailureWithoutCLIFallback(t *testin
 	}
 	if store.calls != 1 {
 		t.Fatalf("SearchIssues called %d times, want 1", store.calls)
+	}
+}
+
+func TestMailboxStoreListIncludesActiveWorkAndListAllAddsClosedWork(t *testing.T) {
+	store := &threadSearchStore{issues: []*beadsdk.Issue{
+		{ID: "open", Status: beadsdk.StatusOpen, Assignee: "gastown/Toast", Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"}},
+		{ID: "active", Status: beadsdk.StatusInProgress, Assignee: "gastown/Toast", Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"}},
+		{ID: "blocked", Status: beadsdk.StatusBlocked, Assignee: "gastown/Toast", Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"}},
+		{ID: "closed-work", Status: beadsdk.StatusClosed, Assignee: "gastown/Toast", Labels: []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"}},
+		{ID: "closed-mail", Status: beadsdk.StatusClosed, Assignee: "gastown/Toast", Labels: []string{"gt:message", "from:mayor/"}},
+	}}
+	m := NewMailboxBeadsWithStore("gastown/Toast", t.TempDir(), store)
+
+	normal, err := m.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messageIDs(normal); !reflect.DeepEqual(got, []string{"open", "active", "blocked"}) {
+		t.Fatalf("normal inbox = %v", got)
+	}
+	all, err := m.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messageIDs(all); !reflect.DeepEqual(got, []string{"open", "active", "blocked", "closed-work"}) {
+		t.Fatalf("all inbox = %v", got)
+	}
+}
+
+type closeGuardStore struct {
+	beadsdk.Storage
+	issue  *beadsdk.Issue
+	closed int
+}
+
+func (s *closeGuardStore) GetIssue(context.Context, string) (*beadsdk.Issue, error) {
+	return s.issue, nil
+}
+
+func (s *closeGuardStore) CloseIssue(context.Context, string, string, string, string) error {
+	s.closed++
+	return nil
+}
+
+func TestMailboxRejectsGenericCloseForActiveMailWork(t *testing.T) {
+	for _, operation := range []string{"delete", "archive"} {
+		t.Run(operation, func(t *testing.T) {
+			store := &closeGuardStore{issue: &beadsdk.Issue{
+				ID: "hq-work", Title: "work", Status: beadsdk.StatusInProgress,
+				Assignee: "gastown/Toast",
+				Labels:   []string{"gt:message", MailWorkLabel, "msg-type:task", "from:mayor/"},
+			}}
+			m := NewMailboxWithBeadsDirAndStore("gastown/Toast", t.TempDir(), t.TempDir(), store)
+			var err error
+			if operation == "delete" {
+				err = m.Delete("hq-work")
+			} else {
+				err = m.Archive("hq-work")
+			}
+			if !errors.Is(err, ErrMailWorkRequiresLifecycle) {
+				t.Fatalf("%s error = %v", operation, err)
+			}
+			if store.closed != 0 {
+				t.Fatalf("%s closed active work", operation)
+			}
+			if _, statErr := os.Stat(m.ArchivePath()); !os.IsNotExist(statErr) {
+				t.Fatalf("%s wrote archive before rejection: %v", operation, statErr)
+			}
+		})
 	}
 }

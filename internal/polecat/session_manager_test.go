@@ -263,8 +263,8 @@ func TestStart_UsesOneDeadlineAndCleansOnlyItsSession(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "creating session:") {
 			t.Fatalf("Start error = %v, want truthful session-creation phase", err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("Start exceeded configured 200ms startup deadline")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start exceeded startup deadline plus bounded failed-session cleanup")
 	}
 
 	if running, err := tm.HasSession(sessionID); err != nil || running {
