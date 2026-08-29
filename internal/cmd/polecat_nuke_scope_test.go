@@ -45,13 +45,13 @@ func TestPolecatNukeUsesOnlyLocalRemovalPrimitives(t *testing.T) {
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptions"); calls != 0 {
 		t.Fatalf("nukePolecatFullWithOptions called publishing RemoveWithOptions %d time(s), want 0", calls)
 	}
-	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnation"); calls != 1 {
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnationJournaled"); calls != 1 {
 		t.Fatalf("nukePolecatFullWithOptions incarnation-bound local-only removal calls = %d, want 1", calls)
 	}
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "resetPolecatAgentBeadForReuse"); calls != 0 {
 		t.Fatalf("nukePolecatFullWithOptions stale-name bead resets = %d, want 0", calls)
 	}
-	if !callNestedWithinCallArgument(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnation", "deletePreservedLocalPolecatBranch") {
+	if !callNestedWithinCallArgument(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnationJournaled", "DeleteBranch") {
 		t.Fatal("local branch deletion is not contained by the exact polecat lifecycle transaction")
 	}
 }
@@ -65,11 +65,14 @@ func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
 	if refs := referencesIdentifier(t, file, "runPolecatNuke", "provePolecatNukeCustody"); refs != 1 {
 		t.Fatalf("runPolecatNuke custody proof references = %d, want 1", refs)
 	}
-	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 3 {
-		t.Fatalf("real nuke custody proof calls = %d, want initial, pre-fence, and destructive-boundary rechecks", calls)
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 2 {
+		t.Fatalf("real nuke custody proof calls = %d, want initial and pre-fence checks", calls)
 	}
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "verifyPolecatNukeGitCustody"); calls != 1 {
 		t.Fatalf("post-stop Git custody rechecks = %d, want 1", calls)
+	}
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "verifyRetirementGitRecord"); calls != 1 {
+		t.Fatalf("resumable durable Git custody rechecks = %d, want 1", calls)
 	}
 	if calls := callsTo(t, file, "provePolecatNukeCustody", "checkPolecatSafetySnapshot"); calls != 1 {
 		t.Fatalf("custody proof safety rechecks = %d, want 1 inside each proof", calls)

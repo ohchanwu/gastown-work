@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -20,6 +21,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/formula"
+	polecatpkg "github.com/steveyegge/gastown/internal/polecat"
 	rigpkg "github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -347,6 +349,13 @@ func burnExistingMolecules(molecules []string, beadID, townRoot string) error {
 }
 
 func removeMoleculeBonds(bd *beads.Beads, beadID, molID string) {
+	if err := removeMoleculeBondsStrict(bd, beadID, molID); err != nil {
+		fmt.Printf("  %s Could not remove molecule bonds: %v\n", style.Dim.Render("Warning:"), err)
+	}
+}
+
+func removeMoleculeBondsStrict(bd *beads.Beads, beadID, molID string) error {
+	var errs []error
 	for _, bond := range []struct {
 		from string
 		to   string
@@ -355,10 +364,10 @@ func removeMoleculeBonds(bd *beads.Beads, beadID, molID string) {
 		{from: beadID, to: molID}, // legacy reverse direction
 	} {
 		if err := bd.RemoveDependency(bond.from, bond.to); err != nil && !dependencyRemovalMissing(err) {
-			fmt.Printf("  %s Could not remove dep bond %s → %s: %v\n",
-				style.Dim.Render("Warning:"), bond.from, bond.to, err)
+			errs = append(errs, fmt.Errorf("removing dep bond %s -> %s: %w", bond.from, bond.to, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func dependencyRemovalMissing(err error) bool {
@@ -1268,6 +1277,38 @@ func hookBeadWithRetry(beadID, targetAgent, hookDir string) error {
 }
 
 func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string) error {
+	return withPolecatAssignmentFence(targetAgent, townRoot, func() error {
+		return hookBeadWithRetryUnlocked(beadID, targetAgent, hookDir, townRoot)
+	})
+}
+
+func withPolecatAssignmentFence(targetAgent, townRoot string, assign func() error) error {
+	parts := strings.Split(strings.Trim(targetAgent, "/"), "/")
+	if len(parts) != 3 || parts[1] != "polecats" {
+		return assign()
+	}
+	if townRoot == "" {
+		var err error
+		townRoot, err = workspace.FindFromCwdOrError()
+		if err != nil {
+			return err
+		}
+	}
+	err := assignPolecatWorkIfCurrent(parts[0], parts[2], townRoot, assign)
+	if err != nil {
+		return fmt.Errorf("assigning work to exact polecat generation: %w", err)
+	}
+	return nil
+}
+
+var assignPolecatWorkIfCurrent = func(rigName, polecatName, townRoot string, assign func() error) error {
+	r := &rigpkg.Rig{Name: rigName, Path: filepath.Join(townRoot, rigName)}
+	mgr := polecatpkg.NewManager(r, nil, tmux.NewTmux())
+	_, err := mgr.AssignWorkIfCurrent(polecatName, assign)
+	return err
+}
+
+func hookBeadWithRetryUnlocked(beadID, targetAgent, hookDir, townRoot string) error {
 	const maxRetries = 10
 	const baseBackoff = 500 * time.Millisecond
 	const maxBackoff = 30 * time.Second

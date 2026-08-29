@@ -424,6 +424,7 @@ exit /b 0
 	prevReviewOnly := slingReviewOnly
 	prevNoMerge := slingNoMerge
 	prevResolveTargetAgent := resolveTargetAgentFn
+	prevAssignPolecatWork := assignPolecatWorkIfCurrent
 	t.Cleanup(func() {
 		slingOnTarget = prevOn
 		slingVars = prevVars
@@ -433,6 +434,7 @@ exit /b 0
 		slingReviewOnly = prevReviewOnly
 		slingNoMerge = prevNoMerge
 		resolveTargetAgentFn = prevResolveTargetAgent
+		assignPolecatWorkIfCurrent = prevAssignPolecatWork
 	})
 
 	slingDryRun = false
@@ -448,6 +450,7 @@ exit /b 0
 		}
 		return "gastown/polecats/toast", "", filepath.Join(townRoot, "gastown", "polecats", "toast", "gastown"), nil
 	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
 
 	// Prevent real tmux nudge from firing during tests (causes agent self-interruption)
 	t.Setenv("GT_TEST_NO_NUDGE", "1")
@@ -3526,6 +3529,9 @@ exit /b 0
 }
 
 func TestHookBeadWithRetryForcesAutoCommit(t *testing.T) {
+	previousFence := assignPolecatWorkIfCurrent
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	t.Cleanup(func() { assignPolecatWorkIfCurrent = previousFence })
 	townRoot := t.TempDir()
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "bd.log")

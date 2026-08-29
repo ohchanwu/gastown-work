@@ -737,6 +737,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	donePolecatMgr, _, err := getPolecatManager(rigName)
+	if err != nil {
+		return fmt.Errorf("resolving polecat completion lifecycle: %w", err)
+	}
+	if err := donePolecatMgr.ClaimCompletionIfCurrent(polecatName, agentIncarnation); err != nil {
+		return fmt.Errorf("claiming exact polecat completion: %w", err)
+	}
 
 	g := git.NewGit(cwd)
 

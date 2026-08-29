@@ -1347,7 +1347,7 @@ func sendHandoffMail(subject, message string) (string, error) {
 	hookCmd.Env = append(hookCmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
 	hookCmd.Stderr = os.Stderr
 
-	if err := hookCmd.Run(); err != nil {
+	if err := withPolecatAssignmentFence(agentID, townRoot, hookCmd.Run); err != nil {
 		// Non-fatal: mail was created, just couldn't hook
 		style.PrintWarning("created mail %s but failed to auto-hook: %v", beadID, err)
 		return beadID, nil

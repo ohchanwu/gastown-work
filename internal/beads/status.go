@@ -19,6 +19,7 @@ const (
 	AgentStateEscalated    AgentState = "escalated"
 	AgentStateIdle         AgentState = "idle"
 	AgentStateRunning      AgentState = "running"
+	AgentStateCompleting   AgentState = "completing"
 	AgentStateRetiring     AgentState = "retiring"
 	AgentStateNuked        AgentState = "nuked"
 	AgentStateAwaitingGate AgentState = "awaiting-gate"
@@ -46,7 +47,7 @@ func ResolveAgentState(description, structured string) string {
 // States like "stuck" and "awaiting-gate" mean the polecat is paused on purpose.
 func (s AgentState) ProtectsFromCleanup() bool {
 	switch s {
-	case AgentStateStuck, AgentStateAwaitingGate, AgentStatePaused, AgentStateRetiring:
+	case AgentStateStuck, AgentStateAwaitingGate, AgentStatePaused, AgentStateCompleting, AgentStateRetiring:
 		return true
 	default:
 		return false
@@ -56,7 +57,7 @@ func (s AgentState) ProtectsFromCleanup() bool {
 // IsActive returns true if the agent is actively doing work.
 func (s AgentState) IsActive() bool {
 	switch s {
-	case AgentStateWorking, AgentStateRunning, AgentStateSpawning, AgentStatePatrolling:
+	case AgentStateWorking, AgentStateRunning, AgentStateSpawning, AgentStatePatrolling, AgentStateCompleting:
 		return true
 	default:
 		return false

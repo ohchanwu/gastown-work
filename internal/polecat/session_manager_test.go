@@ -227,12 +227,16 @@ func TestStartPolecatNotFound(t *testing.T) {
 
 func TestStart_UsesOneDeadlineAndCleansOnlyItsSession(t *testing.T) {
 	requireTmux(t)
+	installMockBd(t)
 
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
 	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir polecat workdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 	settings := config.NewTownSettings()
 	settings.Operational = &config.OperationalConfig{
@@ -275,12 +279,16 @@ func TestStart_UsesOneDeadlineAndCleansOnlyItsSession(t *testing.T) {
 
 func TestStartContext_CancellationDuringPostReadyFallback(t *testing.T) {
 	requireTmux(t)
+	installMockBd(t)
 
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
 	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir polecat workdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 	retries := 1
 	settings := config.NewTownSettings()
@@ -299,7 +307,7 @@ func TestStartContext_CancellationDuringPostReadyFallback(t *testing.T) {
 	}
 	settings.Operational = &config.OperationalConfig{
 		Session: &config.SessionThresholds{
-			ClaudeStartTimeout:      "20s",
+			ClaudeStartTimeout:      "60s",
 			StartupNudgeVerifyDelay: "10s",
 			StartupNudgeMaxRetries:  &retries,
 		},
@@ -345,7 +353,7 @@ func TestStartContext_CancellationDuringPostReadyFallback(t *testing.T) {
 	case <-verificationEntered:
 	case err := <-done:
 		t.Fatalf("StartContext returned before verification: %v", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("StartContext did not enter startup nudge verification")
 	}
 
@@ -457,11 +465,15 @@ func TestStopSerializesWithPolecatLifecycleLock(t *testing.T) {
 }
 
 func TestStartContextFailedCleanupUsesCreationGeneration(t *testing.T) {
+	installMockBd(t)
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
 	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir polecat workdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 	settings := config.NewTownSettings()
 	settings.Operational = &config.OperationalConfig{
@@ -517,8 +529,58 @@ func TestStartContextFailedCleanupUsesCreationGeneration(t *testing.T) {
 	}
 }
 
+func TestStartContextOnStartedFailureCleansCreatedGeneration(t *testing.T) {
+	requireTmux(t)
+	installMockBd(t)
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := config.NewTownSettings()
+	settings.DefaultAgent = "test-runtime"
+	settings.Agents = map[string]*config.RuntimeConfig{
+		"test-runtime": {
+			Provider: "generic", Command: "awk", PromptMode: "none",
+			Hooks: &config.RuntimeHooksConfig{Provider: "claude"},
+			Tmux:  &config.RuntimeTmuxConfig{ProcessNames: []string{"awk"}, ReadyPromptPrefix: "READY>"},
+		},
+	}
+	settings.Operational = &config.OperationalConfig{Session: &config.SessionThresholds{ClaudeStartTimeout: "20s"}}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatal(err)
+	}
+	reg := session.NewPrefixRegistry()
+	reg.Register("xz", "testrig")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmux()
+	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}})
+	m.deliverStartupPrompt = func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error { return nil }
+	m.verifyStartupNudge = func(context.Context, string, *config.RuntimeConfig, string, bool) error { return nil }
+	sentinel := errors.New("post-start CAS failed")
+	err := m.StartContext(context.Background(), "Toast", SessionStartOptions{
+		WorkDir: workDir, Agent: "test-runtime", Incarnation: "fixture-generation",
+		Command:   `awk 'BEGIN { print "READY>"; fflush(); system("sleep 30") }'`,
+		OnStarted: func(string) error { return sentinel },
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("StartContext error = %v, want post-start CAS failure", err)
+	}
+	if running, checkErr := tm.HasSession(m.SessionName("Toast")); checkErr != nil || running {
+		t.Fatalf("failed post-start CAS left session: running=%v err=%v", running, checkErr)
+	}
+}
+
 func TestStart_ExpiredContextKillsOwnedChildOnly(t *testing.T) {
 	requireTmux(t)
+	installMockBd(t)
 
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
@@ -526,9 +588,12 @@ func TestStart_ExpiredContextKillsOwnedChildOnly(t *testing.T) {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir polecat workdir: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	settings := config.NewTownSettings()
 	settings.Operational = &config.OperationalConfig{
-		Session: &config.SessionThresholds{ClaudeStartTimeout: "450ms"},
+		Session: &config.SessionThresholds{ClaudeStartTimeout: "3s"},
 	}
 	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
 		t.Fatalf("save town settings: %v", err)

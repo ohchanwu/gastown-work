@@ -421,11 +421,21 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	// Start session
 	t := tmux.NewTmux()
 	polecatSessMgr := polecat.NewSessionManager(t, r)
+	polecatMgr := polecat.NewManager(r, git.NewGit(r.Path), t)
 
 	fmt.Printf("Starting session for %s/%s...\n", s.RigName, s.PolecatName)
 	startOpts := polecat.SessionStartOptions{
 		RuntimeConfigDir: claudeConfigDir,
 		Agent:            s.agent,
+		OnStarted: func(incarnation string) error {
+			if err := polecatMgr.SetAgentStateWithRetryIfIncarnation(s.PolecatName, incarnation, "working"); err != nil {
+				return fmt.Errorf("setting exact agent state: %w", err)
+			}
+			if err := polecatMgr.SetStateIfIncarnation(s.PolecatName, incarnation, polecat.StateWorking); err != nil {
+				return fmt.Errorf("setting exact work state: %w", err)
+			}
+			return nil
+		},
 	}
 	if err := polecatSessMgr.Start(s.PolecatName, startOpts); err != nil {
 		return "", fmt.Errorf("starting session: %w", err)
@@ -452,24 +462,6 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	}
 	if err := t.WaitForRuntimeReady(s.SessionName, runtimeConfig, 30*time.Second); err != nil {
 		style.PrintWarning("runtime may not be fully ready: %v", err)
-	}
-
-	// Update agent state with retry logic (gt-94llt7: fail-safe Dolt writes).
-	// Note: warn-only, not fail-hard. The tmux session is already started above,
-	// so returning an error here would leave an orphaned session with no cleanup path.
-	// The polecat can still function without the agent state update — it only affects
-	// monitoring visibility, not correctness. Compare with createAgentBeadWithRetry
-	// which fails hard because a polecat without an agent bead is untrackable.
-	polecatGit := git.NewGit(r.Path)
-	polecatMgr := polecat.NewManager(r, polecatGit, t)
-	if err := polecatMgr.SetAgentStateWithRetry(s.PolecatName, "working"); err != nil {
-		style.PrintWarning("could not update agent state after retries: %v", err)
-	}
-
-	// Update issue status from hooked to in_progress.
-	// Also warn-only for the same reason: session is already running.
-	if err := polecatMgr.SetState(s.PolecatName, polecat.StateWorking); err != nil {
-		style.PrintWarning("could not update issue status to in_progress: %v", err)
 	}
 
 	// Get pane — if this fails, the session may have died during startup.

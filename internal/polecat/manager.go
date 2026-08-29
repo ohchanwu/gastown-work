@@ -231,14 +231,81 @@ func (m *Manager) EnsurePolecatIncarnation(name string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = fl.Unlock() }()
+	return m.resolvePolecatLaunchIncarnationLocked(name, "")
+}
+
+func (m *Manager) resolvePolecatLaunchIncarnationLocked(name, expected string) (string, error) {
 	if !m.exists(name) {
 		return "", ErrPolecatNotFound
 	}
-	incarnation, err := m.agentBeads().InitializeAgentIncarnationIfMissing(m.agentBeadID(name))
+	_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
 	if err != nil {
-		return "", fmt.Errorf("initializing polecat incarnation for %s: %w", name, err)
+		return "", fmt.Errorf("reading polecat incarnation for %s: %w", name, err)
+	}
+	if fields == nil {
+		return "", fmt.Errorf("%w: missing agent fields", ErrPolecatIncarnationChanged)
+	}
+	switch fields.AgentState {
+	case string(beads.AgentStateCompleting), string(beads.AgentStateRetiring), string(beads.AgentStateNuked):
+		return "", fmt.Errorf("%w: agent is %s", ErrPolecatIncarnationChanged, fields.AgentState)
+	}
+	incarnation := strings.TrimSpace(fields.Incarnation)
+	if incarnation == "" {
+		incarnation, err = m.agentBeads().InitializeAgentIncarnationIfMissing(m.agentBeadID(name))
+		if err != nil {
+			return "", fmt.Errorf("initializing polecat incarnation for %s: %w", name, err)
+		}
+	}
+	expected = strings.TrimSpace(expected)
+	if expected != "" && incarnation != expected {
+		return "", fmt.Errorf("%w: expected %s, observed %s", ErrPolecatIncarnationChanged, expected, incarnation)
 	}
 	return incarnation, nil
+}
+
+// AssignWorkIfCurrent serializes authoritative work-bead assignment with
+// spawn, completion, and retirement for one polecat generation.
+func (m *Manager) AssignWorkIfCurrent(name string, assign func() error) (string, error) {
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = fl.Unlock() }()
+	incarnation, err := m.resolvePolecatLaunchIncarnationLocked(name, "")
+	if err != nil {
+		return "", err
+	}
+	if assign == nil {
+		return "", errors.New("work assignment callback unavailable")
+	}
+	if err := assign(); err != nil {
+		return "", err
+	}
+	return incarnation, nil
+}
+
+// ClaimCompletionIfCurrent establishes the gt done fence under the same
+// lifecycle lock used by assignment, startup, and retirement.
+func (m *Manager) ClaimCompletionIfCurrent(name, expectedIncarnation string) error {
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+	if !m.exists(name) {
+		return ErrPolecatNotFound
+	}
+	_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+	if err != nil {
+		return err
+	}
+	if fields == nil || fields.Incarnation != strings.TrimSpace(expectedIncarnation) {
+		return fmt.Errorf("%w: completion receipt", ErrPolecatIncarnationChanged)
+	}
+	if fields.AgentState == string(beads.AgentStateRetiring) || fields.AgentState == string(beads.AgentStateNuked) {
+		return fmt.Errorf("%w: agent is %s", ErrPolecatIncarnationChanged, fields.AgentState)
+	}
+	return m.agentBeads().ClaimAgentCompletion(m.agentBeadID(name), expectedIncarnation)
 }
 
 // lockPolecat acquires an exclusive file lock for a specific polecat.
@@ -417,6 +484,42 @@ func (m *Manager) SetAgentStateWithRetry(name string, state string) error {
 		}
 	}
 	return fmt.Errorf("setting agent state after %d attempts: %w", doltStateRetries, lastErr)
+}
+
+// SetAgentStateWithRetryIfIncarnation rejects a delayed startup writer after
+// same-name reuse or retirement.
+func (m *Manager) SetAgentStateWithRetryIfIncarnation(name, expectedIncarnation, state string) error {
+	var lastErr error
+	for attempt := 1; attempt <= doltStateRetries; attempt++ {
+		err := m.agentBeads().UpdateAgentDescriptionFieldsIfIncarnation(
+			m.agentBeadID(name), expectedIncarnation, beads.AgentFieldUpdates{AgentState: &state},
+		)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if isDoltConfigError(err) || errors.Is(err, beads.ErrAgentFieldsChanged) {
+			return err
+		}
+		if attempt < doltStateRetries {
+			time.Sleep(doltBackoff(attempt))
+		}
+	}
+	return fmt.Errorf("setting exact agent state after %d attempts: %w", doltStateRetries, lastErr)
+}
+
+// SetStateIfIncarnation binds the work-bead state write to the launch receipt.
+// Callers that already hold the lifecycle lock use this after exact validation.
+func (m *Manager) SetStateIfIncarnation(name, expectedIncarnation string, state State) error {
+	_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+	if err != nil {
+		return err
+	}
+	if fields == nil || fields.Incarnation != strings.TrimSpace(expectedIncarnation) ||
+		fields.AgentState == string(beads.AgentStateRetiring) || fields.AgentState == string(beads.AgentStateNuked) {
+		return fmt.Errorf("%w: startup state receipt", ErrPolecatIncarnationChanged)
+	}
+	return m.SetState(name, state)
 }
 
 // assigneeID returns the beads assignee identifier for a polecat.
@@ -1184,7 +1287,7 @@ func (m *Manager) RemoveWithOptionsLocalOnly(name string, force, nuclear, selfNu
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "", nil, nil, false)
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "", nil, nil, false, nil)
 }
 
 // RemoveWithOptionsLocalOnlyIfIncarnation holds the same per-polecat lifecycle
@@ -1227,7 +1330,7 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 		_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
 		return fields, err
 	}
-	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation, beforeRetire, afterFence, false); err != nil {
+	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation, beforeRetire, afterFence, false, nil); err != nil {
 		return err
 	}
 	if afterRemove != nil {
@@ -1238,8 +1341,73 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 	return nil
 }
 
+type polecatRetirementJournal struct {
+	record           beads.AgentRetirementRecord
+	beforeFilesystem func(beads.AgentRetirementRecord) error
+	afterFilesystem  func(*beads.AgentRetirementRecord, func(string) error) error
+	resuming         bool
+}
+
+// RemoveWithOptionsLocalOnlyIfIncarnationJournaled resumes exact retirement
+// from the durable agent bead even when the worktree has already disappeared.
+func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnationJournaled(
+	name, expectedIncarnation string,
+	force, nuclear, selfNuke bool,
+	record beads.AgentRetirementRecord,
+	beforeRemove func(*Polecat) (*beads.AgentFields, error),
+	beforeFilesystem func(beads.AgentRetirementRecord) error,
+	afterFilesystem func(*beads.AgentRetirementRecord, func(string) error) error,
+) (retErr error) {
+	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
+	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
+	if expectedIncarnation == "" {
+		return fmt.Errorf("%w: missing expected incarnation", ErrPolecatIncarnationChanged)
+	}
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+	if err != nil {
+		return err
+	}
+	if fields == nil || fields.Incarnation != expectedIncarnation {
+		return fmt.Errorf("%w: expected %s", ErrPolecatIncarnationChanged, expectedIncarnation)
+	}
+	resuming := fields.AgentState == string(beads.AgentStateRetiring)
+	var beforeRetire func() (*beads.AgentFields, error)
+	if resuming {
+		record = fields.RetirementRecord()
+	} else {
+		current, loadErr := m.loadFromBeads(name)
+		if loadErr != nil {
+			return loadErr
+		}
+		if current == nil || current.Incarnation != expectedIncarnation {
+			return fmt.Errorf("%w: lifecycle snapshot", ErrPolecatIncarnationChanged)
+		}
+		beforeRetire = func() (*beads.AgentFields, error) {
+			if beforeRemove != nil {
+				return beforeRemove(current)
+			}
+			_, currentFields, loadErr := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+			return currentFields, loadErr
+		}
+	}
+	journal := &polecatRetirementJournal{
+		record: record, beforeFilesystem: beforeFilesystem,
+		afterFilesystem: afterFilesystem, resuming: resuming,
+	}
+	return m.removeWithOptionsLockedPolicy(
+		name, force, nuclear, selfNuke, false, expectedIncarnation,
+		beforeRetire, nil, false, journal,
+	)
+}
+
 func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) error {
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "", nil, nil, false)
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "", nil, nil, false, nil)
 }
 
 func (m *Manager) removeWithOptionsLockedPolicy(
@@ -1249,14 +1417,16 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	beforeRetire func() (*beads.AgentFields, error),
 	afterFence func() error,
 	allowStructurallyBrokenDirectRemoval bool,
+	journal *polecatRetirementJournal,
 ) (retErr error) {
 	retirementCommitted := false
+	resumingRetirement := journal != nil && journal.resuming
 	defer func() {
 		if retErr != nil && retirementCommitted {
 			retErr = errors.Join(ErrPolecatRetirementCommitted, retErr)
 		}
 	}()
-	if !m.exists(name) {
+	if !m.exists(name) && journal == nil {
 		return ErrPolecatNotFound
 	}
 
@@ -1266,7 +1436,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	polecatDir := m.polecatDir(name)
 
 	// Check for uncommitted work unless bypassed
-	if !nuclear {
+	if !nuclear && !resumingRetirement {
 		// ZFC #10: First try to read cleanup_status from agent bead
 		// This is the ZFC-compliant path - trust what the polecat reported
 		cleanupStatus := m.getCleanupStatusFromBead(name)
@@ -1297,7 +1467,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	// Even nuclear mode must not delete worktrees with pending MRs unless
 	// --force explicitly accepts that risk. Use the shared classifier so removal
 	// fails closed the same way recovery/listing do.
-	if !force {
+	if !force && !resumingRetirement {
 		if activeMR, blocker := m.ActiveMRRemovalBlocker(name); blocker != "" {
 			return fmt.Errorf("cannot remove polecat %s: MR %s is still pending in merge queue (%s)\nRefinery will process the MR and clean up after merge\nUse --force to override (risks data loss)", name, activeMR, blocker)
 		}
@@ -1306,7 +1476,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	// Fail closed before the durable retirement boundary if the caller's shell
 	// is inside the worktree. Once the exact incarnation is reset, a retry can
 	// no longer prove custody with the old receipt.
-	if !selfNuke {
+	if !selfNuke && !resumingRetirement {
 		cwd, cwdErr := getWorkingDirectory()
 		if cwdErr != nil {
 			return fmt.Errorf("cannot verify shell safety: current directory unavailable: %w", cwdErr)
@@ -1328,7 +1498,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	// nuking a stalled polecat (e.g., after disk space recovery) permanently loses
 	// any commits on the branch. The push is non-blocking: failures are warnings,
 	// not errors, so nuke still proceeds. See: disk-space-resilience.
-	if publishBeforeRemoval {
+	if publishBeforeRemoval && !resumingRetirement {
 		polecatGit := git.NewGit(clonePath)
 		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
 			pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
@@ -1350,7 +1520,11 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	}
 	filesystemCommitted := false
 	removeFilesystem := func() error {
-		if afterFence != nil {
+		if journal != nil && journal.beforeFilesystem != nil {
+			if err := journal.beforeFilesystem(journal.record); err != nil {
+				return err
+			}
+		} else if afterFence != nil {
 			if err := afterFence(); err != nil {
 				return err
 			}
@@ -1404,7 +1578,74 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 
 	agentID := m.agentBeadID(name)
 	var resetErr error
-	if expectedAgentFields != nil {
+	if journal != nil {
+		expected := beads.AgentFieldExpectations{Incarnation: &expectedIncarnation}
+		var revalidate func(*beads.Issue, *beads.AgentFields) error
+		if expectedAgentFields != nil {
+			expected = expectedAgentFields.LifecycleExpectations()
+			revalidate = func(_ *beads.Issue, currentFields *beads.AgentFields) error {
+				if beforeRetire == nil {
+					return errors.New("final lifecycle proof unavailable")
+				}
+				lockedFields, err := beforeRetire()
+				if err != nil {
+					return err
+				}
+				if lockedFields == nil || currentFields == nil || lockedFields.Incarnation != expectedIncarnation || currentFields.Incarnation != expectedIncarnation {
+					return fmt.Errorf("%w: lifecycle snapshot", ErrPolecatIncarnationChanged)
+				}
+				return nil
+			}
+		}
+		resetErr = m.agentBeads().RetireAgentGeneration(
+			agentID, expected, journal.record, revalidate,
+			func(record beads.AgentRetirementRecord, advance func(string) error) error {
+				advanceTo := func(phase string) error {
+					if err := advance(phase); err != nil {
+						return err
+					}
+					record.Phase = phase
+					journal.record = record
+					return nil
+				}
+				if retirementPhaseBefore(record.Phase, beads.AgentRetirementPhaseLocalRemoved) {
+					if err := removeFilesystem(); err != nil {
+						return err
+					}
+					filesystemCommitted = true
+					if err := advanceTo(beads.AgentRetirementPhaseLocalRemoved); err != nil {
+						return err
+					}
+				}
+				if retirementPhaseBefore(record.Phase, beads.AgentRetirementPhaseWorkUnassigned) {
+					if err := m.unassignWorkBeads(name); err != nil {
+						return err
+					}
+					if err := advanceTo(beads.AgentRetirementPhaseWorkUnassigned); err != nil {
+						return err
+					}
+				}
+				if journal.afterFilesystem != nil {
+					if err := journal.afterFilesystem(&record, advanceTo); err != nil {
+						return err
+					}
+				}
+				if retirementPhaseBefore(record.Phase, beads.AgentRetirementPhaseNameReleased) {
+					m.namePool.Release(name)
+					if err := m.namePool.Save(); err != nil {
+						return fmt.Errorf("saving released polecat name: %w", err)
+					}
+					if err := advanceTo(beads.AgentRetirementPhaseNameReleased); err != nil {
+						return err
+					}
+				}
+				if retirementPhaseBefore(record.Phase, beads.AgentRetirementPhaseCleanupComplete) {
+					return advanceTo(beads.AgentRetirementPhaseCleanupComplete)
+				}
+				return nil
+			},
+		)
+	} else if expectedAgentFields != nil {
 		resetErr = m.agentBeads().ResetAgentBeadForReuseIfUnchangedRevalidatedAfter(
 			agentID,
 			"polecat removed",
@@ -1455,16 +1696,35 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 		retirementCommitted = true
 	}
 
-	// Unassign work only after the exact filesystem-and-bead retirement commits.
-	m.unassignWorkBeads(name)
-
-	// Publish the name as reusable only after exact filesystem cleanup is proven.
-	m.namePool.Release(name)
-	if err := m.namePool.Save(); err != nil {
-		return fmt.Errorf("saving released polecat name: %w", err)
+	if journal == nil {
+		// Legacy removal keeps its existing ordering; exact nuke uses the durable
+		// journal above and does not clear identity before these steps commit.
+		if err := m.unassignWorkBeads(name); err != nil {
+			return err
+		}
+		m.namePool.Release(name)
+		if err := m.namePool.Save(); err != nil {
+			return fmt.Errorf("saving released polecat name: %w", err)
+		}
 	}
 
 	return nil
+}
+
+func retirementPhaseBefore(current, target string) bool {
+	order := map[string]int{
+		"":                                        0,
+		beads.AgentRetirementPhaseFenced:          1,
+		beads.AgentRetirementPhaseSessionStopped:  2,
+		beads.AgentRetirementPhaseLocalRemoved:    3,
+		beads.AgentRetirementPhaseWorkUnassigned:  4,
+		beads.AgentRetirementPhaseMoleculeCleaned: 5,
+		beads.AgentRetirementPhaseBranchVerified:  6,
+		beads.AgentRetirementPhaseBranchDeleted:   7,
+		beads.AgentRetirementPhaseNameReleased:    8,
+		beads.AgentRetirementPhaseCleanupComplete: 9,
+	}
+	return order[current] < order[target]
 }
 
 // classifyPolecatRemoval permits direct deletion only for an absent path or a
@@ -1669,7 +1929,7 @@ func (m *Manager) ReclaimBrokenIdlePolecat(name string) (retErr error) {
 		return fmt.Errorf("not safe to reclaim: %s", blocker)
 	}
 
-	return m.removeWithOptionsLockedPolicy(name, false, false, false, true, "", nil, nil, true)
+	return m.removeWithOptionsLockedPolicy(name, false, false, false, true, "", nil, nil, true, nil)
 }
 
 // verifyRemovalComplete checks that polecat directories were actually removed.
@@ -2949,15 +3209,16 @@ func (m *Manager) ClearIssue(name string) error {
 // to status=open with an empty assignee, so they can be picked up by another polecat.
 // This must be called during polecat removal to prevent orphaned beads (gt-e4u1).
 // Agent beads are skipped (handled separately by ResetAgentBeadForReuse).
-// Errors are logged as warnings but do not block removal.
-func (m *Manager) unassignWorkBeads(name string) {
+// Any failed query or update blocks exact retirement so a retry can resume
+// before the generation identity is cleared.
+func (m *Manager) unassignWorkBeads(name string) error {
 	assignee := m.assigneeID(name)
 	issues, err := m.beads.ListByAssignee(assignee)
 	if err != nil {
-		style.PrintWarning("could not list assigned beads for %s: %v", name, err)
-		return
+		return fmt.Errorf("listing assigned beads for %s: %w", name, err)
 	}
 
+	var errs []error
 	for _, issue := range activeWorkBeadsForCleanup(issues) {
 		openStatus := "open"
 		empty := ""
@@ -2965,9 +3226,10 @@ func (m *Manager) unassignWorkBeads(name string) {
 			Status:   &openStatus,
 			Assignee: &empty,
 		}); err != nil {
-			style.PrintWarning("could not unassign bead %s from %s: %v", issue.ID, name, err)
+			errs = append(errs, fmt.Errorf("unassigning bead %s from %s: %w", issue.ID, name, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func activeWorkBeadsForCleanup(issues []*beads.Issue) []*beads.Issue {

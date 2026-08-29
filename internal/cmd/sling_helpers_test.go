@@ -295,6 +295,9 @@ func TestIsSlingConfigError(t *testing.T) {
 }
 
 func TestHookBeadWithRetryFailsFastOnBdStderr(t *testing.T) {
+	previousFence := assignPolecatWorkIfCurrent
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	t.Cleanup(func() { assignPolecatWorkIfCurrent = previousFence })
 	if runtime.GOOS == "windows" {
 		t.Skip("uses Unix shell script bd stub")
 	}
@@ -337,5 +340,27 @@ exit 1
 	}
 	if got := strings.TrimSpace(string(countBytes)); got != "1" {
 		t.Fatalf("bd update invoked %s times, want 1", got)
+	}
+}
+
+func TestWithPolecatAssignmentFenceCoversAuthoritativeHookWrite(t *testing.T) {
+	previous := assignPolecatWorkIfCurrent
+	t.Cleanup(func() { assignPolecatWorkIfCurrent = previous })
+	fenceCalls, assignmentCalls := 0, 0
+	assignPolecatWorkIfCurrent = func(rigName, polecatName, townRoot string, assign func() error) error {
+		fenceCalls++
+		if rigName != "gastown" || polecatName != "nux" || townRoot != "/town" {
+			t.Fatalf("fence target = %s/%s root=%s", rigName, polecatName, townRoot)
+		}
+		return assign()
+	}
+	if err := withPolecatAssignmentFence("gastown/polecats/nux", "/town", func() error {
+		assignmentCalls++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fenceCalls != 1 || assignmentCalls != 1 {
+		t.Fatalf("calls = fence:%d assignment:%d, want 1/1", fenceCalls, assignmentCalls)
 	}
 }

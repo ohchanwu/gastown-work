@@ -732,6 +732,88 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationAllowsMissingCloneRecovery(t *te
 	}
 }
 
+func TestJournaledRetirementResumesAfterWorktreeRemovalBeforeCursorAdvance(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	runManagerGit(t, mayorRig, "worktree", "remove", "--force", p.ClonePath)
+	if err := os.RemoveAll(filepath.Dir(p.ClonePath)); err != nil {
+		t.Fatal(err)
+	}
+
+	bdPath, err := exec.LookPath("bd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+cmd=""
+for arg in "$@"; do
+  case "$arg" in --*) continue ;; esac
+  cmd="$arg"
+  break
+done
+case "$cmd" in
+  show)
+    printf '%s\n' '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: fixture-generation\nretirement_phase: fenced\nretirement_work_bead: gt-work\nretirement_clone_path: /missing/worktree"}]'
+    ;;
+  list) printf '[]\n' ;;
+  update) cat >/dev/null ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	beforeCalls, boundaryCalls, afterCalls := 0, 0, 0
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnationJournaled(
+		"toast", "fixture-generation", true, true, false, beads.AgentRetirementRecord{},
+		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil },
+		func(beads.AgentRetirementRecord) error { boundaryCalls++; return nil },
+		func(*beads.AgentRetirementRecord, func(string) error) error { afterCalls++; return nil },
+	)
+	if err != nil {
+		t.Fatalf("resuming journaled retirement: %v", err)
+	}
+	if beforeCalls != 0 || boundaryCalls != 1 || afterCalls != 1 {
+		t.Fatalf("resume callbacks = before:%d boundary:%d after:%d, want 0/1/1", beforeCalls, boundaryCalls, afterCalls)
+	}
+}
+
+func TestAssignWorkIfCurrentRejectsRetiringGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	if _, err := mgr.AddWithOptions("toast", AddOptions{}); err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	bdPath, err := exec.LookPath("bd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+cmd=""
+for arg in "$@"; do case "$arg" in --*) continue ;; esac; cmd="$arg"; break; done
+case "$cmd" in
+show) printf '%s\n' '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: fixture-generation\nretirement_phase: fenced"}]' ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	if _, err := mgr.AssignWorkIfCurrent("toast", func() error { calls++; return nil }); !errors.Is(err, ErrPolecatIncarnationChanged) {
+		t.Fatalf("assignment error = %v, want ErrPolecatIncarnationChanged", err)
+	}
+	if calls != 0 {
+		t.Fatalf("assignment callback calls = %d, want 0", calls)
+	}
+}
+
 func TestRemoveWithOptionsLocalOnlyIfIncarnationDoesNotConfuseSiblingPrefixWithWorktree(t *testing.T) {
 	mgr, _ := setupCanonicalBranchManagerTest(t)
 	_, err := mgr.AddWithOptions("toast", AddOptions{})

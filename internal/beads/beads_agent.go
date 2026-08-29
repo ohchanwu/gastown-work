@@ -41,7 +41,7 @@ func (b *Beads) lockAgentBead(id string) (*flock.Flock, error) {
 type AgentFields struct {
 	RoleType          string // polecat, witness, refinery, deacon, mayor
 	Rig               string // Rig name (empty for global agents like mayor/deacon)
-	AgentState        string // spawning, working, done, stuck, escalated, idle, running, retiring, nuked
+	AgentState        string // spawning, working, done, stuck, escalated, idle, running, completing, retiring, nuked
 	Incarnation       string // Opaque polecat lifetime ID; immutable until retirement/reuse
 	HookBead          string // Currently pinned work bead ID
 	CleanupStatus     string // ZFC: polecat self-reports git state (clean, has_uncommitted, has_stash, has_unpushed)
@@ -62,8 +62,71 @@ type AgentFields struct {
 	PushFailed      bool   // True when branch push to origin failed (gas-556)
 	CompletionTime  string // RFC3339 timestamp of when gt done was called
 
+	// Durable retirement journal. These fields remain generation-bound until
+	// every destructive and post-cleanup phase has committed.
+	RetirementPhase     string
+	RetirementWorkBead  string
+	RetirementMolecule  string
+	RetirementClonePath string
+	RetirementBranch    string
+	RetirementGitHead   string
+	RetirementGitState  string
+	RetirementTargets   []string
+
 	structuredAgentState string
 	structuredHookBead   string
+}
+
+// AgentRetirementRecord is the durable, generation-bound cleanup receipt kept
+// on an agent bead until every retirement phase has completed.
+type AgentRetirementRecord struct {
+	Phase     string
+	WorkBead  string
+	Molecule  string
+	ClonePath string
+	Branch    string
+	GitHead   string
+	GitState  string
+	Targets   []string
+}
+
+const (
+	AgentRetirementPhaseFenced          = "fenced"
+	AgentRetirementPhaseSessionStopped  = "session-stopped"
+	AgentRetirementPhaseLocalRemoved    = "local-removed"
+	AgentRetirementPhaseWorkUnassigned  = "work-unassigned"
+	AgentRetirementPhaseNameReleased    = "name-released"
+	AgentRetirementPhaseMoleculeCleaned = "molecule-cleaned"
+	AgentRetirementPhaseBranchVerified  = "branch-verified"
+	AgentRetirementPhaseBranchDeleted   = "branch-deleted"
+	AgentRetirementPhaseCleanupComplete = "cleanup-complete"
+)
+
+func (f *AgentFields) RetirementRecord() AgentRetirementRecord {
+	if f == nil {
+		return AgentRetirementRecord{}
+	}
+	return AgentRetirementRecord{
+		Phase:     f.RetirementPhase,
+		WorkBead:  f.RetirementWorkBead,
+		Molecule:  f.RetirementMolecule,
+		ClonePath: f.RetirementClonePath,
+		Branch:    f.RetirementBranch,
+		GitHead:   f.RetirementGitHead,
+		GitState:  f.RetirementGitState,
+		Targets:   append([]string(nil), f.RetirementTargets...),
+	}
+}
+
+func applyAgentRetirementRecord(fields *AgentFields, record AgentRetirementRecord) {
+	fields.RetirementPhase = record.Phase
+	fields.RetirementWorkBead = record.WorkBead
+	fields.RetirementMolecule = record.Molecule
+	fields.RetirementClonePath = record.ClonePath
+	fields.RetirementBranch = record.Branch
+	fields.RetirementGitHead = record.GitHead
+	fields.RetirementGitState = record.GitState
+	fields.RetirementTargets = append([]string(nil), record.Targets...)
 }
 
 // LifecycleExpectations captures both compatibility description fields and
@@ -175,6 +238,32 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 	if fields.CompletionTime != "" {
 		lines = append(lines, fmt.Sprintf("completion_time: %s", fields.CompletionTime))
 	}
+	if fields.RetirementPhase != "" {
+		lines = append(lines, fmt.Sprintf("retirement_phase: %s", fields.RetirementPhase))
+	}
+	if fields.RetirementWorkBead != "" {
+		lines = append(lines, fmt.Sprintf("retirement_work_bead: %s", fields.RetirementWorkBead))
+	}
+	if fields.RetirementMolecule != "" {
+		lines = append(lines, fmt.Sprintf("retirement_molecule: %s", fields.RetirementMolecule))
+	}
+	if fields.RetirementClonePath != "" {
+		lines = append(lines, fmt.Sprintf("retirement_clone_path: %s", fields.RetirementClonePath))
+	}
+	if fields.RetirementBranch != "" {
+		lines = append(lines, fmt.Sprintf("retirement_branch: %s", fields.RetirementBranch))
+	}
+	if fields.RetirementGitHead != "" {
+		lines = append(lines, fmt.Sprintf("retirement_git_head: %s", fields.RetirementGitHead))
+	}
+	if fields.RetirementGitState != "" {
+		lines = append(lines, fmt.Sprintf("retirement_git_state: %s", fields.RetirementGitState))
+	}
+	if len(fields.RetirementTargets) > 0 {
+		if encoded, err := json.Marshal(fields.RetirementTargets); err == nil {
+			lines = append(lines, fmt.Sprintf("retirement_targets: %s", encoded))
+		}
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -234,6 +323,22 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.PushFailed = value == "true"
 		case "completion_time":
 			fields.CompletionTime = value
+		case "retirement_phase":
+			fields.RetirementPhase = value
+		case "retirement_work_bead":
+			fields.RetirementWorkBead = value
+		case "retirement_molecule":
+			fields.RetirementMolecule = value
+		case "retirement_clone_path":
+			fields.RetirementClonePath = value
+		case "retirement_branch":
+			fields.RetirementBranch = value
+		case "retirement_git_head":
+			fields.RetirementGitHead = value
+		case "retirement_git_state":
+			fields.RetirementGitState = value
+		case "retirement_targets":
+			_ = json.Unmarshal([]byte(value), &fields.RetirementTargets)
 		}
 	}
 
@@ -373,6 +478,10 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	if showErr != nil {
 		// Bead doesn't exist (or can't be read) - return original create error
 		return nil, createErr
+	}
+	existingFields := agentFieldsFromIssue(existing)
+	if existingFields != nil && (existingFields.AgentState == string(AgentStateRetiring) || existingFields.AgentState == string(AgentStateCompleting)) {
+		return nil, fmt.Errorf("%w: agent_state", ErrAgentFieldsChanged)
 	}
 
 	// If bead is closed, reopen it first
@@ -568,6 +677,138 @@ func (b *Beads) resetAgentBeadForReuseRevalidated(
 	return nil
 }
 
+// RetireAgentGeneration durably records an exact generation's cleanup inputs,
+// runs resumable cleanup while holding the agent-bead lock, and clears identity
+// only after the caller commits cleanup-complete.
+func (b *Beads) RetireAgentGeneration(
+	id string,
+	expected AgentFieldExpectations,
+	record AgentRetirementRecord,
+	revalidate func(*Issue, *AgentFields) error,
+	cleanup func(AgentRetirementRecord, func(string) error) error,
+) (retErr error) {
+	if target := b.agentBeadTarget(); target != b {
+		return target.RetireAgentGeneration(id, expected, record, revalidate, cleanup)
+	}
+	if expected.Incarnation == nil || strings.TrimSpace(*expected.Incarnation) == "" {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	fl, err := b.lockAgentBead(id)
+	if err != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, err)
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	issue, err := b.Show(id)
+	if err != nil {
+		return err
+	}
+	fields := agentFieldsFromIssue(issue)
+	if fields == nil || fields.Incarnation != *expected.Incarnation {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	fenced := fields.AgentState == string(AgentStateRetiring)
+	if !fenced {
+		if err := checkAgentFieldExpectationsAllowRetiring(fields, expected); err != nil {
+			return err
+		}
+		if revalidate != nil {
+			if err := revalidate(issue, fields); err != nil {
+				return err
+			}
+		}
+		record.Phase = AgentRetirementPhaseFenced
+		fields.AgentState = string(AgentStateRetiring)
+		applyAgentRetirementRecord(fields, record)
+		description := FormatAgentDescription(issue.Title, fields)
+		if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
+			return fmt.Errorf("fencing retiring agent generation: %w", err)
+		}
+	} else {
+		record = fields.RetirementRecord()
+		if record.Phase == "" {
+			record.Phase = AgentRetirementPhaseFenced
+		}
+	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(ErrAgentRetirementFenced, retErr)
+		}
+	}()
+
+	advance := func(phase string) error {
+		record.Phase = phase
+		applyAgentRetirementRecord(fields, record)
+		description := FormatAgentDescription(issue.Title, fields)
+		if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
+			return fmt.Errorf("advancing retirement to %s: %w", phase, err)
+		}
+		return nil
+	}
+	if cleanup != nil {
+		if err := cleanup(record, advance); err != nil {
+			return err
+		}
+	}
+	if record.Phase != AgentRetirementPhaseCleanupComplete {
+		return errors.New("retirement cleanup did not commit cleanup-complete")
+	}
+
+	fields.HookBead = ""
+	fields.ActiveMR = ""
+	fields.CleanupStatus = ""
+	fields.Mode = ""
+	fields.Incarnation = ""
+	fields.AgentState = string(AgentStateNuked)
+	fields.ExitType = ""
+	fields.MRID = ""
+	fields.Branch = ""
+	fields.LastSourceIssue = ""
+	fields.MRFailed = false
+	fields.PushFailed = false
+	fields.CompletionTime = ""
+	applyAgentRetirementRecord(fields, AgentRetirementRecord{})
+	description := FormatAgentDescription(issue.Title, fields)
+	if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
+		return fmt.Errorf("resetting retired agent generation: %w", err)
+	}
+	return nil
+}
+
+// ClaimAgentCompletion atomically changes a matching live generation to the
+// completing state before gt done performs any external mutation.
+func (b *Beads) ClaimAgentCompletion(id, expectedIncarnation string) error {
+	if target := b.agentBeadTarget(); target != b {
+		return target.ClaimAgentCompletion(id, expectedIncarnation)
+	}
+	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
+	if expectedIncarnation == "" {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	fl, err := b.lockAgentBead(id)
+	if err != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, err)
+	}
+	defer func() { _ = fl.Unlock() }()
+	issue, err := b.Show(id)
+	if err != nil {
+		return err
+	}
+	fields := agentFieldsFromIssue(issue)
+	if fields == nil || fields.Incarnation != expectedIncarnation {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	switch fields.AgentState {
+	case string(AgentStateRetiring), string(AgentStateNuked):
+		return fmt.Errorf("%w: agent_state", ErrAgentFieldsChanged)
+	case string(AgentStateCompleting):
+		return nil
+	}
+	fields.AgentState = string(AgentStateCompleting)
+	description := FormatAgentDescription(issue.Title, fields)
+	return b.Update(id, UpdateOptions{Description: &description})
+}
+
 // UpdateAgentState updates the agent_state field in an agent bead.
 // bd >= 0.62.0 no longer provides a supported `bd agent state` writer, so
 // Gastown writes agent_state through the description field and readers mirror
@@ -746,6 +987,9 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 	}
 
 	fields := agentFieldsFromIssue(issue)
+	if fields != nil && fields.AgentState == string(AgentStateRetiring) {
+		return fmt.Errorf("%w: agent_state", ErrAgentFieldsChanged)
+	}
 	if expected != nil {
 		if err := checkAgentFieldExpectations(fields, *expected); err != nil {
 			return err

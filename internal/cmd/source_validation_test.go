@@ -333,6 +333,10 @@ if [ "$1" = "show" ] && [ "$2" = "gt-gastown-polecat-refuge" ]; then
   echo '[{"id":"gt-gastown-polecat-refuge","title":"Polecat refuge","status":"open","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\\nrig: gastown\\nagent_state: working\\nincarnation: fixture-generation\\nhook_bead: bd-source\\ncleanup_status: clean"}]'
   exit 0
 fi
+if [ "$1" = "update" ] && [ "$2" = "gt-gastown-polecat-refuge" ]; then
+  cat >/dev/null
+  exit 0
+fi
 if [ "$1" = "list" ]; then
   echo '[]'
   exit 0

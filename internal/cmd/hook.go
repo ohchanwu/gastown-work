@@ -391,22 +391,27 @@ func runHook(_ *cobra.Command, args []string) error {
 	const hookBaseBackoff = 500 * time.Millisecond
 	const hookBackoffMax = 10 * time.Second
 	var lastHookErr error
-	for attempt := 1; attempt <= hookMaxRetries; attempt++ {
-		if err := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
-			Dir(resolveBeadDir(beadID)).
-			StripBeadsDir().
-			WithAutoCommit().
-			Run(); err != nil {
-			lastHookErr = err
-			if attempt < hookMaxRetries {
-				backoff := slingBackoff(attempt, hookBaseBackoff, hookBackoffMax)
-				fmt.Printf("%s Hook attempt %d failed, retrying in %v...\n", style.Warning.Render("⚠"), attempt, backoff)
-				time.Sleep(backoff)
-				continue
+	if err := withPolecatAssignmentFence(agentID, townRoot, func() error {
+		for attempt := 1; attempt <= hookMaxRetries; attempt++ {
+			if err := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
+				Dir(resolveBeadDir(beadID)).
+				StripBeadsDir().
+				WithAutoCommit().
+				Run(); err != nil {
+				lastHookErr = err
+				if attempt < hookMaxRetries {
+					backoff := slingBackoff(attempt, hookBaseBackoff, hookBackoffMax)
+					fmt.Printf("%s Hook attempt %d failed, retrying in %v...\n", style.Warning.Render("⚠"), attempt, backoff)
+					time.Sleep(backoff)
+					continue
+				}
+				return fmt.Errorf("hooking bead after %d attempts: %w", hookMaxRetries, lastHookErr)
 			}
-			return fmt.Errorf("hooking bead after %d attempts: %w", hookMaxRetries, lastHookErr)
+			break
 		}
-		break
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Emit a propulsion signal if the target is the mayor.

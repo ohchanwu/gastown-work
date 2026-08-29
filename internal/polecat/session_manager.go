@@ -118,6 +118,10 @@ type SessionStartOptions struct {
 	// Incarnation is the immutable agent-bead generation receipt inherited by
 	// this exact session. Completion must present it before lifecycle writes.
 	Incarnation string
+
+	// OnStarted commits generation-bound post-start state while the lifecycle
+	// lock is still held. An error cleans up only the exact created session.
+	OnStarted func(incarnation string) error
 }
 
 // EnvAgentIncarnation binds a polecat process to the agent-bead generation
@@ -191,6 +195,27 @@ func (m *SessionManager) CaptureSessionCustody(polecat string) (SessionCustody, 
 		return SessionCustody{}, fmt.Errorf("capturing poller generation: %w", err)
 	}
 	return SessionCustody{sessionID: sessionID, generation: generation, running: running, poller: poller}, nil
+}
+
+// CaptureSessionCustodyIfIncarnation accepts a live same-name session only
+// when its immutable launch receipt belongs to the retiring generation. Proven
+// absence is safe because the lifecycle lock prevents a replacement launch.
+func (m *SessionManager) CaptureSessionCustodyIfIncarnation(polecat, expectedIncarnation string) (SessionCustody, error) {
+	custody, err := m.CaptureSessionCustody(polecat)
+	if err != nil {
+		return SessionCustody{}, err
+	}
+	if !custody.running {
+		return custody, nil
+	}
+	observed, err := m.tmux.GetEnvironment(custody.sessionID, EnvAgentIncarnation)
+	if err != nil {
+		return SessionCustody{}, fmt.Errorf("reading session incarnation: %w", err)
+	}
+	if strings.TrimSpace(observed) != strings.TrimSpace(expectedIncarnation) {
+		return SessionCustody{}, fmt.Errorf("%w: session %s incarnation changed", ErrPolecatIncarnationChanged, custody.sessionID)
+	}
+	return custody, nil
 }
 
 // StopSessionCustody stops only the generations captured by
@@ -447,26 +472,12 @@ func (m *SessionManager) polecatSlot(polecat string) int {
 
 // Start creates and starts a new session for a polecat.
 func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
-	if strings.TrimSpace(opts.Incarnation) == "" {
-		lifecycle := m.lifecycle
-		if lifecycle == nil {
-			lifecycle = NewManager(m.rig, nil, m.tmux)
-		}
-		incarnation, err := lifecycle.EnsurePolecatIncarnation(polecat)
-		if err != nil {
-			return fmt.Errorf("resolving polecat launch incarnation: %w", err)
-		}
-		opts.Incarnation = incarnation
-	}
 	return m.StartContext(context.Background(), polecat, opts)
 }
 
 // StartContext creates a polecat session under one caller-cancelable deadline.
 func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts SessionStartOptions) (retErr error) {
 	opts.Incarnation = strings.TrimSpace(opts.Incarnation)
-	if opts.Incarnation == "" {
-		return fmt.Errorf("starting polecat %s without an incarnation receipt", polecat)
-	}
 	lifecycle := m.lifecycle
 	if lifecycle == nil {
 		lifecycle = NewManager(m.rig, nil, m.tmux)
@@ -476,6 +487,11 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 		return err
 	}
 	defer func() { _ = fl.Unlock() }()
+	incarnation, err := lifecycle.resolvePolecatLaunchIncarnationLocked(polecat, opts.Incarnation)
+	if err != nil {
+		return fmt.Errorf("resolving polecat launch incarnation: %w", err)
+	}
+	opts.Incarnation = incarnation
 
 	if !m.hasPolecat(polecat) {
 		return fmt.Errorf("%w: %s", ErrPolecatNotFound, polecat)
@@ -805,6 +821,11 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 			"witness patrol will misidentify this polecat as a zombie and auto-nuke it. "+
 			"Ensure RuntimeConfig.ResolvedAgent is set during agent config resolution",
 			sessionID, runtimeConfig.Command)
+	}
+	if opts.OnStarted != nil {
+		if err := opts.OnStarted(opts.Incarnation); err != nil {
+			return fmt.Errorf("committing post-start state: %w", err)
+		}
 	}
 
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
