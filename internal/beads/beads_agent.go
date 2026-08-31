@@ -24,14 +24,22 @@ import (
 // CreateOrReopenAgentBead, ResetAgentBeadForReuse, and UpdateAgentDescriptionFields.
 // Caller must defer fl.Unlock().
 func (b *Beads) lockAgentBead(id string) (*flock.Flock, error) {
+	return b.lockAgentBeadContext(context.Background(), id)
+}
+
+func (b *Beads) lockAgentBeadContext(ctx context.Context, id string) (*flock.Flock, error) {
 	lockDir := filepath.Join(b.getResolvedBeadsDir(), ".locks")
 	if err := os.MkdirAll(lockDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating bead lock dir: %w", err)
 	}
 	lockPath := filepath.Join(lockDir, fmt.Sprintf("agent-%s.lock", id))
 	fl := flock.New(lockPath)
-	if err := fl.Lock(); err != nil {
+	locked, err := fl.TryLockContext(ctx, 25*time.Millisecond)
+	if err != nil {
 		return nil, fmt.Errorf("acquiring agent bead lock for %s: %w", id, err)
+	}
+	if !locked {
+		return nil, ctx.Err()
 	}
 	return fl, nil
 }
@@ -54,19 +62,22 @@ type AgentFields struct {
 	// Completion metadata fields (gt-x7t9).
 	// Written by gt done, read by witness survey-workers to discover
 	// completion state from beads instead of POLECAT_DONE mail.
-	ExitType        string // COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE (see witness.ExitType*)
-	MRID            string // MR bead ID (if MR was created)
-	Branch          string // Polecat working branch name
-	LastSourceIssue string // Last source/work bead ID, preserved after hook_bead is cleared
-	MRFailed        bool   // True when MR creation was attempted but failed
-	PushFailed      bool   // True when branch push to origin failed (gas-556)
-	CompletionTime  string // RFC3339 timestamp of when gt done was called
+	ExitType          string // COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE (see witness.ExitType*)
+	MRID              string // MR bead ID (if MR was created)
+	Branch            string // Polecat working branch name
+	LastSourceIssue   string // Last source/work bead ID, preserved after hook_bead is cleared
+	MRFailed          bool   // True when MR creation was attempted but failed
+	PushFailed        bool   // True when branch push to origin failed (gas-556)
+	CompletionTime    string // RFC3339 timestamp of when gt done was called
+	CompletionAttempt string // Opaque owner receipt for the current gt done process lease
 
 	// Durable retirement journal. These fields remain generation-bound until
 	// every destructive and post-cleanup phase has committed.
+	RetirementVersion   string
 	RetirementPhase     string
-	RetirementWorkBead  string
-	RetirementMolecule  string
+	RetirementHookBead  string
+	RetirementLastIssue string
+	RetirementWork      []AgentRetirementWorkReceipt
 	RetirementClonePath string
 	RetirementBranch    string
 	RetirementGitHead   string
@@ -80,17 +91,27 @@ type AgentFields struct {
 // AgentRetirementRecord is the durable, generation-bound cleanup receipt kept
 // on an agent bead until every retirement phase has completed.
 type AgentRetirementRecord struct {
-	Phase     string
-	WorkBead  string
-	Molecule  string
-	ClonePath string
-	Branch    string
-	GitHead   string
-	GitState  string
-	Targets   []string
+	Version         string
+	Phase           string
+	HookBead        string
+	LastSourceIssue string
+	WorkReceipts    []AgentRetirementWorkReceipt
+	ClonePath       string
+	Branch          string
+	GitHead         string
+	GitState        string
+	Targets         []string
+}
+
+// AgentRetirementWorkReceipt binds every authoritative work bead to the exact
+// molecule attached when the generation was fenced.
+type AgentRetirementWorkReceipt struct {
+	WorkBead string `json:"work_bead"`
+	Molecule string `json:"molecule,omitempty"`
 }
 
 const (
+	AgentRetirementJournalVersion       = "1"
 	AgentRetirementPhaseFenced          = "fenced"
 	AgentRetirementPhaseSessionStopped  = "session-stopped"
 	AgentRetirementPhaseLocalRemoved    = "local-removed"
@@ -107,26 +128,127 @@ func (f *AgentFields) RetirementRecord() AgentRetirementRecord {
 		return AgentRetirementRecord{}
 	}
 	return AgentRetirementRecord{
-		Phase:     f.RetirementPhase,
-		WorkBead:  f.RetirementWorkBead,
-		Molecule:  f.RetirementMolecule,
-		ClonePath: f.RetirementClonePath,
-		Branch:    f.RetirementBranch,
-		GitHead:   f.RetirementGitHead,
-		GitState:  f.RetirementGitState,
-		Targets:   append([]string(nil), f.RetirementTargets...),
+		Version:         f.RetirementVersion,
+		Phase:           f.RetirementPhase,
+		HookBead:        f.RetirementHookBead,
+		LastSourceIssue: f.RetirementLastIssue,
+		WorkReceipts:    append([]AgentRetirementWorkReceipt(nil), f.RetirementWork...),
+		ClonePath:       f.RetirementClonePath,
+		Branch:          f.RetirementBranch,
+		GitHead:         f.RetirementGitHead,
+		GitState:        f.RetirementGitState,
+		Targets:         append([]string(nil), f.RetirementTargets...),
 	}
 }
 
 func applyAgentRetirementRecord(fields *AgentFields, record AgentRetirementRecord) {
+	fields.RetirementVersion = record.Version
 	fields.RetirementPhase = record.Phase
-	fields.RetirementWorkBead = record.WorkBead
-	fields.RetirementMolecule = record.Molecule
+	fields.RetirementHookBead = record.HookBead
+	fields.RetirementLastIssue = record.LastSourceIssue
+	fields.RetirementWork = append([]AgentRetirementWorkReceipt(nil), record.WorkReceipts...)
 	fields.RetirementClonePath = record.ClonePath
 	fields.RetirementBranch = record.Branch
 	fields.RetirementGitHead = record.GitHead
 	fields.RetirementGitState = record.GitState
 	fields.RetirementTargets = append([]string(nil), record.Targets...)
+}
+
+var agentRetirementPhases = []string{
+	AgentRetirementPhaseFenced,
+	AgentRetirementPhaseSessionStopped,
+	AgentRetirementPhaseLocalRemoved,
+	AgentRetirementPhaseWorkUnassigned,
+	AgentRetirementPhaseMoleculeCleaned,
+	AgentRetirementPhaseBranchVerified,
+	AgentRetirementPhaseBranchDeleted,
+	AgentRetirementPhaseNameReleased,
+	AgentRetirementPhaseCleanupComplete,
+}
+
+func agentRetirementPhaseIndex(phase string) int {
+	for i, candidate := range agentRetirementPhases {
+		if phase == candidate {
+			return i
+		}
+	}
+	return -1
+}
+
+// ValidateAgentRetirementTransition permits only the next durable cleanup phase.
+func ValidateAgentRetirementTransition(current, next string) error {
+	currentIndex, nextIndex := agentRetirementPhaseIndex(current), agentRetirementPhaseIndex(next)
+	if currentIndex < 0 || nextIndex != currentIndex+1 {
+		return fmt.Errorf("invalid retirement transition %q -> %q", current, next)
+	}
+	return nil
+}
+
+// ValidateAgentRetirementRecord rejects incomplete or internally inconsistent
+// durable cleanup receipts before any destructive retirement work resumes.
+func ValidateAgentRetirementRecord(record AgentRetirementRecord) error {
+	if record.Version != AgentRetirementJournalVersion {
+		return fmt.Errorf("unsupported retirement journal version %q", record.Version)
+	}
+	if agentRetirementPhaseIndex(record.Phase) < 0 {
+		return fmt.Errorf("unknown retirement phase %q", record.Phase)
+	}
+	if record.ClonePath == "" || !filepath.IsAbs(record.ClonePath) || filepath.Clean(record.ClonePath) != record.ClonePath {
+		return fmt.Errorf("retirement clone path is not canonical: %q", record.ClonePath)
+	}
+	if strings.TrimSpace(record.GitState) == "" {
+		return errors.New("retirement Git receipt is missing")
+	}
+	if !json.Valid([]byte(record.GitState)) {
+		return errors.New("retirement Git receipt is malformed")
+	}
+	var gitState struct {
+		WorktreePresent *bool
+	}
+	if err := json.Unmarshal([]byte(record.GitState), &gitState); err != nil || gitState.WorktreePresent == nil {
+		return errors.New("retirement Git receipt lacks positive custody")
+	}
+	authoritative := make(map[string]bool, 2)
+	for _, work := range []string{record.HookBead, record.LastSourceIssue} {
+		if work = strings.TrimSpace(work); work != "" {
+			authoritative[work] = true
+		}
+	}
+	seen := make(map[string]bool, len(record.WorkReceipts))
+	previous := ""
+	for _, receipt := range record.WorkReceipts {
+		work := strings.TrimSpace(receipt.WorkBead)
+		if work == "" || seen[work] || !authoritative[work] || (previous != "" && work < previous) {
+			return errors.New("retirement work receipts are not the canonical authoritative set")
+		}
+		seen[work], previous = true, work
+	}
+	if len(seen) != len(authoritative) {
+		return errors.New("retirement work receipts are incomplete")
+	}
+	for work := range authoritative {
+		if !seen[work] {
+			return errors.New("retirement work receipts are incomplete")
+		}
+	}
+	if strings.TrimSpace(record.Branch) == "" {
+		if strings.TrimSpace(record.GitHead) != "" || len(record.Targets) != 0 {
+			return errors.New("branchless retirement has branch identity receipts")
+		}
+	} else if strings.TrimSpace(record.GitHead) == "" || len(record.Targets) == 0 {
+		return errors.New("retirement branch identity receipt is incomplete")
+	}
+	previous = ""
+	for _, target := range record.Targets {
+		if target = strings.TrimSpace(target); target == "" || (previous != "" && target <= previous) {
+			return errors.New("retirement branch targets are not canonical")
+		}
+		if record.Branch != "" && (target == record.Branch || target == "refs/heads/"+record.Branch) {
+			return errors.New("retirement branch cannot preserve itself")
+		}
+		previous = target
+	}
+	return nil
 }
 
 // LifecycleExpectations captures both compatibility description fields and
@@ -149,6 +271,7 @@ func (fields *AgentFields) LifecycleExpectations() AgentFieldExpectations {
 		MRFailed:             agentBoolPointer(fields.MRFailed),
 		PushFailed:           agentBoolPointer(fields.PushFailed),
 		CompletionTime:       agentStringPointer(fields.CompletionTime),
+		CompletionAttempt:    agentStringPointer(fields.CompletionAttempt),
 		structuredAgentState: agentStringPointer(fields.structuredAgentState),
 		structuredHookBead:   agentStringPointer(fields.structuredHookBead),
 	}
@@ -238,14 +361,25 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 	if fields.CompletionTime != "" {
 		lines = append(lines, fmt.Sprintf("completion_time: %s", fields.CompletionTime))
 	}
+	if fields.CompletionAttempt != "" {
+		lines = append(lines, fmt.Sprintf("completion_attempt: %s", fields.CompletionAttempt))
+	}
+	if fields.RetirementVersion != "" {
+		lines = append(lines, fmt.Sprintf("retirement_version: %s", fields.RetirementVersion))
+	}
 	if fields.RetirementPhase != "" {
 		lines = append(lines, fmt.Sprintf("retirement_phase: %s", fields.RetirementPhase))
 	}
-	if fields.RetirementWorkBead != "" {
-		lines = append(lines, fmt.Sprintf("retirement_work_bead: %s", fields.RetirementWorkBead))
+	if fields.RetirementHookBead != "" {
+		lines = append(lines, fmt.Sprintf("retirement_hook_bead: %s", fields.RetirementHookBead))
 	}
-	if fields.RetirementMolecule != "" {
-		lines = append(lines, fmt.Sprintf("retirement_molecule: %s", fields.RetirementMolecule))
+	if fields.RetirementLastIssue != "" {
+		lines = append(lines, fmt.Sprintf("retirement_last_source_issue: %s", fields.RetirementLastIssue))
+	}
+	if len(fields.RetirementWork) > 0 {
+		if encoded, err := json.Marshal(fields.RetirementWork); err == nil {
+			lines = append(lines, fmt.Sprintf("retirement_work_receipts: %s", encoded))
+		}
 	}
 	if fields.RetirementClonePath != "" {
 		lines = append(lines, fmt.Sprintf("retirement_clone_path: %s", fields.RetirementClonePath))
@@ -323,12 +457,20 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.PushFailed = value == "true"
 		case "completion_time":
 			fields.CompletionTime = value
+		case "completion_attempt":
+			fields.CompletionAttempt = value
+		case "retirement_version":
+			fields.RetirementVersion = value
 		case "retirement_phase":
 			fields.RetirementPhase = value
-		case "retirement_work_bead":
-			fields.RetirementWorkBead = value
-		case "retirement_molecule":
-			fields.RetirementMolecule = value
+		case "retirement_hook_bead":
+			fields.RetirementHookBead = value
+		case "retirement_last_source_issue":
+			fields.RetirementLastIssue = value
+		case "retirement_work_receipts":
+			if err := json.Unmarshal([]byte(value), &fields.RetirementWork); err != nil {
+				fields.RetirementWork = []AgentRetirementWorkReceipt{{}}
+			}
 		case "retirement_clone_path":
 			fields.RetirementClonePath = value
 		case "retirement_branch":
@@ -338,7 +480,9 @@ func ParseAgentFields(description string) *AgentFields {
 		case "retirement_git_state":
 			fields.RetirementGitState = value
 		case "retirement_targets":
-			_ = json.Unmarshal([]byte(value), &fields.RetirementTargets)
+			if err := json.Unmarshal([]byte(value), &fields.RetirementTargets); err != nil {
+				fields.RetirementTargets = []string{""}
+			}
 		}
 	}
 
@@ -582,7 +726,7 @@ func (b *Beads) ResetAgentBeadForReuseIfUnchangedRevalidatedAfter(
 		expected.ActiveMR == nil || expected.Mode == nil || expected.HookBead == nil ||
 		expected.ExitType == nil || expected.MRID == nil || expected.Branch == nil ||
 		expected.LastSourceIssue == nil || expected.MRFailed == nil || expected.PushFailed == nil ||
-		expected.CompletionTime == nil || expected.structuredAgentState == nil || expected.structuredHookBead == nil ||
+		expected.CompletionTime == nil || expected.CompletionAttempt == nil || expected.structuredAgentState == nil || expected.structuredHookBead == nil ||
 		strings.TrimSpace(*expected.Incarnation) == "" {
 		return fmt.Errorf("%w: incomplete lifecycle snapshot", ErrAgentFieldsChanged)
 	}
@@ -665,6 +809,7 @@ func (b *Beads) resetAgentBeadForReuseRevalidated(
 	fields.MRFailed = false
 	fields.PushFailed = false
 	fields.CompletionTime = ""
+	fields.CompletionAttempt = ""
 
 	// Update description with cleared fields
 	description := FormatAgentDescription(issue.Title, fields)
@@ -718,6 +863,9 @@ func (b *Beads) RetireAgentGeneration(
 			}
 		}
 		record.Phase = AgentRetirementPhaseFenced
+		if err := ValidateAgentRetirementRecord(record); err != nil {
+			return err
+		}
 		fields.AgentState = string(AgentStateRetiring)
 		applyAgentRetirementRecord(fields, record)
 		description := FormatAgentDescription(issue.Title, fields)
@@ -726,8 +874,8 @@ func (b *Beads) RetireAgentGeneration(
 		}
 	} else {
 		record = fields.RetirementRecord()
-		if record.Phase == "" {
-			record.Phase = AgentRetirementPhaseFenced
+		if err := ValidateAgentRetirementRecord(record); err != nil {
+			return fmt.Errorf("invalid durable retirement journal: %w", err)
 		}
 	}
 	defer func() {
@@ -737,6 +885,9 @@ func (b *Beads) RetireAgentGeneration(
 	}()
 
 	advance := func(phase string) error {
+		if err := ValidateAgentRetirementTransition(record.Phase, phase); err != nil {
+			return err
+		}
 		record.Phase = phase
 		applyAgentRetirementRecord(fields, record)
 		description := FormatAgentDescription(issue.Title, fields)
@@ -767,6 +918,7 @@ func (b *Beads) RetireAgentGeneration(
 	fields.MRFailed = false
 	fields.PushFailed = false
 	fields.CompletionTime = ""
+	fields.CompletionAttempt = ""
 	applyAgentRetirementRecord(fields, AgentRetirementRecord{})
 	description := FormatAgentDescription(issue.Title, fields)
 	if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
@@ -777,13 +929,14 @@ func (b *Beads) RetireAgentGeneration(
 
 // ClaimAgentCompletion atomically changes a matching live generation to the
 // completing state before gt done performs any external mutation.
-func (b *Beads) ClaimAgentCompletion(id, expectedIncarnation string) error {
+func (b *Beads) ClaimAgentCompletion(id, expectedIncarnation, attempt string) error {
 	if target := b.agentBeadTarget(); target != b {
-		return target.ClaimAgentCompletion(id, expectedIncarnation)
+		return target.ClaimAgentCompletion(id, expectedIncarnation, attempt)
 	}
 	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
-	if expectedIncarnation == "" {
-		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	attempt = strings.TrimSpace(attempt)
+	if expectedIncarnation == "" || attempt == "" {
+		return fmt.Errorf("%w: completion receipt", ErrAgentFieldsChanged)
 	}
 	fl, err := b.lockAgentBead(id)
 	if err != nil {
@@ -799,12 +952,15 @@ func (b *Beads) ClaimAgentCompletion(id, expectedIncarnation string) error {
 		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
 	}
 	switch fields.AgentState {
-	case string(AgentStateRetiring), string(AgentStateNuked):
-		return fmt.Errorf("%w: agent_state", ErrAgentFieldsChanged)
 	case string(AgentStateCompleting):
-		return nil
+		// The manager's process lease proves the prior owner exited. Replace its
+		// stale receipt so this exact attempt can resume checkpoints safely.
+	case string(AgentStateWorking), string(AgentStateRunning), string(AgentStateSpawning):
+	default:
+		return fmt.Errorf("%w: agent_state", ErrAgentFieldsChanged)
 	}
 	fields.AgentState = string(AgentStateCompleting)
+	fields.CompletionAttempt = attempt
 	description := FormatAgentDescription(issue.Title, fields)
 	return b.Update(id, UpdateOptions{Description: &description})
 }
@@ -838,13 +994,14 @@ type AgentFieldUpdates struct {
 	Mode              *string
 	HookBead          *string // Clear hook_bead on completion (gt-qbh)
 	// Completion metadata fields (gt-x7t9)
-	ExitType        *string
-	MRID            *string
-	Branch          *string
-	LastSourceIssue *string
-	MRFailed        *bool
-	PushFailed      *bool // True when branch push to origin failed (gas-556)
-	CompletionTime  *string
+	ExitType          *string
+	MRID              *string
+	Branch            *string
+	LastSourceIssue   *string
+	MRFailed          *bool
+	PushFailed        *bool // True when branch push to origin failed (gas-556)
+	CompletionTime    *string
+	CompletionAttempt *string
 }
 
 // AgentFieldExpectations specifies description fields that must still have
@@ -864,6 +1021,7 @@ type AgentFieldExpectations struct {
 	MRFailed             *bool
 	PushFailed           *bool
 	CompletionTime       *string
+	CompletionAttempt    *string
 	structuredAgentState *string
 	structuredHookBead   *string
 }
@@ -908,7 +1066,7 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return b.updateAgentDescriptionFieldsLocked(id, nil, updates, nil)
+	return b.updateAgentDescriptionFieldsLocked(id, nil, updates, nil, false)
 }
 
 // UpdateAgentDescriptionFieldsIfIncarnation applies lifecycle writes only to
@@ -924,6 +1082,37 @@ func (b *Beads) UpdateAgentDescriptionFieldsIfIncarnation(
 		id,
 		AgentFieldExpectations{Incarnation: &expectedIncarnation},
 		updates,
+	)
+}
+
+// UpdateAgentDescriptionFieldsIfIncarnationContext is the cancellation-aware
+// form used by lifecycle control-plane operations.
+func (b *Beads) UpdateAgentDescriptionFieldsIfIncarnationContext(
+	ctx context.Context,
+	id, expectedIncarnation string,
+	updates AgentFieldUpdates,
+) error {
+	if strings.TrimSpace(expectedIncarnation) == "" {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	if target := b.agentBeadTarget(); target != b {
+		return target.UpdateAgentDescriptionFieldsIfIncarnationContext(ctx, id, expectedIncarnation, updates)
+	}
+	if err := validateAgentFieldUpdates(updates); err != nil {
+		return err
+	}
+	fl, err := b.lockAgentBeadContext(ctx, id)
+	if err != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, err)
+	}
+	defer func() { _ = fl.Unlock() }()
+	return b.updateAgentDescriptionFieldsLockedContext(
+		ctx,
+		id,
+		&AgentFieldExpectations{Incarnation: &expectedIncarnation},
+		updates,
+		nil,
+		false,
 	)
 }
 
@@ -972,7 +1161,36 @@ func (b *Beads) compareRevalidateAndUpdateAgentDescriptionFields(
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return b.updateAgentDescriptionFieldsLocked(id, &expected, updates, revalidate)
+	return b.updateAgentDescriptionFieldsLocked(id, &expected, updates, revalidate, false)
+}
+
+// UpdateAgentDescriptionFieldsIfCompletionOwner permits lifecycle writes only
+// for the exact process attempt that owns the durable completing generation.
+func (b *Beads) UpdateAgentDescriptionFieldsIfCompletionOwner(
+	id, expectedIncarnation, expectedAttempt string,
+	updates AgentFieldUpdates,
+) error {
+	if target := b.agentBeadTarget(); target != b {
+		return target.UpdateAgentDescriptionFieldsIfCompletionOwner(id, expectedIncarnation, expectedAttempt, updates)
+	}
+	if strings.TrimSpace(expectedIncarnation) == "" || strings.TrimSpace(expectedAttempt) == "" {
+		return fmt.Errorf("%w: completion owner", ErrAgentFieldsChanged)
+	}
+	if err := validateAgentFieldUpdates(updates); err != nil {
+		return err
+	}
+	fl, err := b.lockAgentBead(id)
+	if err != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, err)
+	}
+	defer func() { _ = fl.Unlock() }()
+	state := string(AgentStateCompleting)
+	expected := AgentFieldExpectations{
+		AgentState:        &state,
+		Incarnation:       &expectedIncarnation,
+		CompletionAttempt: &expectedAttempt,
+	}
+	return b.updateAgentDescriptionFieldsLocked(id, &expected, updates, nil, true)
 }
 
 func (b *Beads) updateAgentDescriptionFieldsLocked(
@@ -980,14 +1198,26 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 	expected *AgentFieldExpectations,
 	updates AgentFieldUpdates,
 	revalidate func(*Issue, *AgentFields) error,
+	allowCompletionOwner bool,
 ) error {
-	issue, err := b.Show(id)
+	return b.updateAgentDescriptionFieldsLockedContext(context.Background(), id, expected, updates, revalidate, allowCompletionOwner)
+}
+
+func (b *Beads) updateAgentDescriptionFieldsLockedContext(
+	ctx context.Context,
+	id string,
+	expected *AgentFieldExpectations,
+	updates AgentFieldUpdates,
+	revalidate func(*Issue, *AgentFields) error,
+	allowCompletionOwner bool,
+) error {
+	issue, err := b.ShowContext(ctx, id)
 	if err != nil {
 		return err
 	}
 
 	fields := agentFieldsFromIssue(issue)
-	if fields != nil && fields.AgentState == string(AgentStateRetiring) {
+	if fields != nil && agentLifecycleFrozen(fields.AgentState) && !allowCompletionOwner {
 		return fmt.Errorf("%w: agent_state", ErrAgentFieldsChanged)
 	}
 	if expected != nil {
@@ -1003,6 +1233,9 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 
 	if updates.AgentState != nil {
 		fields.AgentState = *updates.AgentState
+		if fields.AgentState != string(AgentStateCompleting) {
+			fields.CompletionAttempt = ""
+		}
 	}
 	if updates.CleanupStatus != nil {
 		fields.CleanupStatus = *updates.CleanupStatus
@@ -1041,16 +1274,29 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 	if updates.CompletionTime != nil {
 		fields.CompletionTime = *updates.CompletionTime
 	}
+	if updates.CompletionAttempt != nil {
+		fields.CompletionAttempt = *updates.CompletionAttempt
+	}
 
 	description := FormatAgentDescription(issue.Title, fields)
-	return b.Update(id, UpdateOptions{Description: &description})
+	return b.UpdateContext(ctx, id, UpdateOptions{Description: &description})
 }
 
 func checkAgentFieldExpectations(fields *AgentFields, expected AgentFieldExpectations) error {
-	if fields != nil && expected.Incarnation != nil && fields.AgentState == string(AgentStateRetiring) {
+	if fields != nil && expected.Incarnation != nil && agentLifecycleFrozen(fields.AgentState) &&
+		!(fields.AgentState == string(AgentStateCompleting) && expected.CompletionAttempt != nil) {
 		return fmt.Errorf("%w: agent_state", ErrAgentFieldsChanged)
 	}
 	return checkAgentFieldExpectationsAllowRetiring(fields, expected)
+}
+
+func agentLifecycleFrozen(state string) bool {
+	switch state {
+	case string(AgentStateCompleting), string(AgentStateRetiring), string(AgentStateNuked):
+		return true
+	default:
+		return false
+	}
 }
 
 func checkAgentFieldExpectationsAllowRetiring(fields *AgentFields, expected AgentFieldExpectations) error {
@@ -1073,6 +1319,7 @@ func checkAgentFieldExpectationsAllowRetiring(fields *AgentFields, expected Agen
 		{name: "branch", want: expected.Branch, current: fields.Branch},
 		{name: "last_source_issue", want: expected.LastSourceIssue, current: fields.LastSourceIssue},
 		{name: "completion_time", want: expected.CompletionTime, current: fields.CompletionTime},
+		{name: "completion_attempt", want: expected.CompletionAttempt, current: fields.CompletionAttempt},
 		{name: "structured_agent_state", want: expected.structuredAgentState, current: fields.structuredAgentState},
 		{name: "structured_hook_bead", want: expected.structuredHookBead, current: fields.structuredHookBead},
 	}
@@ -1117,6 +1364,14 @@ func (b *Beads) UpdateAgentActiveMRIfIncarnation(id, expectedIncarnation, active
 	return b.UpdateAgentDescriptionFieldsIfIncarnation(id, expectedIncarnation, AgentFieldUpdates{ActiveMR: &activeMR})
 }
 
+// UpdateAgentActiveMRIfCompletionOwner allows the exact completion attempt to
+// persist its MR while ordinary writers remain frozen out of completing state.
+func (b *Beads) UpdateAgentActiveMRIfCompletionOwner(id, expectedIncarnation, expectedAttempt, activeMR string) error {
+	return b.UpdateAgentDescriptionFieldsIfCompletionOwner(
+		id, expectedIncarnation, expectedAttempt, AgentFieldUpdates{ActiveMR: &activeMR},
+	)
+}
+
 // UpdateAgentIfIncarnation applies non-description issue updates only when the
 // agent bead still belongs to the caller's generation.
 func (b *Beads) UpdateAgentIfIncarnation(id, expectedIncarnation string, updates UpdateOptions) error {
@@ -1136,10 +1391,106 @@ func (b *Beads) UpdateAgentIfIncarnation(id, expectedIncarnation string, updates
 	if err != nil {
 		return err
 	}
-	if fields := agentFieldsFromIssue(issue); fields == nil || fields.Incarnation != expectedIncarnation || fields.AgentState == string(AgentStateRetiring) {
+	if fields := agentFieldsFromIssue(issue); fields == nil || fields.Incarnation != expectedIncarnation || agentLifecycleFrozen(fields.AgentState) {
 		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
 	}
 	return b.Update(id, updates)
+}
+
+// CompareAndRestoreIssueStatusIfAssignee restores startup-mutated work state
+// only while both the exact assignee and the state written by startup remain.
+func (b *Beads) CompareAndRestoreIssueStatusIfAssignee(id, expectedStatus, expectedAssignee, restoreStatus string) error {
+	return b.CompareAndRestoreIssueAssignmentIfMatches(id, expectedStatus, expectedAssignee, restoreStatus, expectedAssignee)
+}
+
+// CompareAndRestoreIssueAssignmentIfMatches restores status and assignee only
+// while both values written by the failed transaction still match.
+func (b *Beads) CompareAndRestoreIssueAssignmentIfMatches(id, expectedStatus, expectedAssignee, restoreStatus, restoreAssignee string) error {
+	if !b.noRoute {
+		if target := b.forIssueID(id); target != b {
+			return target.CompareAndRestoreIssueAssignmentIfMatches(id, expectedStatus, expectedAssignee, restoreStatus, restoreAssignee)
+		}
+	}
+	if handled, err := b.compareAndUpdateIssueAssignment(id, expectedStatus, expectedAssignee, restoreStatus, restoreAssignee); handled {
+		return err
+	}
+	fl, err := b.lockAgentBead(id)
+	if err != nil {
+		return fmt.Errorf("locking work bead %s: %w", id, err)
+	}
+	defer func() { _ = fl.Unlock() }()
+	issue, err := b.Show(id)
+	if err != nil {
+		return err
+	}
+	if issue.Status != expectedStatus || issue.Assignee != expectedAssignee {
+		return fmt.Errorf("%w: work status or assignee", ErrAgentFieldsChanged)
+	}
+	return b.Update(id, UpdateOptions{Status: &restoreStatus, Assignee: &restoreAssignee})
+}
+
+// UpdateAgentIfCompletionOwner applies label/checkpoint writes for the exact
+// completion attempt while ordinary issue writers remain frozen out.
+func (b *Beads) UpdateAgentIfCompletionOwner(id, expectedIncarnation, expectedAttempt string, updates UpdateOptions) error {
+	if target := b.agentBeadTarget(); target != b {
+		return target.UpdateAgentIfCompletionOwner(id, expectedIncarnation, expectedAttempt, updates)
+	}
+	if strings.TrimSpace(expectedIncarnation) == "" || strings.TrimSpace(expectedAttempt) == "" {
+		return fmt.Errorf("%w: completion owner", ErrAgentFieldsChanged)
+	}
+	fl, err := b.lockAgentBead(id)
+	if err != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, err)
+	}
+	defer func() { _ = fl.Unlock() }()
+	issue, err := b.Show(id)
+	if err != nil {
+		return err
+	}
+	fields := agentFieldsFromIssue(issue)
+	if fields == nil || fields.Incarnation != expectedIncarnation ||
+		fields.AgentState != string(AgentStateCompleting) || fields.CompletionAttempt != expectedAttempt {
+		return fmt.Errorf("%w: completion owner", ErrAgentFieldsChanged)
+	}
+	return b.Update(id, updates)
+}
+
+// FinalizeAgentCompletionIfOwner atomically releases the completing state and
+// removes its recovery markers for the exact completion process owner.
+func (b *Beads) FinalizeAgentCompletionIfOwner(id, expectedIncarnation, expectedAttempt string, finalState AgentState) error {
+	if target := b.agentBeadTarget(); target != b {
+		return target.FinalizeAgentCompletionIfOwner(id, expectedIncarnation, expectedAttempt, finalState)
+	}
+	if strings.TrimSpace(expectedIncarnation) == "" || strings.TrimSpace(expectedAttempt) == "" {
+		return fmt.Errorf("%w: completion owner", ErrAgentFieldsChanged)
+	}
+	if finalState != AgentStateDone && finalState != AgentStateStuck {
+		return fmt.Errorf("invalid final completion state %q", finalState)
+	}
+	fl, err := b.lockAgentBead(id)
+	if err != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, err)
+	}
+	defer func() { _ = fl.Unlock() }()
+	issue, err := b.Show(id)
+	if err != nil {
+		return err
+	}
+	fields := agentFieldsFromIssue(issue)
+	if fields == nil || fields.Incarnation != expectedIncarnation ||
+		fields.AgentState != string(AgentStateCompleting) || fields.CompletionAttempt != expectedAttempt {
+		return fmt.Errorf("%w: completion owner", ErrAgentFieldsChanged)
+	}
+	fields.AgentState = string(finalState)
+	fields.CompletionAttempt = ""
+	description := FormatAgentDescription(issue.Title, fields)
+	removeLabels := make([]string, 0)
+	for _, label := range issue.Labels {
+		if strings.HasPrefix(label, "done-intent:") || strings.HasPrefix(label, "done-cp:") {
+			removeLabels = append(removeLabels, label)
+		}
+	}
+	return b.Update(id, UpdateOptions{Description: &description, RemoveLabels: removeLabels})
 }
 
 // ClearAgentActiveMRIfMatches clears active_mr only when it still references
@@ -1173,6 +1524,9 @@ func (b *Beads) ClearAgentActiveMRIfMatches(id string, expectedMR string) (bool,
 	}
 
 	fields := ParseAgentFields(issue.Description)
+	if agentLifecycleFrozen(fields.AgentState) {
+		return false, fmt.Errorf("%w: agent lifecycle is %s", ErrAgentFieldsChanged, fields.AgentState)
+	}
 	if strings.TrimSpace(fields.ActiveMR) != expectedMR {
 		return false, nil
 	}
@@ -1221,6 +1575,22 @@ func (b *Beads) UpdateAgentCompletionIfIncarnation(id, expectedIncarnation strin
 	return b.updateAgentCompletion(id, expectedIncarnation, meta)
 }
 
+// UpdateAgentCompletionIfOwner writes completion metadata for the exact
+// completion process that owns the durable attempt receipt.
+func (b *Beads) UpdateAgentCompletionIfOwner(id, expectedIncarnation, expectedAttempt string, meta *CompletionMetadata) error {
+	mrFailed := meta.MRFailed
+	pushFailed := meta.PushFailed
+	return b.UpdateAgentDescriptionFieldsIfCompletionOwner(id, expectedIncarnation, expectedAttempt, AgentFieldUpdates{
+		ExitType:        &meta.ExitType,
+		MRID:            &meta.MRID,
+		Branch:          &meta.Branch,
+		LastSourceIssue: &meta.HookBead,
+		MRFailed:        &mrFailed,
+		PushFailed:      &pushFailed,
+		CompletionTime:  &meta.CompletionTime,
+	})
+}
+
 func (b *Beads) updateAgentCompletion(id, expectedIncarnation string, meta *CompletionMetadata) error {
 	mrFailed := meta.MRFailed
 	pushFailed := meta.PushFailed
@@ -1249,13 +1619,14 @@ func (b *Beads) ClearAgentCompletion(id string) error {
 	empty := ""
 	notFailed := false
 	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{
-		ExitType:        &empty,
-		MRID:            &empty,
-		Branch:          &empty,
-		LastSourceIssue: &empty,
-		MRFailed:        &notFailed,
-		PushFailed:      &notFailed,
-		CompletionTime:  &empty,
+		ExitType:          &empty,
+		MRID:              &empty,
+		Branch:            &empty,
+		LastSourceIssue:   &empty,
+		MRFailed:          &notFailed,
+		PushFailed:        &notFailed,
+		CompletionTime:    &empty,
+		CompletionAttempt: &empty,
 	})
 }
 
@@ -1278,11 +1649,16 @@ func (b *Beads) GetAgentNotificationLevel(id string) (string, error) {
 // GetAgentBead retrieves an agent bead by ID.
 // Returns nil if not found.
 func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
+	return b.GetAgentBeadContext(context.Background(), id)
+}
+
+// GetAgentBeadContext retrieves an agent bead and honors caller cancellation.
+func (b *Beads) GetAgentBeadContext(ctx context.Context, id string) (*Issue, *AgentFields, error) {
 	if target := b.agentBeadTarget(); target != b {
-		return target.GetAgentBead(id)
+		return target.GetAgentBeadContext(ctx, id)
 	}
 
-	issue, err := b.Show(id)
+	issue, err := b.ShowContext(ctx, id)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, nil, nil

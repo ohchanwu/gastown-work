@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -151,7 +152,7 @@ func runConvoyScheduleByID(convoyID string, opts convoyScheduleOpts) error {
 // runConvoySlingByID immediately dispatches all open tracked issues of a convoy.
 // Used when max_polecats=-1 (direct dispatch mode). Each tracked issue gets its
 // own polecat via executeSling(). Sets NoConvoy=true since issues are already tracked.
-func runConvoySlingByID(convoyID string, opts convoyScheduleOpts) error {
+func runConvoySlingByID(ctx context.Context, convoyID string, opts convoyScheduleOpts) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return err
@@ -240,6 +241,7 @@ func runConvoySlingByID(convoyID string, opts convoyScheduleOpts) error {
 
 		fmt.Printf("\n[%d/%d] Dispatching %s → %s...\n", i+1, len(candidates), c.ID, c.RigName)
 		_, err := executeSling(SlingParams{
+			Context:       ctx,
 			BeadID:        c.ID,
 			RigName:       c.RigName,
 			FormulaName:   formula,

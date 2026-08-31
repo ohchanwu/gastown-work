@@ -2192,6 +2192,41 @@ func (g *Git) DeleteBranch(name string, force bool) error {
 	return err
 }
 
+// DeleteBranchIfMatches atomically deletes a local branch only while its ref
+// still names the exact object previously verified by the caller.
+func (g *Git) DeleteBranchIfMatches(name, expectedOID string) error {
+	name = strings.TrimSpace(name)
+	expectedOID = strings.TrimSpace(expectedOID)
+	if name == "" || expectedOID == "" {
+		return errors.New("branch and expected OID are required")
+	}
+	if err := g.ValidateBranchName(name); err != nil {
+		return err
+	}
+	if (len(expectedOID) != 40 && len(expectedOID) != 64) || strings.Trim(expectedOID, "0123456789abcdef") != "" {
+		return fmt.Errorf("expected branch OID must be a canonical full object ID: %q", expectedOID)
+	}
+	if _, err := g.run("cat-file", "-e", expectedOID+"^{commit}"); err != nil {
+		return fmt.Errorf("invalid expected branch OID %q: %w", expectedOID, err)
+	}
+	if _, err := g.run("update-ref", "-d", "refs/heads/"+name, expectedOID); err != nil {
+		return fmt.Errorf("deleting branch %s at expected OID %s: %w", name, expectedOID, err)
+	}
+	return nil
+}
+
+// ValidateBranchName applies Git's canonical branch-name boundary.
+func (g *Git) ValidateBranchName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("branch name is required")
+	}
+	if _, err := g.run("check-ref-format", "--branch", name); err != nil {
+		return fmt.Errorf("invalid branch name %q: %w", name, err)
+	}
+	return nil
+}
+
 // ListBranches returns all local branches matching a pattern.
 // Pattern uses git's pattern matching (e.g., "polecat/*" matches all polecat branches).
 // Returns branch names without the refs/heads/ prefix.

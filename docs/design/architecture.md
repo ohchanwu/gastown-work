@@ -169,6 +169,21 @@ remain unchanged, and dry-run lists destructive actions only when the real
 command could execute them. Dog status similarly returns tmux transport failures
 instead of rendering unknown custody as a successful human or JSON response.
 
+Destructive molecule cleanup is generation-bound to the detach attempt. Before
+detach, Gas Town records compact hashes for the normalized root and transitive
+child set plus the exact work-to-root bonds. Cleanup revalidates that graph and
+closes its members and bonds in one serializable Dolt transaction; any changed
+root, replacement bond, or late descendant aborts without a partial close. The
+audit reader streams records of any supported size, terminal cleanup phases are
+monotonic, and deferred SQL rollback/reset work is time-bounded.
+
+Forced reassignment keeps the prior owner viable until replacement custody is
+committed. The retirement request names both incarnations, Witness revalidates
+the live replacement and retires only the exact old generation, and the sender
+keeps the attempt pending until an exact same-thread durable ACK exists.
+Same-name replacement skips shutdown of the new incarnation. Accepted and
+aborted retirement records move out of the active retry directory.
+
 ## Storage Layer: Dolt SQL Server
 
 All beads data is stored in a single Dolt SQL Server process per town. There is

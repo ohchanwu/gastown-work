@@ -413,6 +413,26 @@ func StopPollerGeneration(townRoot, session string, generation PollerGeneration)
 	return stopPoller(townRoot, session, &generation)
 }
 
+// StopPollerGenerationContext stops the exact captured generation while
+// honoring cancellation during lock acquisition and exit confirmation.
+func StopPollerGenerationContext(ctx context.Context, townRoot, session string, generation PollerGeneration) error {
+	lock, err := lockPollerContext(ctx, townRoot, session)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Unlock() }()
+	return stopPollerWithExpectedGenerationOpsLocked(
+		townRoot, session, &generation,
+		os.ReadFile, pollerProcessAlive, lookupPollerIdentity,
+		func(data []byte) error { return os.WriteFile(pollerStopFile(townRoot, session), data, 0600) },
+		func(pid int, record pollerRecord) error { return waitPollerExitContext(ctx, pid, record) },
+		func(path string, data []byte) error {
+			return quarantinePollerRecord(path, data, func(destination string) error { return os.Rename(path, destination) })
+		},
+		os.Remove,
+	)
+}
+
 type pollerTransitionOps struct {
 	read       func(string) ([]byte, error)
 	alive      func(int) bool

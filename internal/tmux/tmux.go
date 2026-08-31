@@ -1522,6 +1522,11 @@ func (t *Tmux) CaptureSessionGeneration(name string) (SessionGeneration, error) 
 	return t.captureSessionGenerationContext(context.Background(), name)
 }
 
+// CaptureSessionGenerationContext is CaptureSessionGeneration with caller cancellation.
+func (t *Tmux) CaptureSessionGenerationContext(ctx context.Context, name string) (SessionGeneration, error) {
+	return t.captureSessionGenerationContext(ctx, name)
+}
+
 func (t *Tmux) captureSessionGenerationContext(ctx context.Context, name string) (SessionGeneration, error) {
 	if err := validateSessionName(name); err != nil {
 		return SessionGeneration{}, err
@@ -4959,29 +4964,38 @@ func (t *Tmux) ResolveCurrentSession() (string, error) {
 // ResolveCurrentPaneOwner returns the durable pane PID and session containing
 // the calling process.
 func (t *Tmux) ResolveCurrentPaneOwner() (int, string, error) {
-	out, err := t.run("list-panes", "-a", "-F", "#{pane_pid} #{session_name}")
+	_, pid, session, err := t.ResolveCurrentPaneGeneration()
+	return pid, session, err
+}
+
+// ResolveCurrentPaneGeneration returns the exact tmux pane ID, its durable
+// root PID, and session containing the calling process.
+func (t *Tmux) ResolveCurrentPaneGeneration() (string, int, string, error) {
+	out, err := t.run("list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}\t#{session_name}")
 	if err != nil {
-		return 0, "", fmt.Errorf("listing panes: %w", err)
+		return "", 0, "", fmt.Errorf("listing panes: %w", err)
 	}
 
 	paneSessions := make(map[int]string)
+	paneIDs := make(map[int]string)
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 || !validPaneIDRe.MatchString(parts[0]) {
 			continue
 		}
-		pid, err := strconv.Atoi(parts[0])
+		pid, err := strconv.Atoi(parts[1])
 		if err != nil {
 			continue
 		}
-		paneSessions[pid] = parts[1]
+		paneIDs[pid] = parts[0]
+		paneSessions[pid] = parts[2]
 	}
 
 	if pid, session, ok := resolvePaneOwner(os.Getpid(), paneSessions, parentPID); ok {
-		return pid, session, nil
+		return paneIDs[pid], pid, session, nil
 	}
 
-	return 0, "", fmt.Errorf("no tmux pane ancestor found for pid %d", os.Getpid())
+	return "", 0, "", fmt.Errorf("no tmux pane ancestor found for pid %d", os.Getpid())
 }
 
 func resolvePaneOwner(pid int, paneSessions map[int]string, parent func(int) (int, error)) (int, string, bool) {

@@ -54,6 +54,10 @@ func EncodeSessionCustodyPaths(paths []string) (string, error) {
 // must fail closed rather than fall back to ancestry scanning.
 var ErrSessionCustodyUnsupported = errors.New("generation-bound session containment is unavailable")
 
+// SessionCustodyLaunchSupported reports whether this platform can launch the
+// trusted parent-side broker required for destructive lifecycle work.
+func SessionCustodyLaunchSupported() bool { return sessionCustodyLaunchSupported() }
+
 type sessionCustodyHandle interface {
 	Freeze(context.Context) error
 	Kill(context.Context) (bool, error)
@@ -112,6 +116,12 @@ func RunSessionCustodyCommandWithBroker(custody, command string, validate Sessio
 // RunSessionCustodyCommandWithBrokerPolicy also accepts a narrow policy for
 // workers that must finish after the requesting session begins teardown.
 func RunSessionCustodyCommandWithBrokerPolicy(custody, command string, validate SessionBrokerValidator, detach SessionBrokerDetachPolicy) error {
+	return RunSessionCustodyCommandWithBrokerExecutorPolicy(custody, command, validate, detach, nil)
+}
+
+// RunSessionCustodyCommandWithBrokerExecutorPolicy also permits a narrow
+// trusted-parent executor for commands that must never re-enter public Cobra.
+func RunSessionCustodyCommandWithBrokerExecutorPolicy(custody, command string, validate SessionBrokerValidator, detach SessionBrokerDetachPolicy, execute SessionBrokerExecutor) error {
 	if !validSessionGenerationRe.MatchString(custody) {
 		return errors.New("invalid session custody token")
 	}
@@ -124,7 +134,7 @@ func RunSessionCustodyCommandWithBrokerPolicy(custody, command string, validate 
 	if validate == nil {
 		return errors.New("session broker validator is unavailable")
 	}
-	return runSessionWithCustody(custody, command, validate, detach)
+	return runSessionWithCustody(custody, command, validate, detach, execute)
 }
 
 // RunSessionCustodyInit enters the trusted namespace-init path selected by the

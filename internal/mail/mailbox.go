@@ -33,6 +33,10 @@ var (
 	ErrMailWorkRequiresLifecycle = errors.New("mail work requires its lifecycle command")
 )
 
+// LifecycleRejectedLabel durably removes rejected lifecycle requests from the
+// trusted dispatcher without deleting their audit record.
+const LifecycleRejectedLabel = "lifecycle:rejected"
+
 // Mailbox manages messages for an identity via beads.
 // When store is non-nil, beads-mode methods use the in-process beadsdk.Storage
 // directly instead of shelling out to the bd CLI.
@@ -112,24 +116,50 @@ func (m *Mailbox) lockLegacy() (*flock.Flock, error) {
 
 // List returns all open messages in the mailbox.
 func (m *Mailbox) List() ([]*Message, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.ListContext(ctx)
+}
+
+// ListContext returns all open messages and honors caller cancellation.
+func (m *Mailbox) ListContext(ctx context.Context) ([]*Message, error) {
 	if m.legacy {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return m.listLegacy()
 	}
-	return m.listBeads(false)
+	return m.listBeadsContext(ctx, false)
 }
 
 // ListAll includes completed actionable work while keeping archived legacy mail hidden.
 func (m *Mailbox) ListAll() ([]*Message, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.ListAllContext(ctx)
+}
+
+// ListAllContext includes completed actionable work and honors caller cancellation.
+func (m *Mailbox) ListAllContext(ctx context.Context) ([]*Message, error) {
 	if m.legacy {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return m.listLegacy()
 	}
-	return m.listBeads(true)
+	return m.listBeadsContext(ctx, true)
 }
 
 func (m *Mailbox) listBeads(includeClosedWork bool) ([]*Message, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.listBeadsContext(ctx, includeClosedWork)
+}
+
+func (m *Mailbox) listBeadsContext(ctx context.Context, includeClosedWork bool) ([]*Message, error) {
 	// Single query to beads - returns both persistent and wisp messages
 	// Wisps are stored in the same DB with ephemeral=true, not synced to git.
-	messages, err := m.listFromDir(m.beadsDir, includeClosedWork)
+	messages, err := m.listFromDirContext(ctx, m.beadsDir, includeClosedWork)
 	if err != nil {
 		return nil, err
 	}
@@ -154,9 +184,15 @@ func (m *Mailbox) listBeads(includeClosedWork bool) ([]*Message, error) {
 // memory footprint under concurrent agent load. A separate CC query fetches
 // messages where this identity is CC'd.
 func (m *Mailbox) listFromDir(beadsDir string, includeClosedWork bool) ([]*Message, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.listFromDirContext(ctx, beadsDir, includeClosedWork)
+}
+
+func (m *Mailbox) listFromDirContext(ctx context.Context, beadsDir string, includeClosedWork bool) ([]*Message, error) {
 	// Use in-process store when available
 	if m.store != nil {
-		return m.storeListFromDir(includeClosedWork)
+		return m.storeListFromDirContext(ctx, includeClosedWork)
 	}
 
 	identities := m.identityVariants()
@@ -184,15 +220,15 @@ func (m *Mailbox) listFromDir(beadsDir string, includeClosedWork bool) ([]*Messa
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		assignee.messages, assignee.err = m.queryIssueMessagesByAssignee(beadsDir, identities)
+		assignee.messages, assignee.err = m.queryIssueMessagesByAssigneeContext(ctx, beadsDir, identities)
 	}()
 	go func() {
 		defer wg.Done()
-		cc.messages = m.queryIssueMessagesByCC(beadsDir, identities)
+		cc.messages = m.queryIssueMessagesByCCContext(ctx, beadsDir, identities)
 	}()
 	go func() {
 		defer wg.Done()
-		wisps.messages, wisps.err = m.queryWispMessages(beadsDir, identities)
+		wisps.messages, wisps.err = m.queryWispMessagesContext(ctx, beadsDir, identities)
 	}()
 	wg.Wait()
 
@@ -213,6 +249,12 @@ func (m *Mailbox) listFromDir(beadsDir string, includeClosedWork bool) ([]*Messa
 }
 
 func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []string) ([]BeadsMessage, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.queryIssueMessagesByAssigneeContext(ctx, beadsDir, identities)
+}
+
+func (m *Mailbox) queryIssueMessagesByAssigneeContext(ctx context.Context, beadsDir string, identities []string) ([]BeadsMessage, error) {
 	var messages []BeadsMessage
 	for _, id := range identities {
 		args := []string{"list",
@@ -223,9 +265,7 @@ func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []str
 			"--limit", "0",
 		}
 
-		ctx, cancel := bdReadCtx()
 		stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
-		cancel()
 		if err != nil {
 			return nil, err
 		}
@@ -239,6 +279,12 @@ func (m *Mailbox) queryIssueMessagesByAssignee(beadsDir string, identities []str
 }
 
 func (m *Mailbox) queryIssueMessagesByCC(beadsDir string, identities []string) []BeadsMessage {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.queryIssueMessagesByCCContext(ctx, beadsDir, identities)
+}
+
+func (m *Mailbox) queryIssueMessagesByCCContext(ctx context.Context, beadsDir string, identities []string) []BeadsMessage {
 	var messages []BeadsMessage
 	for _, id := range identities {
 		args := []string{"list",
@@ -249,9 +295,7 @@ func (m *Mailbox) queryIssueMessagesByCC(beadsDir string, identities []string) [
 			"--limit", "0",
 		}
 
-		ctx, cancel := bdReadCtx()
 		stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
-		cancel()
 		if err != nil {
 			continue
 		}
@@ -339,6 +383,12 @@ type wispQueryMessage struct {
 // Protocol/lifecycle messages are stored as wisps by shouldBeWisp(), but bd list
 // only queries the issues table.
 func (m *Mailbox) queryWispMessages(beadsDir string, identities []string) ([]wispQueryMessage, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.queryWispMessagesContext(ctx, beadsDir, identities)
+}
+
+func (m *Mailbox) queryWispMessagesContext(ctx context.Context, beadsDir string, identities []string) ([]wispQueryMessage, error) {
 	if len(identities) == 0 {
 		return nil, nil
 	}
@@ -362,7 +412,7 @@ func (m *Mailbox) queryWispMessages(beadsDir string, identities []string) ([]wis
 			"WHERE w.status IN ('open', 'hooked') AND (w.assignee IN (%s) OR cc.label IS NOT NULL) "+
 			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at",
 		identityList, ccLabelList, identityList)
-	return m.runWispSQL(beadsDir, query)
+	return m.runWispSQLContext(ctx, beadsDir, query)
 }
 
 // wispSQLRow represents a row from the wisps SQL query with aggregated labels.
@@ -382,10 +432,14 @@ type wispSQLRow struct {
 
 // runWispSQL executes a bd sql --json query and converts results to wisp query messages.
 func (m *Mailbox) runWispSQL(beadsDir, query string) ([]wispQueryMessage, error) {
-	args := []string{"sql", "--json", query}
 	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.runWispSQLContext(ctx, beadsDir, query)
+}
+
+func (m *Mailbox) runWispSQLContext(ctx context.Context, beadsDir, query string) ([]wispQueryMessage, error) {
+	args := []string{"sql", "--json", query}
 	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
-	cancel()
 	if err != nil {
 		return nil, err // Wisps table may not exist yet.
 	}
@@ -515,7 +569,14 @@ func (m *Mailbox) listLegacy() ([]*Message, error) {
 // ListUnread returns unread (open) messages.
 // Filters out messages marked as read (via "read" label in beads mode).
 func (m *Mailbox) ListUnread() ([]*Message, error) {
-	all, err := m.List()
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.ListUnreadContext(ctx)
+}
+
+// ListUnreadContext returns unread messages and honors caller cancellation.
+func (m *Mailbox) ListUnreadContext(ctx context.Context) ([]*Message, error) {
+	all, err := m.ListContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -530,35 +591,56 @@ func (m *Mailbox) ListUnread() ([]*Message, error) {
 
 // Get returns a message by ID.
 func (m *Mailbox) Get(id string) (*Message, error) {
+	return m.GetContext(context.Background(), id)
+}
+
+// GetContext retrieves one message and honors caller cancellation.
+func (m *Mailbox) GetContext(ctx context.Context, id string) (*Message, error) {
 	if m.legacy {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return m.getLegacy(id)
 	}
-	return m.getBeads(id)
+	return m.getBeadsContext(ctx, id)
 }
 
 func (m *Mailbox) getBeads(id string) (*Message, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.getBeadsContext(ctx, id)
+}
+
+func (m *Mailbox) getBeadsContext(ctx context.Context, id string) (*Message, error) {
 	// Resolve correct beadsDir based on bead ID prefix (GH#2423)
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
-	msg, err := m.getFromDir(id, primary)
+	msg, err := m.getFromDirContext(ctx, id, primary)
 	if errors.Is(err, ErrMessageNotFound) && primary != m.beadsDir {
 		// Cross-rig bead IDs (e.g. ne-*) may live in the home DB when created
 		// via the mail router (which always uses town beads). Fall back to
 		// m.beadsDir before giving up. See ne-bgr.
-		return m.getFromDir(id, m.beadsDir)
+		return m.getFromDirContext(ctx, id, m.beadsDir)
 	}
 	return msg, err
 }
 
 // getFromDir retrieves a message from a beads directory.
 func (m *Mailbox) getFromDir(id, beadsDir string) (*Message, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	return m.getFromDirContext(ctx, id, beadsDir)
+}
+
+func (m *Mailbox) getFromDirContext(ctx context.Context, id, beadsDir string) (*Message, error) {
 	if m.store != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return m.storeGetFromDir(id)
 	}
 
 	args := []string{"show", id, "--json"}
 
-	ctx, cancel := bdReadCtx()
-	defer cancel()
 	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && (bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") || bdErr.ContainsError("no issue found")) {
@@ -725,35 +807,90 @@ func (m *Mailbox) markReadLegacy(id string) error {
 // For legacy mode, this sets the Read field to true.
 // The message remains in the inbox but is displayed as read.
 func (m *Mailbox) MarkReadOnly(id string) error {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return m.MarkReadOnlyContext(ctx, id)
+}
+
+// MarkReadOnlyContext marks a message read and honors caller cancellation.
+func (m *Mailbox) MarkReadOnlyContext(ctx context.Context, id string) error {
 	if m.legacy {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return m.markReadLegacy(id)
 	}
-	return m.markReadOnlyBeads(id)
+	return m.markReadOnlyBeadsContext(ctx, id)
+}
+
+// QuarantineLifecycleContext durably labels a rejected lifecycle request before
+// best-effort read marking. The label alone is sufficient to prevent retries.
+func (m *Mailbox) QuarantineLifecycleContext(ctx context.Context, id string) error {
+	if m.legacy {
+		return m.MarkReadOnlyContext(ctx, id)
+	}
+	if err := m.addLabelBeadsContext(ctx, id, LifecycleRejectedLabel); err != nil {
+		return err
+	}
+	_ = m.markReadOnlyBeadsContext(ctx, id)
+	return nil
+}
+
+func (m *Mailbox) addLabelBeadsContext(ctx context.Context, id, label string) error {
+	if m.store != nil {
+		if err := m.store.AddLabel(ctx, id, label, ""); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return ErrMessageNotFound
+			}
+			return err
+		}
+		return nil
+	}
+
+	args := []string{"label", "add", id, label}
+	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
+	if _, err := runBdCommand(ctx, args, m.workDir, primary); err != nil {
+		if !isBdNotFound(err) {
+			return err
+		}
+		if primary == m.beadsDir {
+			return ErrMessageNotFound
+		}
+		if _, fallbackErr := runBdCommand(ctx, args, m.workDir, m.beadsDir); fallbackErr != nil {
+			if isBdNotFound(fallbackErr) {
+				return ErrMessageNotFound
+			}
+			return fallbackErr
+		}
+	}
+	return nil
 }
 
 func (m *Mailbox) markReadOnlyBeads(id string) error {
-	if err := m.acknowledgeDeliveryForPrimary(id); err != nil {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return m.markReadOnlyBeadsContext(ctx, id)
+}
+
+func (m *Mailbox) markReadOnlyBeadsContext(ctx context.Context, id string) error {
+	if err := m.acknowledgeDeliveryForPrimaryContext(ctx, id); err != nil {
 		return err
 	}
 
 	if m.store != nil {
-		return m.storeMarkReadOnly(id)
+		return m.storeMarkReadOnlyContext(ctx, id)
 	}
 
 	// Add "read" label to mark as read without closing
 	args := []string{"label", "add", id, "read"}
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
 
-	ctx, cancel := bdWriteCtx()
-	defer cancel()
 	_, err := runBdCommand(ctx, args, m.workDir, primary)
 	if err != nil {
 		if isBdNotFound(err) {
 			if primary != m.beadsDir {
 				// Cross-rig bead IDs (e.g. ne-*) may live in the home DB. See ne-bgr.
-				ctx2, cancel2 := bdWriteCtx()
-				defer cancel2()
-				_, err2 := runBdCommand(ctx2, args, m.workDir, m.beadsDir)
+				_, err2 := runBdCommand(ctx, args, m.workDir, m.beadsDir)
 				if err2 != nil {
 					if isBdNotFound(err2) {
 						return ErrMessageNotFound
@@ -771,21 +908,30 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 }
 
 func (m *Mailbox) acknowledgeDeliveryForPrimary(id string) error {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return m.acknowledgeDeliveryForPrimaryContext(ctx, id)
+}
+
+func (m *Mailbox) acknowledgeDeliveryForPrimaryContext(ctx context.Context, id string) error {
 	if m.legacy {
 		return nil
 	}
 	if m.store != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return m.storeAcknowledgeDeliveryForPrimary(id)
 	}
 
-	msg, err := m.Get(id)
+	msg, err := m.GetContext(ctx, id)
 	if err != nil {
 		return err
 	}
 	if msg == nil || msg.DeliveryState == "" || AddressToIdentity(msg.To) != m.identity {
 		return nil
 	}
-	return AcknowledgeDeliveryBead(m.workDir, m.beadsDir, id, m.identity)
+	return AcknowledgeDeliveryBeadContext(ctx, m.workDir, m.beadsDir, id, m.identity)
 }
 
 func isBdNotFound(err error) bool {

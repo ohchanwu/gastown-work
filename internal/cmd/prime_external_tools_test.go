@@ -168,6 +168,18 @@ esac
 	}
 }
 
+func TestCheckPendingEscalations_CallsBdList(t *testing.T) {
+	workDir := setupPrimeExternalToolTest(t, `
+case "$*" in
+	  "list --status=open --tag=escalation --json --flat") printf '%s\n' '[]'; exit 0 ;;
+esac
+`, `
+`)
+
+	checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
+	assertPrimeToolCalled(t, "bd:list --status=open --tag=escalation --json --flat")
+}
+
 func TestCheckPendingEscalations_BoundsSlowBdList(t *testing.T) {
 	workDir := setupPrimeExternalToolTest(t, `
 case "$*" in
@@ -181,7 +193,6 @@ esac
 		checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
 	})
 	assertElapsedUnder(t, time.Since(start), 2*time.Second)
-	assertPrimeToolCalled(t, "bd:list --status=open --tag=escalation --json --flat")
 
 	if strings.Contains(output, "PENDING ESCALATIONS") {
 		t.Fatalf("timed-out escalation output should not be emitted: %q", output)

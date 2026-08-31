@@ -93,6 +93,23 @@ func TestReplaceBeforeStoppingPollerGenerationContextChecksDeadlineAfterValidati
 	}
 }
 
+func TestStopPollerGenerationContextCancelsWhileOwnershipLockIsHeld(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-held-lock"
+	lock, err := lockPoller(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	err = StopPollerGenerationContext(ctx, townRoot, session, PollerGeneration{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("held-lock stop error = %v, want deadline", err)
+	}
+}
+
 func TestReplaceBeforeStoppingPollerGenerationContextHoldsLifecycleLockDuringReplacement(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"

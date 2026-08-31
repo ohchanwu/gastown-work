@@ -1,17 +1,212 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 )
+
+func TestRunMoleculeDetachReusesPendingAttemptWhenPreStateIsVisible(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("real bd fixture is not supported on Windows")
+	}
+	portText := strings.TrimSpace(os.Getenv("GT_TEST_DOLT_PORT"))
+	if portText == "" && os.Getenv("GT_TEST_ISOLATED") == "1" {
+		portText = strings.TrimSpace(os.Getenv("GT_DOLT_PORT"))
+	}
+	port, err := strconv.Atoi(portText)
+	if portText == "" || err != nil || port < 1 || port > 65535 {
+		t.Skipf("GT_TEST_DOLT_PORT is absent or invalid: %q", portText)
+	}
+
+	dir := t.TempDir()
+	bd := beads.NewIsolatedWithPort(dir, port)
+	if err := bd.Init("gt"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+	molecule, err := bd.Create(beads.CreateOptions{Title: "molecule", Type: "molecule", Priority: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	description := "attached_molecule: " + molecule.ID
+	work, err := bd.Create(beads.CreateOptions{Title: "work", Type: "task", Priority: 2, Description: description})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := string(beads.StatusPinned)
+	if err := bd.Update(work.ID, beads.UpdateOptions{Status: &pinned}); err != nil {
+		t.Fatal(err)
+	}
+	work, err = bd.Show(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "11111111-1111-4111-8111-111111111111"
+	if err := bd.LogDetachAudit(beads.DetachAuditEntry{
+		Operation:           "detach",
+		PinnedBeadID:        work.ID,
+		DetachedMolecule:    molecule.ID,
+		DetachedBy:          "test",
+		AttemptID:           attemptID,
+		State:               "pending",
+		PreviousStatus:      work.Status,
+		PreviousAssignee:    work.Assignee,
+		PreviousDescription: work.Description,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldCWD) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_DOLT_PORT", portText)
+	if err := runMoleculeDetach(nil, []string{work.ID}); err != nil {
+		t.Fatalf("runMoleculeDetach: %v", err)
+	}
+
+	f, err := os.Open(filepath.Join(dir, ".beads", "audit.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	attempts := make(map[string]bool)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var entry beads.DetachAuditEntry
+		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.PinnedBeadID == work.ID && entry.AttemptID != "" {
+			attempts[entry.AttemptID] = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || !attempts[attemptID] {
+		t.Fatalf("detach attempt IDs = %v, want only pending %s", attempts, attemptID)
+	}
+	updated, err := bd.Show(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment := beads.ParseAttachmentFields(updated); attachment != nil && attachment.AttachedMolecule != "" {
+		t.Fatalf("attachment remained after pending attempt reconciliation: %+v", attachment)
+	}
+}
+
+func installShellMockMoleculeCleanup(t *testing.T) {
+	t.Helper()
+	oldDetach := detachAndCleanupMoleculesFn
+	oldLog := logMoleculeCleanupPhaseFn
+	t.Cleanup(func() {
+		detachAndCleanupMoleculesFn = oldDetach
+		logMoleculeCleanupPhaseFn = oldLog
+	})
+	logMoleculeCleanupPhaseFn = func(*beads.Beads, string, string) error { return nil }
+	detachAndCleanupMoleculesFn = func(bd *beads.Beads, pinnedBeadID string, _ *beadInfo, _, _, _, closeReason string, moleculeIDs []string) (int, error) {
+		closed := 0
+		for _, moleculeID := range moleculeIDs {
+			children, err := forceCloseDescendants(bd, moleculeID)
+			closed += children
+			if err != nil {
+				return closed, err
+			}
+			if err := removeMoleculeBondsStrict(bd, pinnedBeadID, moleculeID); err != nil {
+				return closed, err
+			}
+			if err := bd.ForceCloseWithReason(closeReason, moleculeID); err != nil {
+				return closed, err
+			}
+		}
+		return closed, nil
+	}
+}
+
+func TestDetachAndCleanupMoleculesResumesAfterCompletionReceiptFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("real bd fixture is not supported on Windows")
+	}
+	portText := strings.TrimSpace(os.Getenv("GT_TEST_DOLT_PORT"))
+	if portText == "" && os.Getenv("GT_TEST_ISOLATED") == "1" {
+		portText = strings.TrimSpace(os.Getenv("GT_DOLT_PORT"))
+	}
+	port, err := strconv.Atoi(portText)
+	if portText == "" || err != nil || port < 1 || port > 65535 {
+		t.Skipf("GT_TEST_DOLT_PORT is absent or invalid: %q", portText)
+	}
+	dir := t.TempDir()
+	bd := beads.NewIsolatedWithPort(dir, port)
+	if err := bd.Init("gt"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+	molecule, err := bd.Create(beads.CreateOptions{Title: "molecule", Type: "molecule", Priority: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workDesc := "attached_molecule: " + molecule.ID
+	work, err := bd.Create(beads.CreateOptions{Title: "work", Type: "task", Priority: 2, Description: workDesc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bd.AddDependency(molecule.ID, work.ID); err != nil {
+		t.Fatal(err)
+	}
+	pinned := string(beads.StatusPinned)
+	if err := bd.Update(work.ID, beads.UpdateOptions{Status: &pinned}); err != nil {
+		t.Fatal(err)
+	}
+	oldLog := logMoleculeCleanupPhaseFn
+	t.Cleanup(func() { logMoleculeCleanupPhaseFn = oldLog })
+	failed := false
+	logMoleculeCleanupPhaseFn = func(got *beads.Beads, attemptID, phase string) error {
+		if phase == "complete" && !failed {
+			failed = true
+			return errors.New("lost phase acknowledgement")
+		}
+		return got.LogMoleculeCleanupPhase(attemptID, phase)
+	}
+	info := &beadInfo{Status: pinned, Description: workDesc}
+	if _, err := detachAndCleanupMolecules(bd, work.ID, info, "burn", "test", "test detach", "burned", []string{molecule.ID}); err == nil {
+		t.Fatal("cleanup unexpectedly succeeded after phase receipt failure")
+	} else if !strings.Contains(err.Error(), "lost phase acknowledgement") {
+		t.Fatalf("cleanup failed before phase receipt: %v", err)
+	}
+	gotWork, err := bd.Show(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment := beads.ParseAttachmentFields(gotWork); attachment != nil && attachment.AttachedMolecule != "" {
+		t.Fatalf("work remained attached after durable detach: %+v", attachment)
+	}
+	if resumed, _, err := resumeMoleculeCleanupIfPresent(bd, work.ID, "burn", "burned"); err != nil || !resumed {
+		t.Fatalf("resume = (%v, %v), want success", resumed, err)
+	}
+	gotMolecule, err := bd.Show(molecule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMolecule.Status != string(beads.StatusClosed) {
+		t.Fatalf("molecule status = %q, want closed", gotMolecule.Status)
+	}
+	if pending, err := bd.PendingMoleculeCleanup(work.ID, "burn"); err != nil || pending != nil {
+		t.Fatalf("pending cleanup = (%+v, %v), want none", pending, err)
+	}
+}
 
 // TestExtractRoleFromIdentity verifies that role names are correctly extracted
 // from agent identity strings, including trailing slashes and compound paths.
@@ -161,6 +356,7 @@ func TestSquashJitterContextCancellation(t *testing.T) {
 // Expected behavior: Hook the base bead, store attached_molecule pointing to wisp.
 // gt hook/gt prime can follow attached_molecule to find the workflow steps.
 func TestSlingFormulaOnBeadHooksBaseBead(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-xyz")
 	townRoot := t.TempDir()
 
 	// Minimal workspace marker
@@ -352,6 +548,7 @@ exit /b 0
 // - Compound resolution: base bead -> attached_molecule -> wisp
 // - gt hook/gt prime: read base bead, follow attached_molecule to show wisp steps
 func TestSlingFormulaOnBeadSetsAttachedMoleculeInBaseBead(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-xyz")
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows batch script JSON output causes storeAttachedMoleculeInBead to fail silently")
 	}
@@ -539,6 +736,7 @@ func TestBurnClosesWispRoot(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script bd stub not supported on Windows")
 	}
+	installShellMockMoleculeCleanup(t)
 
 	townRoot := t.TempDir()
 
@@ -634,6 +832,67 @@ exit 0
 	}
 }
 
+func TestBurnPreservesReplacementBeforeAnyDestructiveClose(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script bd stub not supported on Windows")
+	}
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads", "locks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	closesLog := filepath.Join(townRoot, "closes.log")
+	bdScript := fmt.Sprintf(`#!/bin/sh
+while [ "$1" = "--allow-stale" ]; do shift; done
+cmd="$1"; shift
+case "$cmd" in
+  list)
+    if echo "$*" | grep -q "status=pinned"; then
+      echo '[{"id":"gt-handoff-1","title":"witness Handoff","status":"pinned","assignee":"gastown/polecats/old","description":"attached_molecule: gt-wisp-old"}]'
+    else
+      echo '[]'
+    fi
+    ;;
+  show)
+    echo '[{"id":"gt-handoff-1","title":"witness Handoff","status":"pinned","assignee":"gastown/polecats/new","description":"attached_molecule: gt-wisp-replacement"}]'
+    ;;
+  close) echo "$*" >> "%s" ;;
+esac
+exit 0
+`, closesLog)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "witness")
+	t.Setenv("GT_POLECAT", "")
+	t.Setenv("GT_CREW", "")
+	t.Setenv("GT_RIG", "")
+	t.Setenv("BEADS_DIR", "")
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := runMoleculeBurn(nil, []string{"witness"}); err == nil || (!strings.Contains(err.Error(), "assignee changed") && !strings.Contains(err.Error(), "molecule changed")) {
+		t.Fatalf("replacement receipt error=%v", err)
+	}
+	if data, err := os.ReadFile(closesLog); err == nil && len(data) > 0 {
+		t.Fatalf("replacement molecule was destructively closed: %s", data)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
 // TestSquashClosesWispRoot verifies that runMoleculeSquash closes the wisp root
 // via ForceCloseWithReason after detaching. Without this, patrol molecule roots
 // stay in "hooked" status indefinitely (issue #1828).
@@ -641,6 +900,7 @@ func TestSquashClosesWispRoot(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script bd stub not supported on Windows")
 	}
+	installShellMockMoleculeCleanup(t)
 
 	townRoot := t.TempDir()
 
@@ -754,6 +1014,7 @@ func TestSquashClosesDescendantsAndRoot(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script bd stub not supported on Windows")
 	}
+	installShellMockMoleculeCleanup(t)
 
 	townRoot := t.TempDir()
 

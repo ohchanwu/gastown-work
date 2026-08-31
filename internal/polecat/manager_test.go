@@ -56,6 +56,86 @@ func TestHasSubmittableWorkForWorkstateUsesBranchTargetStatus(t *testing.T) {
 	}
 }
 
+func TestStartupStateReceiptRestoresPersistedAgentAndWorkState(t *testing.T) {
+	if _, err := exec.LookPath("bd"); err != nil {
+		t.Skip("bd not installed")
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(os.Getenv("GT_TEST_DOLT_PORT")))
+	if err != nil || port < 1 || port > 65535 {
+		testutil.RequireDoltContainer(t)
+		port, _ = strconv.Atoi(testutil.DoltContainerPort())
+	}
+
+	rigPath := t.TempDir()
+	mayorRig := filepath.Join(rigPath, "mayor", "rig")
+	if err := os.MkdirAll(mayorRig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := beads.NewIsolatedWithPort(mayorRig, port).Init("gt"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "redirect"), []byte("mayor/rig/.beads\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		name        = "toast"
+		incarnation = "generation-1"
+	)
+	if err := os.MkdirAll(filepath.Join(rigPath, "polecats", name), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManager(&rig.Rig{Name: "rig", Path: rigPath}, nil, nil)
+	work, err := mgr.beads.Create(beads.CreateOptions{Title: "startup work", Type: "task", Priority: 2})
+	if err != nil {
+		t.Fatalf("create work: %v", err)
+	}
+	assignee := mgr.assigneeID(name)
+	if err := mgr.beads.Update(work.ID, beads.UpdateOptions{Assignee: &assignee}); err != nil {
+		t.Fatalf("assign work: %v", err)
+	}
+	agentID := mgr.agentBeadID(name)
+	if _, err := mgr.agentBeads().CreateOrReopenAgentBead(agentID, assignee, &beads.AgentFields{
+		AgentState: string(beads.AgentStateSpawning), Incarnation: incarnation, HookBead: work.ID,
+	}); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+
+	receipt, err := mgr.CaptureStartupStateIfIncarnation(name, incarnation)
+	if err != nil {
+		t.Fatalf("capture startup state: %v", err)
+	}
+	if receipt.WorkWrittenStatus != "in_progress" {
+		t.Fatalf("post-assignment status receipt = %q, want in_progress", receipt.WorkWrittenStatus)
+	}
+	if err := mgr.SetAgentStateWithRetryIfIncarnation(name, incarnation, string(beads.AgentStateWorking)); err != nil {
+		t.Fatalf("persist agent state: %v", err)
+	}
+	if err := mgr.SetStateIfIncarnation(name, incarnation, StateWorking); err != nil {
+		t.Fatalf("persist work state: %v", err)
+	}
+	if err := mgr.RestoreStartupStateIfIncarnation(name, receipt); err != nil {
+		t.Fatalf("restore startup state: %v", err)
+	}
+
+	_, agent, err := mgr.agentBeads().GetAgentBead(agentID)
+	if err != nil {
+		t.Fatalf("reread agent: %v", err)
+	}
+	if agent.AgentState != string(beads.AgentStateSpawning) || agent.Incarnation != incarnation {
+		t.Fatalf("restored agent = state:%q incarnation:%q", agent.AgentState, agent.Incarnation)
+	}
+	restoredWork, err := mgr.beads.Show(work.ID)
+	if err != nil {
+		t.Fatalf("reread work: %v", err)
+	}
+	if restoredWork.Status != work.Status || restoredWork.Assignee != assignee {
+		t.Fatalf("restored work = status:%q assignee:%q, want status:%q assignee:%q", restoredWork.Status, restoredWork.Assignee, work.Status, assignee)
+	}
+}
+
 func setupManagerSquashPreservedRepo(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -416,6 +496,70 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationHoldsLockThroughAfterRemove(t *t
 	}
 }
 
+func TestRemovalBranchCallbackFinishesBeforeSameNameReplacement(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	oldPolecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions old generation: %v", err)
+	}
+	oldOID, err := git.NewGit(mayorRig).Rev(oldPolecat.Branch)
+	if err != nil {
+		t.Fatalf("capture old branch OID: %v", err)
+	}
+
+	afterEntered := make(chan struct{})
+	releaseAfter := make(chan struct{})
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+			"toast", "fixture-generation", true, true, false, nil, nil,
+			func() error {
+				if err := git.NewGit(mayorRig).DeleteBranchIfMatches(oldPolecat.Branch, oldOID); err != nil {
+					return err
+				}
+				close(afterEntered)
+				<-releaseAfter
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-afterEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("branch cleanup callback was not reached")
+	}
+
+	replacementDone := make(chan *Polecat, 1)
+	replacementErr := make(chan error, 1)
+	go func() {
+		replacement, addErr := mgr.AddWithOptions("toast", AddOptions{})
+		replacementDone <- replacement
+		replacementErr <- addErr
+	}()
+	select {
+	case replacement := <-replacementDone:
+		t.Fatalf("same-name replacement escaped lifecycle fence: %+v", replacement)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseAfter)
+	if err := <-removeDone; err != nil {
+		t.Fatalf("remove old generation: %v", err)
+	}
+	replacement := <-replacementDone
+	if err := <-replacementErr; err != nil {
+		t.Fatalf("add replacement generation: %v", err)
+	}
+	if replacement == nil || replacement.Incarnation == "" {
+		t.Fatalf("replacement generation = %+v", replacement)
+	}
+	if _, err := git.NewGit(mayorRig).Rev(replacement.Branch); err != nil {
+		t.Fatalf("replacement branch was not preserved: %v", err)
+	}
+	if _, err := os.Stat(replacement.ClonePath); err != nil {
+		t.Fatalf("replacement worktree was not preserved: %v", err)
+	}
+}
+
 func TestRemoveWithOptionsLocalOnlyIfIncarnationShellPreflightDoesNotCommit(t *testing.T) {
 	mgr, _ := setupCanonicalBranchManagerTest(t)
 	p, err := mgr.AddWithOptions("toast", AddOptions{})
@@ -741,6 +885,10 @@ func TestJournaledRetirementResumesAfterWorktreeRemovalBeforeCursorAdvance(t *te
 	if err != nil {
 		t.Fatalf("AddWithOptions: %v", err)
 	}
+	clonePath, err := canonicalPath(p.ClonePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runManagerGit(t, mayorRig, "worktree", "remove", "--force", p.ClonePath)
 	if err := os.RemoveAll(filepath.Dir(p.ClonePath)); err != nil {
 		t.Fatal(err)
@@ -759,12 +907,13 @@ for arg in "$@"; do
 done
 case "$cmd" in
   show)
-    printf '%s\n' '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: fixture-generation\nretirement_phase: fenced\nretirement_work_bead: gt-work\nretirement_clone_path: /missing/worktree"}]'
+    printf '%s\n' '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: fixture-generation\nretirement_version: 1\nretirement_phase: fenced\nretirement_hook_bead: gt-work\nretirement_work_receipts: [{\"work_bead\":\"gt-work\"}]\nretirement_clone_path: CANONICAL_CLONE\nretirement_git_state: {\"WorktreePresent\":false}"}]'
     ;;
   list) printf '[]\n' ;;
   update) cat >/dev/null ;;
 esac
 `
+	script = strings.Replace(script, "CANONICAL_CLONE", clonePath, 1)
 	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -773,7 +922,19 @@ esac
 		"toast", "fixture-generation", true, true, false, beads.AgentRetirementRecord{},
 		func(*Polecat) (*beads.AgentFields, error) { beforeCalls++; return nil, nil },
 		func(beads.AgentRetirementRecord) error { boundaryCalls++; return nil },
-		func(*beads.AgentRetirementRecord, func(string) error) error { afterCalls++; return nil },
+		func(_ *beads.AgentRetirementRecord, advance func(string) error) error {
+			afterCalls++
+			for _, phase := range []string{
+				beads.AgentRetirementPhaseMoleculeCleaned,
+				beads.AgentRetirementPhaseBranchVerified,
+				beads.AgentRetirementPhaseBranchDeleted,
+			} {
+				if err := advance(phase); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
 	)
 	if err != nil {
 		t.Fatalf("resuming journaled retirement: %v", err)
@@ -783,12 +944,165 @@ esac
 	}
 }
 
-func TestAssignWorkIfCurrentRejectsRetiringGeneration(t *testing.T) {
+func TestJournaledRetirementRejectsDecoyClonePathBeforeMutation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mock for bd")
 	}
 	mgr, _ := setupCanonicalBranchManagerTest(t)
-	if _, err := mgr.AddWithOptions("toast", AddOptions{}); err != nil {
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoy := filepath.Join(t.TempDir(), "decoy-worktree")
+	if err := os.MkdirAll(decoy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bdPath, err := exec.LookPath("bd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	description := fmt.Sprintf("role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: fixture-generation\nretirement_version: 1\nretirement_phase: session-stopped\nretirement_clone_path: %s\nretirement_git_state: {\"WorktreePresent\":true}", decoy)
+	script := fmt.Sprintf(`#!/bin/sh
+while [ "$1" = "--allow-stale" ]; do shift; done
+case "$1" in
+version) exit 0 ;;
+show) printf '%%s\n' '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":%q}]' ;;
+esac
+`, description)
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mutations := 0
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnationJournaled(
+		"toast", "fixture-generation", true, true, false, beads.AgentRetirementRecord{}, nil,
+		func(beads.AgentRetirementRecord) error { mutations++; return nil },
+		func(*beads.AgentRetirementRecord, func(string) error) error { mutations++; return nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "clone path") {
+		t.Fatalf("decoy retirement clone error = %v", err)
+	}
+	if mutations != 0 {
+		t.Fatalf("decoy retirement reached %d mutation callback(s)", mutations)
+	}
+	if _, err := os.Stat(p.ClonePath); err != nil {
+		t.Fatalf("canonical worktree mutated: %v", err)
+	}
+	if _, err := os.Stat(decoy); err != nil {
+		t.Fatalf("decoy path mutated: %v", err)
+	}
+}
+
+func TestAssignWorkIfCurrentRejectsFrozenGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+	for _, state := range []string{"completing", "retiring", "nuked"} {
+		t.Run(state, func(t *testing.T) {
+			mgr, _ := setupCanonicalBranchManagerTest(t)
+			if _, err := mgr.AddWithOptions("toast", AddOptions{}); err != nil {
+				t.Fatalf("AddWithOptions: %v", err)
+			}
+			bdPath, err := exec.LookPath("bd")
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := `#!/bin/sh
+cmd=""
+for arg in "$@"; do case "$arg" in --*) continue ;; esac; cmd="$arg"; break; done
+case "$cmd" in
+show) printf '%s\n' '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: FROZEN_STATE\nincarnation: fixture-generation\nretirement_phase: fenced"}]' ;;
+esac
+`
+			script = strings.Replace(script, "FROZEN_STATE", state, 1)
+			if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			if _, err := mgr.AssignWorkIfCurrent("toast", func() error { calls++; return nil }); !errors.Is(err, ErrPolecatIncarnationChanged) {
+				t.Fatalf("assignment error = %v, want ErrPolecatIncarnationChanged", err)
+			}
+			if calls != 0 {
+				t.Fatalf("assignment callback calls = %d, want 0", calls)
+			}
+		})
+	}
+}
+
+func TestAssignmentRollbackRemovalReusesHeldLifecycleFence(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	_, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, assignErr := mgr.AssignWorkIfCurrent("toast", func() error {
+			return mgr.RemoveWithOptionsLocalOnlyIfIncarnationLocked(
+				"toast", "fixture-generation", true, true, false, nil, nil, nil,
+			)
+		})
+		done <- assignErr
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("fenced rollback removal: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fenced rollback recursively acquired the lifecycle lock")
+	}
+}
+
+func TestJournaledNukeWaitsForCompletionProcessLease(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	owner, err := mgr.lockPolecatCompletion("toast")
+	if err != nil {
+		t.Fatalf("lock completion owner: %v", err)
+	}
+	cleanupEntered := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	clonePath, err := canonicalPath(p.ClonePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := beads.AgentRetirementRecord{
+		Version:   beads.AgentRetirementJournalVersion,
+		ClonePath: clonePath,
+		GitState:  `{"WorktreePresent":true}`,
+	}
+	go func() {
+		done <- mgr.RemoveWithOptionsLocalOnlyIfIncarnationJournaled(
+			"toast", "fixture-generation", true, true, false, record, nil,
+			func(beads.AgentRetirementRecord) error {
+				cleanupEntered <- struct{}{}
+				return errors.New("stop after lease proof")
+			}, nil,
+		)
+	}()
+	select {
+	case <-cleanupEntered:
+		t.Fatal("forced journaled nuke entered cleanup while completion lease was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := owner.Unlock(); err != nil {
+		t.Fatalf("release completion owner: %v", err)
+	}
+	select {
+	case <-cleanupEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("journaled nuke did not enter recovery cleanup after completion lease release")
+	}
+	<-done
+}
+
+func TestCompletionAttemptsAreExclusiveUntilOwnerRelease(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	_, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
 		t.Fatalf("AddWithOptions: %v", err)
 	}
 	bdPath, err := exec.LookPath("bd")
@@ -799,18 +1113,52 @@ func TestAssignWorkIfCurrentRejectsRetiringGeneration(t *testing.T) {
 cmd=""
 for arg in "$@"; do case "$arg" in --*) continue ;; esac; cmd="$arg"; break; done
 case "$cmd" in
-show) printf '%s\n' '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: fixture-generation\nretirement_phase: fenced"}]' ;;
+show) printf '%s\n' '[{"id":"gt-rig-polecat-toast","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: rig\nagent_state: working\nincarnation: fixture-generation"}]' ;;
+list) printf '[]\n' ;;
 esac
 `
-	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	calls := 0
-	if _, err := mgr.AssignWorkIfCurrent("toast", func() error { calls++; return nil }); !errors.Is(err, ErrPolecatIncarnationChanged) {
-		t.Fatalf("assignment error = %v, want ErrPolecatIncarnationChanged", err)
+	releaseFirst, err := mgr.ClaimCompletionIfCurrent("toast", "fixture-generation", "attempt-1")
+	if err != nil {
+		t.Fatalf("first completion claim: %v", err)
 	}
-	if calls != 0 {
-		t.Fatalf("assignment callback calls = %d, want 0", calls)
+	firstEffectRecorded := true
+	effects := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		releaseSecond, claimErr := mgr.ClaimCompletionIfCurrent("toast", "fixture-generation", "attempt-2")
+		if claimErr == nil {
+			effects <- "attempt-2"
+			releaseSecond()
+		}
+		done <- claimErr
+	}()
+	select {
+	case effect := <-effects:
+		t.Fatalf("second completion attempt reached external side effect while owner live: %s", effect)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseFirst()
+	select {
+	case claimErr := <-done:
+		if claimErr != nil {
+			t.Fatalf("recovery completion claim: %v", claimErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second completion attempt did not resume after owner release")
+	}
+	if !firstEffectRecorded {
+		t.Fatal("first completion attempt did not record its external side effect")
+	}
+	select {
+	case effect := <-effects:
+		if effect != "attempt-2" {
+			t.Fatalf("recovery side effect = %q", effect)
+		}
+	default:
+		t.Fatal("recovery attempt did not reach its external side effect")
 	}
 }
 
@@ -1262,8 +1610,7 @@ func TestListWithPolecats(t *testing.T) {
 // via integration tests. The unit tests here focus on testing the basic
 // polecat lifecycle operations that don't require beads.
 
-func TestSetStateWithoutBeads(t *testing.T) {
-	// SetState should not error when beads is not available
+func TestSetStatePropagatesAssignedIssueLookupFailure(t *testing.T) {
 	root := t.TempDir()
 	polecatDir := filepath.Join(root, "polecats", "Test")
 	if err := os.MkdirAll(polecatDir, 0755); err != nil {
@@ -1281,10 +1628,9 @@ func TestSetStateWithoutBeads(t *testing.T) {
 	}
 	m := NewManager(r, git.NewGit(root), nil)
 
-	// SetState should succeed (no-op when no issue assigned)
 	err := m.SetState("Test", StateWorking)
-	if err != nil {
-		t.Errorf("SetState: %v (expected no error when no beads/issue)", err)
+	if err == nil {
+		t.Fatal("SetState suppressed assigned-issue lookup failure")
 	}
 }
 

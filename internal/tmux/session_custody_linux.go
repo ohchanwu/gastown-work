@@ -994,7 +994,7 @@ func runLinuxCustodyWorkload(command string, proxyPorts *linuxCustodyProxyPorts)
 	}
 }
 
-func runSessionWithCustody(_ string, command string, validate SessionBrokerValidator, detach SessionBrokerDetachPolicy) error {
+func runSessionWithCustody(_ string, command string, validate SessionBrokerValidator, detach SessionBrokerDetachPolicy, execute SessionBrokerExecutor) error {
 	launch, contained, err := launchLinuxCustodyCommand(command, startLinuxCustodyCommand)
 	if err != nil {
 		return err
@@ -1022,7 +1022,7 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 	defer cancelServices()
 	serviceDone := make(chan linuxCustodyServiceResult, 2)
 	go func() {
-		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: serveSessionBrokerWithPinnedTmux(serviceContext, "/proc/self/exe", launch.tmux, launch.control, brokerFD, validate, detach)}
+		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: serveSessionBrokerWithPinnedTmux(serviceContext, "/proc/self/exe", launch.tmux, launch.control, brokerFD, validate, detach, execute)}
 	}()
 	go func() {
 		serviceDone <- linuxCustodyServiceResult{name: "HTTPS proxy", err: serveHTTPSConnect(serviceContext, launch.proxies.HTTPS)}

@@ -43,17 +43,24 @@ var (
 
 // SessionManager handles polecat session lifecycle.
 type SessionManager struct {
-	tmux                    *tmux.Tmux
-	rig                     *rig.Rig
-	lifecycle               *Manager
-	newSessionGeneration    func(context.Context, string, string, string, map[string]string) (tmux.SessionGeneration, error)
-	cleanupFailedGeneration func(tmux.SessionGeneration) error
-	deliverStartupPrompt    func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error
-	verifyStartupNudge      func(context.Context, string, *config.RuntimeConfig, string, bool) error
-	startPoller             func(string, string, []string) (int, error)
-	stopPoller              func(string, string) error
-	capturePollerGeneration func(string, string) (nudge.PollerGeneration, error)
-	stopPollerGeneration    func(string, string, nudge.PollerGeneration) error
+	tmux                       *tmux.Tmux
+	rig                        *rig.Rig
+	lifecycle                  *Manager
+	newSessionGeneration       func(context.Context, string, string, string, map[string]string) (tmux.SessionGeneration, error)
+	cleanupFailedGeneration    func(tmux.SessionGeneration) error
+	deliverStartupPrompt       func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error
+	verifyStartupNudge         func(context.Context, string, tmux.SessionGeneration, *config.RuntimeConfig, string, bool) error
+	verifyStartupNudgeLocked   func(context.Context, string, tmux.SessionGeneration, *config.RuntimeConfig, string, bool) error
+	beforeStartupGenerationUse func(string)
+	afterStartupGenerationUse  func(string)
+	nudgeStartupSession        func(string, string) error
+	startupGenerationCurrentFn func(tmux.SessionGeneration) bool
+	hasStartupSession          func(context.Context, string) (bool, error)
+	isStartupIdle              func(context.Context, string, *config.RuntimeConfig) (bool, error)
+	startPoller                func(string, string, []string) (int, error)
+	stopPoller                 func(string, string) error
+	capturePollerGeneration    func(string, string) (nudge.PollerGeneration, error)
+	stopPollerGeneration       func(context.Context, string, string, nudge.PollerGeneration) error
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
@@ -66,13 +73,18 @@ func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 	if t != nil {
 		m.newSessionGeneration = t.NewSessionWithCommandAndEnvGenerationContext
 		m.cleanupFailedGeneration = t.CleanupFailedSessionGeneration
+		m.nudgeStartupSession = t.NudgeSession
+		m.hasStartupSession = t.HasSessionContext
+		m.isStartupIdle = t.IsIdleContext
 	}
 	m.deliverStartupPrompt = m.deliverStartupPromptFallback
-	m.verifyStartupNudge = m.verifyStartupNudgeDelivery
+	m.verifyStartupNudge = m.verifyStartupNudgeDeliveryForGeneration
+	m.verifyStartupNudgeLocked = m.verifyStartupNudgeDeliveryCallerLocked
+	m.startupGenerationCurrentFn = m.startupGenerationCurrent
 	m.startPoller = nudge.StartPollerWithEnv
 	m.stopPoller = nudge.StopPoller
 	m.capturePollerGeneration = nudge.CapturePollerGeneration
-	m.stopPollerGeneration = nudge.StopPollerGeneration
+	m.stopPollerGeneration = nudge.StopPollerGenerationContext
 	return m
 }
 
@@ -122,6 +134,10 @@ type SessionStartOptions struct {
 	// OnStarted commits generation-bound post-start state while the lifecycle
 	// lock is still held. An error cleans up only the exact created session.
 	OnStarted func(incarnation string) error
+
+	// OnStartFailed compensates any durable state written by OnStarted. It runs
+	// after asynchronous startup verification has been canceled and joined.
+	OnStartFailed func(incarnation string) error
 }
 
 // EnvAgentIncarnation binds a polecat process to the agent-bead generation
@@ -168,7 +184,11 @@ type SessionCustody struct {
 }
 
 func (m *SessionManager) currentSessionGeneration(sessionID string) (tmux.SessionGeneration, bool, error) {
-	generation, err := m.tmux.CaptureSessionGeneration(sessionID)
+	return m.currentSessionGenerationContext(context.Background(), sessionID)
+}
+
+func (m *SessionManager) currentSessionGenerationContext(ctx context.Context, sessionID string) (tmux.SessionGeneration, bool, error) {
+	generation, err := m.tmux.CaptureSessionGenerationContext(ctx, sessionID)
 	if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
 		return tmux.SessionGeneration{}, false, nil
 	}
@@ -181,8 +201,12 @@ func (m *SessionManager) currentSessionGeneration(sessionID string) (tmux.Sessio
 // CaptureSessionCustody records the exact session and poller generations for a
 // later lifecycle-locked stop.
 func (m *SessionManager) CaptureSessionCustody(polecat string) (SessionCustody, error) {
+	return m.captureSessionCustodyContext(context.Background(), polecat)
+}
+
+func (m *SessionManager) captureSessionCustodyContext(ctx context.Context, polecat string) (SessionCustody, error) {
 	sessionID := m.SessionName(polecat)
-	generation, running, err := m.currentSessionGeneration(sessionID)
+	generation, running, err := m.currentSessionGenerationContext(ctx, sessionID)
 	if err != nil {
 		return SessionCustody{}, fmt.Errorf("capturing session generation: %w", err)
 	}
@@ -201,18 +225,40 @@ func (m *SessionManager) CaptureSessionCustody(polecat string) (SessionCustody, 
 // when its immutable launch receipt belongs to the retiring generation. Proven
 // absence is safe because the lifecycle lock prevents a replacement launch.
 func (m *SessionManager) CaptureSessionCustodyIfIncarnation(polecat, expectedIncarnation string) (SessionCustody, error) {
-	custody, err := m.CaptureSessionCustody(polecat)
+	return m.captureSessionCustodyIfIncarnationContext(context.Background(), polecat, expectedIncarnation)
+}
+
+func (m *SessionManager) captureSessionCustodyForIncarnationContext(ctx context.Context, polecat, expectedIncarnation string) (SessionCustody, bool, error) {
+	custody, err := m.captureSessionCustodyContext(ctx, polecat)
+	if err != nil {
+		return SessionCustody{}, false, err
+	}
+	if !custody.running {
+		return custody, true, nil
+	}
+	observed, err := m.tmux.GetEnvironmentContext(ctx, custody.sessionID, EnvAgentIncarnation)
+	if err != nil {
+		return SessionCustody{}, false, fmt.Errorf("reading session incarnation: %w", err)
+	}
+	confirmed, running, err := m.currentSessionGenerationContext(ctx, custody.sessionID)
+	if err != nil {
+		return SessionCustody{}, false, fmt.Errorf("rechecking session incarnation generation: %w", err)
+	}
+	if !running || !confirmed.Equal(custody.generation) {
+		return SessionCustody{}, false, tmux.ErrSessionGenerationChanged
+	}
+	if strings.TrimSpace(observed) != strings.TrimSpace(expectedIncarnation) {
+		return custody, false, nil
+	}
+	return custody, true, nil
+}
+
+func (m *SessionManager) captureSessionCustodyIfIncarnationContext(ctx context.Context, polecat, expectedIncarnation string) (SessionCustody, error) {
+	custody, matches, err := m.captureSessionCustodyForIncarnationContext(ctx, polecat, expectedIncarnation)
 	if err != nil {
 		return SessionCustody{}, err
 	}
-	if !custody.running {
-		return custody, nil
-	}
-	observed, err := m.tmux.GetEnvironment(custody.sessionID, EnvAgentIncarnation)
-	if err != nil {
-		return SessionCustody{}, fmt.Errorf("reading session incarnation: %w", err)
-	}
-	if strings.TrimSpace(observed) != strings.TrimSpace(expectedIncarnation) {
+	if custody.running && !matches {
 		return SessionCustody{}, fmt.Errorf("%w: session %s incarnation changed", ErrPolecatIncarnationChanged, custody.sessionID)
 	}
 	return custody, nil
@@ -222,7 +268,11 @@ func (m *SessionManager) CaptureSessionCustodyIfIncarnation(polecat, expectedInc
 // CaptureSessionCustody. It fails closed before session mutation when poller
 // custody changed and reports any same-name tmux replacement to the caller.
 func (m *SessionManager) StopSessionCustody(custody SessionCustody) error {
-	current, running, err := m.currentSessionGeneration(custody.sessionID)
+	return m.stopSessionCustodyContext(context.Background(), custody)
+}
+
+func (m *SessionManager) stopSessionCustodyContext(ctx context.Context, custody SessionCustody) error {
+	current, running, err := m.currentSessionGenerationContext(ctx, custody.sessionID)
 	if err != nil {
 		return fmt.Errorf("rechecking session generation: %w", err)
 	}
@@ -232,21 +282,24 @@ func (m *SessionManager) StopSessionCustody(custody SessionCustody) error {
 
 	stopPoller := m.stopPollerGeneration
 	if stopPoller == nil {
-		stopPoller = nudge.StopPollerGeneration
+		stopPoller = nudge.StopPollerGenerationContext
 	}
-	if err := stopPoller(filepath.Dir(m.rig.Path), custody.sessionID, custody.poller); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := stopPoller(ctx, filepath.Dir(m.rig.Path), custody.sessionID, custody.poller); err != nil {
 		return fmt.Errorf("stopping exact poller generation: %w", err)
 	}
 
 	if custody.running && running {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		if err := m.tmux.KillSessionGenerationWithProcessesPortableContext(cleanupCtx, custody.generation); err != nil {
 			return fmt.Errorf("killing exact session generation: %w", err)
 		}
 	}
 
-	final, finalRunning, err := m.currentSessionGeneration(custody.sessionID)
+	final, finalRunning, err := m.currentSessionGenerationContext(ctx, custody.sessionID)
 	if err != nil {
 		return fmt.Errorf("verifying session generation teardown: %w", err)
 	}
@@ -477,16 +530,28 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 // StartContext creates a polecat session under one caller-cancelable deadline.
 func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts SessionStartOptions) (retErr error) {
+	return m.startContext(ctx, polecat, opts, false)
+}
+
+// StartContextCallerLocked starts a session while the caller holds this
+// polecat's lifecycle lock.
+func (m *SessionManager) StartContextCallerLocked(ctx context.Context, polecat string, opts SessionStartOptions) error {
+	return m.startContext(ctx, polecat, opts, true)
+}
+
+func (m *SessionManager) startContext(ctx context.Context, polecat string, opts SessionStartOptions, callerLocked bool) (retErr error) {
 	opts.Incarnation = strings.TrimSpace(opts.Incarnation)
 	lifecycle := m.lifecycle
 	if lifecycle == nil {
 		lifecycle = NewManager(m.rig, nil, m.tmux)
 	}
-	fl, err := lifecycle.lockPolecat(polecat)
-	if err != nil {
-		return err
+	if !callerLocked {
+		fl, err := lifecycle.lockPolecat(polecat)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = fl.Unlock() }()
 	}
-	defer func() { _ = fl.Unlock() }()
 	incarnation, err := lifecycle.resolvePolecatLaunchIncarnationLocked(polecat, opts.Incarnation)
 	if err != nil {
 		return fmt.Errorf("resolving polecat launch incarnation: %w", err)
@@ -673,9 +738,21 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 	if err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}
+	var asyncVerifyCancel context.CancelFunc
+	var asyncVerifyDone chan struct{}
+	postStartCommitAttempted := false
 	defer func() {
 		if retErr == nil {
 			return
+		}
+		if asyncVerifyCancel != nil {
+			asyncVerifyCancel()
+			<-asyncVerifyDone
+		}
+		if postStartCommitAttempted && opts.OnStartFailed != nil {
+			if err := opts.OnStartFailed(opts.Incarnation); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("compensating post-start state: %w", err))
+			}
 		}
 		cleanupFailedGeneration := m.cleanupFailedGeneration
 		if cleanupFailedGeneration == nil {
@@ -778,7 +855,7 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 		if fallbackInfo.SendBeaconNudge {
 			verifyContent = startupPromptFallback
 		}
-		if err := m.verifyStartupNudge(ctx, sessionID, runtimeConfig, verifyContent, startupNudgeSubmitted); err != nil {
+		if err := m.verifyStartupNudgeLocked(ctx, polecat, createdGeneration, runtimeConfig, verifyContent, startupNudgeSubmitted); err != nil {
 			return fmt.Errorf("verifying startup nudge delivery: %w", err)
 		}
 	}
@@ -791,8 +868,12 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 	// synchronous call would add ~25s to every successful polecat startup on the
 	// common gt sling path. Non-fatal: the witness zombie patrol handles unrecovered stalls.
 	if !fallbackInfo.SendBeaconNudge && !fallbackInfo.SendStartupNudge {
+		verifyCtx, cancelVerify := context.WithCancel(context.Background())
+		asyncVerifyCancel = cancelVerify
+		asyncVerifyDone = make(chan struct{})
 		go func() {
-			_ = m.verifyStartupNudge(context.Background(), sessionID, runtimeConfig, startupNudgeContent, false)
+			defer close(asyncVerifyDone)
+			_ = m.verifyStartupNudge(verifyCtx, polecat, createdGeneration, runtimeConfig, startupNudgeContent, false)
 		}()
 	}
 
@@ -823,6 +904,7 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 			sessionID, runtimeConfig.Command)
 	}
 	if opts.OnStarted != nil {
+		postStartCommitAttempted = true
 		if err := opts.OnStarted(opts.Incarnation); err != nil {
 			return fmt.Errorf("committing post-start state: %w", err)
 		}
@@ -851,6 +933,10 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 	return nil
 }
 
+func (m *SessionManager) verifyStartupNudgeDeliveryCallerLocked(ctx context.Context, polecat string, generation tmux.SessionGeneration, rc *config.RuntimeConfig, retryContent string, submitted bool) error {
+	return m.verifyStartupNudgeDeliveryForGenerationMode(ctx, polecat, generation, rc, retryContent, submitted, true)
+}
+
 // isSessionStale checks if a tmux session's pane process has died.
 // A stale session exists in tmux but its main process (the agent) is no longer running.
 // This happens when the agent crashes during startup but tmux keeps the dead pane.
@@ -863,17 +949,43 @@ func (m *SessionManager) isSessionStale(sessionID string) bool {
 // holding the same per-polecat lifecycle lock as Start and nuke. A same-name
 // replacement therefore cannot appear between graceful exit and final teardown.
 func (m *SessionManager) Stop(polecat string, force bool) error {
+	return m.stop(polecat, "", force)
+}
+
+// StopIfIncarnation stops only the session launched for expectedIncarnation.
+func (m *SessionManager) StopIfIncarnation(polecat, expectedIncarnation string, force bool) error {
+	return m.StopIfIncarnationContext(context.Background(), polecat, expectedIncarnation, force)
+}
+
+// StopIfIncarnationContext stops only the session launched for expectedIncarnation.
+func (m *SessionManager) StopIfIncarnationContext(ctx context.Context, polecat, expectedIncarnation string, force bool) error {
+	if strings.TrimSpace(expectedIncarnation) == "" {
+		return fmt.Errorf("%w: missing expected incarnation", ErrPolecatIncarnationChanged)
+	}
+	return m.stopContext(ctx, polecat, expectedIncarnation, force)
+}
+
+func (m *SessionManager) stop(polecat, expectedIncarnation string, force bool) error {
+	return m.stopContext(context.Background(), polecat, expectedIncarnation, force)
+}
+
+func (m *SessionManager) stopContext(ctx context.Context, polecat, expectedIncarnation string, force bool) error {
 	lifecycle := m.lifecycle
 	if lifecycle == nil {
 		lifecycle = NewManager(m.rig, nil, m.tmux)
 	}
-	fl, err := lifecycle.lockPolecat(polecat)
+	fl, err := lifecycle.lockPolecatContext(ctx, polecat)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	custody, err := m.CaptureSessionCustody(polecat)
+	var custody SessionCustody
+	if expectedIncarnation == "" {
+		custody, err = m.captureSessionCustodyContext(ctx, polecat)
+	} else {
+		custody, err = m.captureSessionCustodyIfIncarnationContext(ctx, polecat, expectedIncarnation)
+	}
 	if err != nil {
 		return err
 	}
@@ -882,13 +994,95 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 		_ = m.tmux.SendKeysRawGeneration(custody.generation, "C-c")
 		session.WaitForSessionExit(m.tmux, custody.generation.SessionID, constants.GracefulShutdownTimeout)
 	}
-	if err := m.StopSessionCustody(custody); err != nil {
+	if err := m.stopSessionCustodyContext(ctx, custody); err != nil {
 		return err
 	}
 	if !custody.running {
 		return ErrSessionNotFound
 	}
 	return nil
+}
+
+// RetireIfIncarnationContext tears down only the named generation and commits
+// its terminal bead state while holding the same lifecycle lock as Start.
+func (m *SessionManager) RetireIfIncarnationContext(
+	ctx context.Context,
+	polecat, expectedIncarnation string,
+	commit func(context.Context) error,
+) error {
+	if strings.TrimSpace(expectedIncarnation) == "" {
+		return fmt.Errorf("%w: missing expected incarnation", ErrPolecatIncarnationChanged)
+	}
+	lifecycle := m.lifecycle
+	if lifecycle == nil {
+		lifecycle = NewManager(m.rig, nil, m.tmux)
+	}
+	fl, err := lifecycle.lockPolecatContext(ctx, polecat)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	custody, target, err := m.captureSessionCustodyForIncarnationContext(ctx, polecat, expectedIncarnation)
+	if err != nil {
+		return err
+	}
+	if target {
+		if err := m.stopSessionCustodyContext(ctx, custody); err != nil && !errors.Is(err, ErrSessionNotFound) {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if commit != nil {
+		if err := commit(ctx); err != nil {
+			return err
+		}
+	}
+	running, err := m.sessionIncarnationRunningContext(ctx, polecat, expectedIncarnation)
+	if err != nil {
+		return err
+	}
+	if running {
+		return fmt.Errorf("session %s incarnation %s remained live after retirement", m.SessionName(polecat), expectedIncarnation)
+	}
+	return nil
+}
+
+// RetirementAppliedContext verifies both the immutable session generation and
+// the caller's terminal bead predicate under the polecat lifecycle lock.
+func (m *SessionManager) RetirementAppliedContext(
+	ctx context.Context,
+	polecat, expectedIncarnation string,
+	terminal func(context.Context) (bool, error),
+) (bool, error) {
+	lifecycle := m.lifecycle
+	if lifecycle == nil {
+		lifecycle = NewManager(m.rig, nil, m.tmux)
+	}
+	fl, err := lifecycle.lockPolecatContext(ctx, polecat)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	running, err := m.sessionIncarnationRunningContext(ctx, polecat, expectedIncarnation)
+	if err != nil || running {
+		return false, err
+	}
+	if terminal == nil {
+		return false, errors.New("retirement terminal predicate is required")
+	}
+	return terminal(ctx)
+}
+
+func (m *SessionManager) sessionIncarnationRunningContext(ctx context.Context, polecat, expectedIncarnation string) (bool, error) {
+	custody, target, err := m.captureSessionCustodyForIncarnationContext(ctx, polecat, expectedIncarnation)
+	if err != nil {
+		return false, err
+	}
+	return custody.running && target, nil
 }
 
 // IsRunning checks if a polecat session is active and healthy.
@@ -1155,6 +1349,26 @@ func (m *SessionManager) deliverStartupPromptFallback(
 // Non-fatal: if verification fails or times out, the session is left running.
 // The witness zombie patrol will eventually detect and handle truly idle polecats.
 func (m *SessionManager) verifyStartupNudgeDelivery(ctx context.Context, sessionID string, rc *config.RuntimeConfig, retryContent string, submitted bool) error {
+	if submitted || rc == nil || rc.Tmux == nil || rc.Tmux.ReadyPromptPrefix == "" {
+		return nil
+	}
+	generation, err := m.tmux.CaptureSessionGeneration(sessionID)
+	if err != nil {
+		return err
+	}
+	identity, _ := session.ParseSessionName(sessionID)
+	polecat := ""
+	if identity != nil {
+		polecat = identity.Name
+	}
+	return m.verifyStartupNudgeDeliveryForGeneration(ctx, polecat, generation, rc, retryContent, submitted)
+}
+
+func (m *SessionManager) verifyStartupNudgeDeliveryForGeneration(ctx context.Context, polecat string, generation tmux.SessionGeneration, rc *config.RuntimeConfig, retryContent string, submitted bool) error {
+	return m.verifyStartupNudgeDeliveryForGenerationMode(ctx, polecat, generation, rc, retryContent, submitted, false)
+}
+
+func (m *SessionManager) verifyStartupNudgeDeliveryForGenerationMode(ctx context.Context, polecat string, generation tmux.SessionGeneration, rc *config.RuntimeConfig, retryContent string, submitted bool, callerLocked bool) error {
 	if submitted {
 		return nil
 	}
@@ -1191,7 +1405,15 @@ func (m *SessionManager) verifyStartupNudgeDelivery(ctx context.Context, session
 		}
 
 		// Check if session is still alive
-		running, err := m.tmux.HasSessionContext(ctx, sessionID)
+		var running bool
+		current, err := m.withStartupGenerationUseMode(ctx, polecat, generation, "has-session", callerLocked, func() error {
+			var useErr error
+			running, useErr = m.hasStartupSession(ctx, generation.Name)
+			return useErr
+		})
+		if !current {
+			return nil
+		}
 		if err != nil || !running {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
@@ -1204,7 +1426,15 @@ func (m *SessionManager) verifyStartupNudgeDelivery(ctx context.Context, session
 		// running tools, generating a response), the status bar shows the busy
 		// indicator and IsIdle returns false — even though ❯ may still be
 		// visible in the pane from before Claude started output.
-		idle, err := m.tmux.IsIdleContext(ctx, sessionID, rc)
+		var idle bool
+		current, err = m.withStartupGenerationUseMode(ctx, polecat, generation, "is-idle", callerLocked, func() error {
+			var useErr error
+			idle, useErr = m.isStartupIdle(ctx, generation.Name, rc)
+			return useErr
+		})
+		if !current {
+			return nil
+		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
@@ -1217,25 +1447,41 @@ func (m *SessionManager) verifyStartupNudgeDelivery(ctx context.Context, session
 
 		// Agent is truly idle (no busy indicator, prompt visible) — nudge was likely lost. Retry.
 		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: agent %s idle at prompt, retrying nudge\n",
-			attempt, maxRetries, sessionID)
+			attempt, maxRetries, generation.Name)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		// NudgeSession has no context variant, but its lock acquisition is capped
 		// at 30s and composer submission uses fixed-count probes/retries.
-		nudgeErr := m.tmux.NudgeSession(sessionID, retryContent)
+		current, nudgeErr := m.withStartupGenerationUseMode(ctx, polecat, generation, "nudge", callerLocked, func() error {
+			return m.nudgeStartupSession(generation.Name, retryContent)
+		})
+		if m.afterStartupGenerationUse != nil {
+			m.afterStartupGenerationUse("nudge")
+		}
+		if !current {
+			return nil
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if nudgeErr != nil {
-			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, nudgeErr)
+			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", generation.Name, nudgeErr)
 			return nil
 		}
 	}
 
 	// If we exhausted retries and the agent is still idle, log a warning.
 	// The witness zombie patrol will handle this case.
-	idle, err := m.tmux.IsIdleContext(ctx, sessionID, rc)
+	var idle bool
+	current, err := m.withStartupGenerationUseMode(ctx, polecat, generation, "final-is-idle", callerLocked, func() error {
+		var useErr error
+		idle, useErr = m.isStartupIdle(ctx, generation.Name, rc)
+		return useErr
+	})
+	if !current {
+		return nil
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -1244,9 +1490,45 @@ func (m *SessionManager) verifyStartupNudgeDelivery(ctx context.Context, session
 	}
 	if idle {
 		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: agent %s still idle after %d nudge retries\n",
-			sessionID, maxRetries)
+			generation.Name, maxRetries)
 	}
 	return ctx.Err()
+}
+
+func (m *SessionManager) withStartupGenerationUse(polecat string, expected tmux.SessionGeneration, operation string, use func() error) (bool, error) {
+	return m.withStartupGenerationUseMode(context.Background(), polecat, expected, operation, false, use)
+}
+
+func (m *SessionManager) withStartupGenerationUseMode(ctx context.Context, polecat string, expected tmux.SessionGeneration, operation string, callerLocked bool, use func() error) (bool, error) {
+	if polecat == "" || m.lifecycle == nil {
+		if !m.startupGenerationCurrentFn(expected) {
+			return false, nil
+		}
+		return true, use()
+	}
+	if callerLocked {
+		if !m.startupGenerationCurrentFn(expected) {
+			return false, nil
+		}
+		return true, use()
+	}
+	fl, err := m.lifecycle.lockPolecatContext(ctx, polecat)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+	if !m.startupGenerationCurrentFn(expected) {
+		return false, nil
+	}
+	if m.beforeStartupGenerationUse != nil {
+		m.beforeStartupGenerationUse(operation)
+	}
+	return true, use()
+}
+
+func (m *SessionManager) startupGenerationCurrent(expected tmux.SessionGeneration) bool {
+	current, err := m.tmux.CaptureSessionGeneration(expected.Name)
+	return err == nil && expected.Equal(current)
 }
 
 // hookIssue pins an issue to a polecat's hook using bd update.

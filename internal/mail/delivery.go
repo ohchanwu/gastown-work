@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -82,8 +83,16 @@ func DeliveryAckLabelSequence(recipientIdentity string, at time.Time, existingLa
 // beads whose prefix maps to a different database on the shared Dolt
 // server (au-ofe, au-b9d).
 func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string) error {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return AcknowledgeDeliveryBeadContext(ctx, workDir, beadsDir, beadID, recipientIdentity)
+}
+
+// AcknowledgeDeliveryBeadContext writes delivery acknowledgement labels with
+// caller cancellation.
+func AcknowledgeDeliveryBeadContext(ctx context.Context, workDir, beadsDir, beadID, recipientIdentity string) error {
 	beadsDir = routedBeadsDirForID(beadsDir, beadID)
-	existingLabels, readErr := readBeadLabelsShared(workDir, beadsDir, beadID)
+	existingLabels, readErr := readBeadLabelsSharedContext(ctx, workDir, beadsDir, beadID)
 	if readErr != nil {
 		return readErr
 	}
@@ -96,9 +105,7 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
 	toWrite := deliveryAckLabelsToWrite(recipientIdentity, timeNow().UTC(), existingLabels)
 	for _, label := range toWrite {
 		args := []string{"label", "add", beadID, label}
-		ctx, cancel := bdWriteCtx()
 		_, err := runBdCommand(ctx, args, workDir, beadsDir)
-		cancel()
 		if err == nil {
 			continue // bd label add silently succeeds on duplicate labels.
 		}
@@ -110,7 +117,7 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
 
 	labelsAfterAck := append(append([]string{}, existingLabels...), toWrite...)
 	if deliveryPendingRemovalNeeded(labelsAfterAck) {
-		return removeDeliveryPendingLabel(workDir, beadsDir, beadID)
+		return removeDeliveryPendingLabelContext(ctx, workDir, beadsDir, beadID)
 	}
 	return nil
 }
@@ -130,10 +137,14 @@ func deliveryPendingRemovalNeeded(labels []string) bool {
 }
 
 func removeDeliveryPendingLabel(workDir, beadsDir, beadID string) error {
-	args := []string{"label", "remove", beadID, DeliveryLabelPending}
 	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return removeDeliveryPendingLabelContext(ctx, workDir, beadsDir, beadID)
+}
+
+func removeDeliveryPendingLabelContext(ctx context.Context, workDir, beadsDir, beadID string) error {
+	args := []string{"label", "remove", beadID, DeliveryLabelPending}
 	_, err := runBdCommand(ctx, args, workDir, beadsDir)
-	cancel()
 	if err == nil {
 		return nil
 	}
@@ -187,9 +198,13 @@ func routedBeadsDirForID(currentBeadsDir, beadID string) string {
 // readBeadLabelsShared reads the labels for a bead, returning an error on failure
 // instead of silently swallowing it.
 func readBeadLabelsShared(workDir, beadsDir, id string) ([]string, error) {
-	args := []string{"show", id, "--json"}
 	ctx, cancel := bdReadCtx()
 	defer cancel()
+	return readBeadLabelsSharedContext(ctx, workDir, beadsDir, id)
+}
+
+func readBeadLabelsSharedContext(ctx context.Context, workDir, beadsDir, id string) ([]string, error) {
+	args := []string{"show", id, "--json"}
 	stdout, err := runBdCommand(ctx, args, workDir, beadsDir)
 	if err != nil {
 		if bdErr, ok := err.(*bdError); ok && (bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found")) {

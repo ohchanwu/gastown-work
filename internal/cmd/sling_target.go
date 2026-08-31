@@ -17,6 +17,9 @@ var spawnPolecatForSling = SpawnPolecatForSling
 // resolveTargetAgentFn is a seam for tests. Production uses resolveTargetAgent.
 var resolveTargetAgentFn = resolveTargetAgent
 
+// resolveSelfTargetFn is a seam for command-level assignment tests.
+var resolveSelfTargetFn = resolveSelfTarget
+
 // resolveTargetAgent converts a target spec to agent ID, pane, and hook root.
 func resolveTargetAgent(target string) (agentID string, pane string, hookRoot string, err error) {
 	// First resolve to session name
@@ -244,6 +247,9 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 		}
 		spawnInfo, err := spawnPolecatForSling(rigName, spawnOpts)
 		if err != nil {
+			if spawnInfo != nil {
+				cleanupSpawnedPolecatFn(spawnInfo, rigName, "")
+			}
 			return nil, fmt.Errorf("spawning polecat: %w", err)
 		}
 		result.Agent = spawnInfo.AgentID()
@@ -286,6 +292,9 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			}
 			spawnInfo, spawnErr := spawnPolecatForSling(rigName, spawnOpts)
 			if spawnErr != nil {
+				if spawnInfo != nil {
+					cleanupSpawnedPolecatFn(spawnInfo, rigName, "")
+				}
 				return nil, fmt.Errorf("spawning polecat to replace dead polecat: %w", spawnErr)
 			}
 			result.Agent = spawnInfo.AgentID()

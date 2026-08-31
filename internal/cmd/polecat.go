@@ -2233,6 +2233,8 @@ func provePolecatNukeCustody(
 	return custody, nil
 }
 
+var removePolecatJournaled = (*polecat.Manager).RemoveWithOptionsLocalOnlyIfIncarnationJournaled
+
 func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig, opts nukePolecatOptions) error {
 	agentID := polecatBeadIDForRig(r, rigName, polecatName)
 	_, durableFields, err := beads.New(r.Path).GetAgentBead(agentID)
@@ -2252,34 +2254,52 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		if err != nil {
 			return err
 		}
-		moleculeID, err := retirementMoleculeID(initialCustody.PolecatInfo.Issue, r)
+		workReceipts, err := retirementWorkReceipts(durableFields, r)
 		if err != nil {
 			return err
+		}
+		clonePath, err := canonicalRetirementClonePath(initialCustody.PolecatInfo.ClonePath)
+		if err != nil {
+			return fmt.Errorf("canonicalizing retirement clone path: %w", err)
 		}
 		gitState, err := json.Marshal(initialCustody.Git)
 		if err != nil {
 			return fmt.Errorf("encoding Git retirement receipt: %w", err)
 		}
 		record = beads.AgentRetirementRecord{
-			WorkBead:  initialCustody.PolecatInfo.Issue,
-			Molecule:  moleculeID,
-			ClonePath: initialCustody.PolecatInfo.ClonePath,
-			Branch:    initialCustody.BranchToDelete,
-			GitHead:   initialCustody.Git.Head,
-			GitState:  string(gitState),
-			Targets:   append([]string(nil), initialCustody.BranchTargets...),
+			Version:         beads.AgentRetirementJournalVersion,
+			HookBead:        durableFields.HookBead,
+			LastSourceIssue: durableFields.LastSourceIssue,
+			WorkReceipts:    workReceipts,
+			ClonePath:       clonePath,
+			Branch:          initialCustody.BranchToDelete,
+			GitHead:         initialCustody.Git.Head,
+			GitState:        string(gitState),
+			Targets:         sortedStrings(initialCustody.BranchTargets),
 		}
 	}
 
 	sessMgr := polecat.NewSessionManager(tmux.NewTmux(), r)
-	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnationJournaled(
+	if resuming {
+		if err := validateResumedRetirementRecord(r, record); err != nil {
+			return err
+		}
+	}
+	err = removePolecatJournaled(mgr,
 		polecatName, incarnation, opts.Force, true, false, record,
 		func(_ *polecat.Polecat) (*beads.AgentFields, error) {
 			candidate, lockedErr := provePolecatNukeCustody(polecatName, rigName, mgr, r, opts)
 			if lockedErr != nil {
 				return nil, lockedErr
 			}
-			moleculeID, lockedErr := retirementMoleculeID(candidate.PolecatInfo.Issue, r)
+			if candidate.PolecatInfo == nil || candidate.AgentFields == nil {
+				return nil, errors.New("locked polecat retirement custody is incomplete")
+			}
+			workReceipts, lockedErr := retirementWorkReceipts(candidate.AgentFields, r)
+			if lockedErr != nil {
+				return nil, lockedErr
+			}
+			clonePath, lockedErr := canonicalRetirementClonePath(candidate.PolecatInfo.ClonePath)
 			if lockedErr != nil {
 				return nil, lockedErr
 			}
@@ -2288,9 +2308,13 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 				return nil, fmt.Errorf("encoding rechecked Git retirement receipt: %w", lockedErr)
 			}
 			if candidate.PolecatInfo == nil || candidate.PolecatInfo.Incarnation != incarnation ||
-				candidate.PolecatInfo.Issue != record.WorkBead || candidate.PolecatInfo.ClonePath != record.ClonePath || candidate.BranchToDelete != record.Branch ||
-				candidate.Git.Head != record.GitHead || string(candidateGitState) != record.GitState || moleculeID != record.Molecule ||
-				!slices.Equal(candidate.BranchTargets, record.Targets) {
+				candidate.AgentFields == nil || candidate.AgentFields.HookBead != record.HookBead ||
+				candidate.AgentFields.LastSourceIssue != record.LastSourceIssue ||
+				(candidate.PolecatInfo.Issue != "" && candidate.PolecatInfo.Issue != record.HookBead && candidate.PolecatInfo.Issue != record.LastSourceIssue) ||
+				clonePath != record.ClonePath || candidate.BranchToDelete != record.Branch ||
+				candidate.Git.Head != record.GitHead || string(candidateGitState) != record.GitState ||
+				!slices.Equal(workReceipts, record.WorkReceipts) ||
+				!slices.Equal(sortedStrings(candidate.BranchTargets), record.Targets) {
 				return nil, fmt.Errorf("%w during nuke recheck", polecat.ErrPolecatIncarnationChanged)
 			}
 			lockedCustody = candidate
@@ -2311,7 +2335,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		},
 		func(current *beads.AgentRetirementRecord, advance func(string) error) error {
 			if retirementPhaseBeforeCmd(current.Phase, beads.AgentRetirementPhaseMoleculeCleaned) {
-				if err := nukeCleanupMoleculeExact(current.WorkBead, current.Molecule, r); err != nil {
+				if err := cleanupRetirementWorkReceipts(current.WorkReceipts, r, nukeCleanupMoleculeExact); err != nil {
 					return err
 				}
 				if err := advance(beads.AgentRetirementPhaseMoleculeCleaned); err != nil {
@@ -2319,26 +2343,30 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 				}
 				current.Phase = beads.AgentRetirementPhaseMoleculeCleaned
 			}
-			if current.Branch != "" && retirementPhaseBeforeCmd(current.Phase, beads.AgentRetirementPhaseBranchVerified) {
-				if err := verifyRetirementBranchRecord(r, *current); err != nil {
-					return err
+			if retirementPhaseBeforeCmd(current.Phase, beads.AgentRetirementPhaseBranchVerified) {
+				if current.Branch != "" {
+					if err := verifyRetirementBranchRecord(r, *current); err != nil {
+						return err
+					}
 				}
 				if err := advance(beads.AgentRetirementPhaseBranchVerified); err != nil {
 					return err
 				}
 				current.Phase = beads.AgentRetirementPhaseBranchVerified
 			}
-			if current.Branch != "" && retirementPhaseBeforeCmd(current.Phase, beads.AgentRetirementPhaseBranchDeleted) {
-				repoGit := getRepoGitForRig(r.Path)
-				exists, existsErr := repoGit.BranchExists(current.Branch)
-				if existsErr != nil {
-					return fmt.Errorf("checking branch before delete: %w", existsErr)
-				}
-				if exists {
-					if err := repoGit.DeleteBranch(current.Branch, true); err != nil {
-						return fmt.Errorf("branch delete: %w", err)
+			if retirementPhaseBeforeCmd(current.Phase, beads.AgentRetirementPhaseBranchDeleted) {
+				if current.Branch != "" {
+					repoGit := getRepoGitForRig(r.Path)
+					exists, existsErr := repoGit.BranchExists(current.Branch)
+					if existsErr != nil {
+						return fmt.Errorf("checking branch before delete: %w", existsErr)
 					}
-					fmt.Printf("  %s deleted local branch %s\n", style.Success.Render("✓"), current.Branch)
+					if exists {
+						if err := deletePreservedLocalPolecatBranch(repoGit, current.Branch, current.GitHead, current.Targets); err != nil {
+							return fmt.Errorf("branch delete: %w", err)
+						}
+						fmt.Printf("  %s deleted local branch %s\n", style.Success.Render("✓"), current.Branch)
+					}
 				}
 				if err := advance(beads.AgentRetirementPhaseBranchDeleted); err != nil {
 					return err
@@ -2365,6 +2393,13 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		purgeClosedEphemeralBeads(beads.New(r.Path))
 	}
 
+	return nil
+}
+
+func validateResumedRetirementRecord(r *rig.Rig, record beads.AgentRetirementRecord) error {
+	if err := verifyRetirementGitRecord(r, record); err != nil {
+		return fmt.Errorf("validating resumed retirement Git receipt: %w", err)
+	}
 	return nil
 }
 
@@ -2479,17 +2514,63 @@ func verifyPolecatNukeGitCustody(r *rig.Rig, expected polecatNukeCustody) error 
 }
 
 func verifyRetirementGitRecord(r *rig.Rig, record beads.AgentRetirementRecord) error {
-	if record.Branch == "" {
-		return nil
+	if err := beads.ValidateAgentRetirementRecord(record); err != nil {
+		return err
 	}
-	if _, err := os.Stat(record.ClonePath); os.IsNotExist(err) {
-		return verifyRetirementBranchRecord(r, record)
-	} else if err != nil {
-		return fmt.Errorf("checking retirement worktree: %w", err)
+	canonicalClone, err := canonicalRetirementClonePath(record.ClonePath)
+	if err != nil {
+		return fmt.Errorf("canonicalizing retirement clone path: %w", err)
+	}
+	if canonicalClone != record.ClonePath {
+		return fmt.Errorf("retirement clone path is not canonical: got %q, want %q", record.ClonePath, canonicalClone)
 	}
 	var expected polecatNukeGitSnapshot
 	if err := json.Unmarshal([]byte(record.GitState), &expected); err != nil {
 		return fmt.Errorf("decoding Git retirement receipt: %w", err)
+	}
+	if expected.Branch != record.Branch || expected.Head != record.GitHead {
+		return fmt.Errorf("retirement Git branch identity mismatch: snapshot branch/head %q/%q, journal %q/%q",
+			expected.Branch, expected.Head, record.Branch, record.GitHead)
+	}
+	if r == nil {
+		return errors.New("retirement rig is unavailable")
+	}
+	if record.Branch != "" {
+		repoGit := getRepoGitForRig(r.Path)
+		if err := repoGit.ValidateBranchName(record.Branch); err != nil {
+			return err
+		}
+	}
+	_, cloneErr := os.Stat(record.ClonePath)
+	cloneMissing := os.IsNotExist(cloneErr)
+	if cloneErr != nil && !cloneMissing {
+		return fmt.Errorf("checking retirement worktree: %w", cloneErr)
+	}
+	if !retirementPhaseBeforeCmd(record.Phase, beads.AgentRetirementPhaseLocalRemoved) {
+		if !cloneMissing {
+			return fmt.Errorf("retirement worktree still exists after local removal: %s", record.ClonePath)
+		}
+		if record.Branch == "" {
+			return nil
+		}
+		repoGit := getRepoGitForRig(r.Path)
+		exists, existsErr := repoGit.BranchExists(record.Branch)
+		if existsErr != nil {
+			return fmt.Errorf("checking retirement branch: %w", existsErr)
+		}
+		if !retirementPhaseBeforeCmd(record.Phase, beads.AgentRetirementPhaseBranchDeleted) {
+			if exists {
+				return fmt.Errorf("retirement branch still exists after delete checkpoint: %s", record.Branch)
+			}
+			return nil
+		}
+		if !exists {
+			if record.Phase == beads.AgentRetirementPhaseBranchVerified {
+				return nil // delete committed; durable phase checkpoint did not
+			}
+			return fmt.Errorf("retirement branch disappeared before delete: %s", record.Branch)
+		}
+		return verifyRetirementBranchRecord(r, record)
 	}
 	custody := polecatNukeCustody{
 		PolecatInfo:    &polecat.Polecat{ClonePath: record.ClonePath},
@@ -2498,6 +2579,22 @@ func verifyRetirementGitRecord(r *rig.Rig, record beads.AgentRetirementRecord) e
 		Git:            expected,
 	}
 	return verifyPolecatNukeGitCustody(r, custody)
+}
+
+func canonicalRetirementClonePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	if os.IsNotExist(err) {
+		return abs, nil
+	}
+	return "", err
 }
 
 func verifyRetirementBranchRecord(r *rig.Rig, record beads.AgentRetirementRecord) error {
@@ -2554,11 +2651,11 @@ func verifyPreservedLocalPolecatBranch(repoGit *git.Git, branch string, targets 
 	return nil
 }
 
-func deletePreservedLocalPolecatBranch(repoGit *git.Git, branch string, targets []string) error {
+func deletePreservedLocalPolecatBranch(repoGit *git.Git, branch, expectedOID string, targets []string) error {
 	if err := verifyPreservedLocalPolecatBranch(repoGit, branch, targets); err != nil {
 		return err
 	}
-	return repoGit.DeleteBranch(branch, true)
+	return repoGit.DeleteBranchIfMatches(branch, expectedOID)
 }
 
 type activeMRRemovalChecker interface {
@@ -2591,6 +2688,45 @@ func retirementMoleculeID(workBeadID string, r *rig.Rig) (string, error) {
 	return attachment.AttachedMolecule, nil
 }
 
+func retirementWorkReceipts(fields *beads.AgentFields, r *rig.Rig) ([]beads.AgentRetirementWorkReceipt, error) {
+	if fields == nil {
+		return nil, errors.New("authoritative agent work receipts are unavailable")
+	}
+	work := make(map[string]bool, 2)
+	for _, id := range []string{fields.HookBead, fields.LastSourceIssue} {
+		if id = strings.TrimSpace(id); id != "" {
+			work[id] = true
+		}
+	}
+	ids := make([]string, 0, len(work))
+	for id := range work {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	receipts := make([]beads.AgentRetirementWorkReceipt, 0, len(ids))
+	for _, id := range ids {
+		molecule, err := retirementMoleculeID(id, r)
+		if err != nil {
+			return nil, err
+		}
+		receipts = append(receipts, beads.AgentRetirementWorkReceipt{WorkBead: id, Molecule: molecule})
+	}
+	return receipts, nil
+}
+
+func cleanupRetirementWorkReceipts(
+	receipts []beads.AgentRetirementWorkReceipt,
+	r *rig.Rig,
+	cleanup func(string, string, *rig.Rig) error,
+) error {
+	for _, receipt := range receipts {
+		if err := cleanup(receipt.WorkBead, receipt.Molecule, r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // nukeCleanupMoleculeExact is idempotent and fails closed. The exact molecule
 // ID survives detach in the retirement journal, so retries never rediscover a
 // different attachment.
@@ -2603,47 +2739,22 @@ func nukeCleanupMoleculeExact(workBeadID, moleculeID string, r *rig.Rig) error {
 	// detach/close operations route to the wrong database and the stale
 	// molecule attachment persists on the work bead. (gt--1up)
 	bd := beads.New(filepath.Join(r.Path, "mayor", "rig"))
-
-	// Fetch the work bead to verify that any remaining attachment is the exact
-	// journaled molecule.
-	issue, err := bd.Show(workBeadID)
+	if resumed, _, err := resumeMoleculeCleanupIfPresentFn(bd, workBeadID, "burn", "burned: polecat nuked"); err != nil {
+		return err
+	} else if resumed {
+		return nil
+	}
+	work, err := bd.Show(workBeadID)
 	if err != nil {
-		return fmt.Errorf("fetching retirement work bead %s: %w", workBeadID, err)
-	}
-
-	attachment := beads.ParseAttachmentFields(issue)
-	if attachment != nil && attachment.AttachedMolecule != "" && attachment.AttachedMolecule != moleculeID {
-		return fmt.Errorf("work bead %s now references replacement molecule %s", workBeadID, attachment.AttachedMolecule)
-	}
-
-	// Force-close descendant steps before detaching (prevents orphaned step beads).
-	// Uses force variant since nuke is destructive — must succeed even for beads in
-	// invalid states.
-	if _, err := forceCloseDescendants(bd, moleculeID); err != nil {
-		return fmt.Errorf("closing descendants of %s: %w", moleculeID, err)
-	}
-
-	if attachment != nil && attachment.AttachedMolecule == moleculeID {
-		if _, detachErr := bd.DetachMoleculeWithAudit(workBeadID, beads.DetachOptions{
-			Operation: "burn",
-			Reason:    "polecat nuked: cleaning stale molecule",
-		}); detachErr != nil {
-			return fmt.Errorf("detaching molecule %s: %w", moleculeID, detachErr)
-		}
-	}
-
-	if err := removeMoleculeBondsStrict(bd, workBeadID, moleculeID); err != nil {
 		return err
 	}
-
-	molecule, showErr := bd.Show(moleculeID)
-	if showErr != nil && !errors.Is(showErr, beads.ErrNotFound) {
-		return fmt.Errorf("reading molecule root %s: %w", moleculeID, showErr)
+	attachment := beads.ParseAttachmentFields(work)
+	if attachment == nil || attachment.AttachedMolecule != moleculeID {
+		return fmt.Errorf("work bead %s molecule changed: expected exact molecule %s", workBeadID, moleculeID)
 	}
-	if showErr == nil && molecule.Status != string(beads.StatusClosed) {
-		if closeErr := bd.ForceCloseWithReason("burned: polecat nuked", moleculeID); closeErr != nil {
-			return fmt.Errorf("closing molecule root %s: %w", moleculeID, closeErr)
-		}
+	pinned := &beadInfo{Status: work.Status, Assignee: work.Assignee, Description: work.Description}
+	if _, err := detachAndCleanupMoleculesFn(bd, workBeadID, pinned, "burn", "", "polecat nuked: cleaning stale molecule", "burned: polecat nuked", []string{moleculeID}); err != nil {
+		return err
 	}
 	fmt.Printf("  %s burned stale molecule %s from work bead %s\n",
 		style.Success.Render("✓"), moleculeID, workBeadID)

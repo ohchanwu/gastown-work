@@ -446,16 +446,83 @@ func TestResolveTargetRigPassesHeldAdmissionToSpawn(t *testing.T) {
 	}
 }
 
+func TestResolveTargetRigCleansPartialSpawnReceiptOnError(t *testing.T) {
+	for _, generation := range []string{"reused-generation", "new-generation"} {
+		t.Run(generation, func(t *testing.T) {
+			townRoot := setupPolecatCapacityRig(t, 1)
+			partial := &SpawnedPolecatInfo{
+				RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "gastown", "polecats", "toast"),
+				Branch: "polecat/toast/work", Incarnation: generation,
+			}
+			oldSpawn, oldCleanup := spawnPolecatForSling, cleanupSpawnedPolecatFn
+			t.Cleanup(func() {
+				spawnPolecatForSling, cleanupSpawnedPolecatFn = oldSpawn, oldCleanup
+			})
+			spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+				return partial, errors.New("injected branch receipt failure")
+			}
+			cleaned := false
+			cleanupSpawnedPolecatFn = func(got *SpawnedPolecatInfo, rigName, convoyID string) {
+				cleaned = got == partial && rigName == "gastown" && convoyID == ""
+			}
+
+			_, err := resolveTarget("gastown", ResolveTargetOptions{TownRoot: townRoot, NoBoot: true})
+			if err == nil || !strings.Contains(err.Error(), "injected branch receipt failure") {
+				t.Fatalf("resolveTarget error = %v", err)
+			}
+			if !cleaned {
+				t.Fatal("direct rig target leaked its partial spawn generation")
+			}
+		})
+	}
+}
+
+func TestResolveTargetDeadPolecatCleansPartialSpawnReceiptOnError(t *testing.T) {
+	for _, generation := range []string{"reused-generation", "new-generation"} {
+		t.Run(generation, func(t *testing.T) {
+			townRoot := setupPolecatCapacityRig(t, 1)
+			partial := &SpawnedPolecatInfo{
+				RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "gastown", "polecats", "toast"),
+				Branch: "polecat/toast/work", Incarnation: generation,
+			}
+			oldSpawn, oldCleanup, oldResolve := spawnPolecatForSling, cleanupSpawnedPolecatFn, resolveTargetAgentFn
+			t.Cleanup(func() {
+				spawnPolecatForSling, cleanupSpawnedPolecatFn, resolveTargetAgentFn = oldSpawn, oldCleanup, oldResolve
+			})
+			resolveTargetAgentFn = func(string) (string, string, string, error) {
+				return "", "", "", errors.New("missing dead polecat pane")
+			}
+			spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+				return partial, errors.New("injected branch receipt failure")
+			}
+			cleaned := false
+			cleanupSpawnedPolecatFn = func(got *SpawnedPolecatInfo, rigName, convoyID string) {
+				cleaned = got == partial && rigName == "gastown" && convoyID == ""
+			}
+
+			_, err := resolveTarget("gastown/toast", ResolveTargetOptions{TownRoot: townRoot, Create: true, NoBoot: true})
+			if err == nil || !strings.Contains(err.Error(), "injected branch receipt failure") {
+				t.Fatalf("resolveTarget error = %v", err)
+			}
+			if !cleaned {
+				t.Fatal("dead-polecat replacement target leaked its partial spawn generation")
+			}
+		})
+	}
+}
+
 func TestStandaloneFormulaRigTargetAcquiresSingleAdmission(t *testing.T) {
 	townRoot := setupPolecatCapacityRig(t, 1)
 	oldAcquire := acquirePolecatAdmissionFn
 	oldSpawn := spawnPolecatForSling
 	oldFind := findHookedFormulaSingletonFn
+	oldAssign := assignPolecatWorkIfCurrent
 	oldDryRun, oldNoBoot := slingDryRun, slingNoBoot
 	t.Cleanup(func() {
 		acquirePolecatAdmissionFn = oldAcquire
 		spawnPolecatForSling = oldSpawn
 		findHookedFormulaSingletonFn = oldFind
+		assignPolecatWorkIfCurrent = oldAssign
 		slingDryRun, slingNoBoot = oldDryRun, oldNoBoot
 	})
 	slingDryRun = false
@@ -482,6 +549,7 @@ func TestStandaloneFormulaRigTargetAcquiresSingleAdmission(t *testing.T) {
 	findHookedFormulaSingletonFn = func(workDir, targetAgent, formulaName string) (*beads.Issue, error) {
 		return &beads.Issue{ID: "gt-wisp-existing"}, nil
 	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
 
 	if err := runSlingFormula(context.Background(), []string{"test-formula", "gastown"}); err != nil {
 		t.Fatalf("runSlingFormula: %v", err)
@@ -496,11 +564,13 @@ func TestStandaloneFormulaExistingPolecatNoopDoesNotRequireCapacity(t *testing.T
 	oldAcquire := acquirePolecatAdmissionFn
 	oldResolve := resolveTargetAgentFn
 	oldFind := findHookedFormulaSingletonFn
+	oldAssign := assignPolecatWorkIfCurrent
 	oldDryRun := slingDryRun
 	t.Cleanup(func() {
 		acquirePolecatAdmissionFn = oldAcquire
 		resolveTargetAgentFn = oldResolve
 		findHookedFormulaSingletonFn = oldFind
+		assignPolecatWorkIfCurrent = oldAssign
 		slingDryRun = oldDryRun
 	})
 	slingDryRun = false
@@ -517,6 +587,7 @@ func TestStandaloneFormulaExistingPolecatNoopDoesNotRequireCapacity(t *testing.T
 	findHookedFormulaSingletonFn = func(workDir, targetAgent, formulaName string) (*beads.Issue, error) {
 		return &beads.Issue{ID: "gt-wisp-existing"}, nil
 	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
 
 	if err := runSlingFormula(context.Background(), []string{"test-formula", "gastown/polecats/toast"}); err != nil {
 		t.Fatalf("runSlingFormula: %v", err)

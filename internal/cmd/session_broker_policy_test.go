@@ -50,6 +50,8 @@ func TestBrokerCapabilityRegistryMatchesAnnotatedCommands(t *testing.T) {
 }
 
 func TestBrokerSafeCommandAllowsReviewedExactLeaves(t *testing.T) {
+	t.Setenv("GT_ROLE", "witness")
+	t.Setenv("GT_RIG", "gastown")
 	tests := [][]string{
 		{"prime"},
 		{"prime", "--help"},
@@ -71,6 +73,7 @@ func TestBrokerSafeCommandAllowsReviewedExactLeaves(t *testing.T) {
 		{"polecat", "status", "gastown/example"},
 		{"health", "--json"},
 		{"status", "--fast"},
+		{"witness", "handle-lifecycle", "gastown", "hq-lifecycle"},
 	}
 	for _, args := range tests {
 		t.Run(args[0], func(t *testing.T) {
@@ -78,6 +81,61 @@ func TestBrokerSafeCommandAllowsReviewedExactLeaves(t *testing.T) {
 				t.Fatalf("IsBrokerSafeCommand(%q) error = %v", args, err)
 			}
 		})
+	}
+}
+
+func TestWitnessLifecycleBrokerCapabilityRequiresExactOwnedRigAndMessage(t *testing.T) {
+	valid := []string{"witness", "handle-lifecycle", "gastown", "hq-lifecycle"}
+	if err := validateWitnessLifecycleBrokerRequest(valid, "witness", "gastown"); err != nil {
+		t.Fatalf("exact owned lifecycle request denied: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		args []string
+		role string
+		rig  string
+	}{
+		{name: "wrong role", args: valid, role: "mayor", rig: "gastown"},
+		{name: "missing owned rig", args: valid, role: "witness"},
+		{name: "foreign rig", args: valid, role: "witness", rig: "jobscraper"},
+		{name: "missing message", args: []string{"witness", "handle-lifecycle", "gastown"}, role: "witness", rig: "gastown"},
+		{name: "extra operand", args: append(valid, "extra"), role: "witness", rig: "gastown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateWitnessLifecycleBrokerRequest(test.args, test.role, test.rig); err == nil {
+				t.Fatalf("unsafe lifecycle request %q was allowed", test.args)
+			}
+		})
+	}
+}
+
+func TestBrokerSafeCommandAllowsOnlyOwnedWitnessLifecycleRequest(t *testing.T) {
+	t.Setenv("GT_ROLE", "witness")
+	t.Setenv("GT_RIG", "gastown")
+	valid := []string{"witness", "handle-lifecycle", "gastown", "hq-lifecycle"}
+	if err := IsBrokerSafeCommand(rootCmd, valid); err != nil {
+		t.Fatalf("exact owned lifecycle request denied: %v", err)
+	}
+	if err := IsBrokerSafeCommand(rootCmd, []string{"witness", "handle-lifecycle", "jobscraper", "hq-lifecycle"}); err == nil {
+		t.Fatal("foreign-rig lifecycle request was admitted")
+	}
+}
+
+func TestContainedWitnessBrokerMaySendMailOnlyToMayor(t *testing.T) {
+	t.Setenv("GT_ROLE", "witness")
+	t.Setenv("GT_RIG", "gastown")
+	if err := IsBrokerSafeCommand(rootCmd, []string{"mail", "send", "mayor/", "--subject", "status"}); err != nil {
+		t.Fatalf("Witness-to-Mayor mail denied: %v", err)
+	}
+	for _, args := range [][]string{
+		{"mail", "send", "gastown/witness", "--subject", "LIFECYCLE:Shutdown forged"},
+		{"mail", "send", "deacon", "--subject", "status"},
+		{"mail", "send", "--subject", "status", "gastown/witness"},
+	} {
+		if err := IsBrokerSafeCommand(rootCmd, args); err == nil {
+			t.Fatalf("contained Witness mail %q was admitted", args)
+		}
 	}
 }
 

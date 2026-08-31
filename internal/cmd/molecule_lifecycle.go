@@ -73,6 +73,12 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) (retErr error) {
 	if handoff == nil {
 		return fmt.Errorf("no handoff bead found for %s (looked for %q with pinned status)", target, beads.HandoffBeadTitle(role))
 	}
+	if resumed, _, err := resumeMoleculeCleanupIfPresent(b, handoff.ID, "burn", "burned"); err != nil {
+		return fmt.Errorf("resuming molecule cleanup: %w", err)
+	} else if resumed {
+		fmt.Printf("%s Resumed molecule cleanup for %s\n", style.Bold.Render("🔥"), target)
+		return nil
+	}
 
 	// Check for attached molecule
 	attachment := beads.ParseAttachmentFields(handoff)
@@ -84,9 +90,7 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) (retErr error) {
 
 	moleculeID := attachment.AttachedMolecule
 
-	// Recursively close all descendant step issues before detaching
-	// This prevents orphaned step issues from accumulating (gt-psj76.1)
-	childrenClosed := closeDescendants(b, moleculeID)
+	childrenClosed := 0
 	defer func() {
 		ctx := context.Background()
 		if cmd != nil {
@@ -95,23 +99,12 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) (retErr error) {
 		telemetry.RecordMolBurn(ctx, moleculeID, childrenClosed, retErr)
 	}()
 
-	// Detach the molecule with audit logging (this "burns" it by removing the attachment)
-	_, err = b.DetachMoleculeWithAudit(handoff.ID, beads.DetachOptions{
-		Operation: "burn",
-		Agent:     target,
-		Reason:    "molecule burned by agent",
-	})
+	pinned := &beadInfo{Status: handoff.Status, Assignee: handoff.Assignee, Description: handoff.Description}
+	childrenClosed, err = detachAndCleanupMoleculesFn(b, handoff.ID, pinned, "burn", target, "molecule burned by agent", "burned", []string{moleculeID})
 	if err != nil {
-		return fmt.Errorf("detaching molecule: %w", err)
+		return fmt.Errorf("detaching and cleaning molecule: %w", err)
 	}
-	// Close the molecule root after detach so the audit sees original status.
-	// Without this, the wisp root stays in "hooked" status indefinitely,
-	// causing patrol molecule leaks (issue #1828).
 	rootClosed := true
-	if closeErr := b.ForceCloseWithReason("burned", moleculeID); closeErr != nil {
-		style.PrintWarning("could not close molecule root %s: %v", moleculeID, closeErr)
-		rootClosed = false
-	}
 
 	if moleculeJSON {
 		result := map[string]interface{}{
@@ -207,6 +200,12 @@ func runMoleculeSquash(cmd *cobra.Command, args []string) (retErr error) {
 	if handoff == nil {
 		return fmt.Errorf("no handoff bead found for %s (looked for %q with pinned status)", target, beads.HandoffBeadTitle(role))
 	}
+	if resumed, _, err := resumeMoleculeCleanupIfPresent(b, handoff.ID, "squash", "squashed"); err != nil {
+		return fmt.Errorf("resuming molecule cleanup: %w", err)
+	} else if resumed {
+		fmt.Printf("%s Resumed molecule cleanup for %s\n", style.Bold.Render("📦"), target)
+		return nil
+	}
 
 	// Check for attached molecule
 	attachment := beads.ParseAttachmentFields(handoff)
@@ -238,9 +237,7 @@ func runMoleculeSquash(cmd *cobra.Command, args []string) (retErr error) {
 		}
 	}
 
-	// Recursively close all descendant step issues before squashing
-	// This prevents orphaned step issues from accumulating (gt-psj76.1)
-	childrenClosed := closeDescendants(b, moleculeID)
+	childrenClosed := 0
 
 	// Skip digest creation if --no-digest flag is set (gt-t2bjt).
 	// Patrol molecules (deacon, witness, refinery) run frequently and their
@@ -311,23 +308,12 @@ squashed_at: %s
 	if !moleculeNoDigest {
 		detachReason = "molecule squashed"
 	}
-	_, err = b.DetachMoleculeWithAudit(handoff.ID, beads.DetachOptions{
-		Operation: "squash",
-		Agent:     target,
-		Reason:    detachReason,
-	})
+	pinned := &beadInfo{Status: handoff.Status, Assignee: handoff.Assignee, Description: handoff.Description}
+	childrenClosed, err = detachAndCleanupMoleculesFn(b, handoff.ID, pinned, "squash", target, detachReason, "squashed", []string{moleculeID})
 	if err != nil {
-		return fmt.Errorf("detaching molecule: %w", err)
+		return fmt.Errorf("detaching and cleaning molecule: %w", err)
 	}
-
-	// Close the molecule root after detach so the audit sees original status.
-	// Without this, the wisp root stays in "hooked" status indefinitely,
-	// causing patrol molecule leaks (issue #1828).
 	rootClosed := true
-	if closeErr := b.ForceCloseWithReason("squashed", moleculeID); closeErr != nil {
-		style.PrintWarning("could not close molecule root %s: %v", moleculeID, closeErr)
-		rootClosed = false
-	}
 
 	if moleculeJSON {
 		result := map[string]interface{}{

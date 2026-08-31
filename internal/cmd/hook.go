@@ -265,12 +265,12 @@ func runHook(_ *cobra.Command, args []string) error {
 	var agentID string
 	var err error
 	if targetAgent != "" {
-		agentID, _, _, err = resolveTargetAgent(targetAgent)
+		agentID, _, _, err = resolveTargetAgentFn(targetAgent)
 		if err != nil {
 			return fmt.Errorf("resolving target agent: %w", err)
 		}
 	} else {
-		agentID, _, _, err = resolveSelfTarget()
+		agentID, _, _, err = resolveSelfTargetFn()
 		if err != nil {
 			return fmt.Errorf("detecting agent identity: %w", err)
 		}
@@ -308,90 +308,90 @@ func runHook(_ *cobra.Command, args []string) error {
 	}
 
 	b := beads.New(workDir)
+	return withPolecatAssignmentFence(agentID, townRoot, func() error {
 
-	// Check for existing hooked bead for this agent
-	existingPinned, err := b.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: agentID,
-		Priority: -1,
-	})
-	if err != nil {
-		return fmt.Errorf("checking existing hooked beads: %w", err)
-	}
-
-	// If there's an existing hooked bead, check if we can auto-replace
-	if len(existingPinned) > 0 {
-		existing := existingPinned[0]
-
-		// Skip if it's the same bead we're trying to pin
-		if existing.ID == beadID {
-			fmt.Printf("%s Already hooked: %s\n", style.Bold.Render("✓"), beadID)
-			return nil
+		// Check for existing hooked bead for this agent
+		existingPinned, err := b.List(beads.ListOptions{
+			Status:   beads.StatusHooked,
+			Assignee: agentID,
+			Priority: -1,
+		})
+		if err != nil {
+			return fmt.Errorf("checking existing hooked beads: %w", err)
 		}
 
-		// Check if existing bead is complete
-		isComplete, hasAttachment := checkPinnedBeadComplete(b, existing)
+		// If there's an existing hooked bead, check if we can auto-replace
+		if len(existingPinned) > 0 {
+			existing := existingPinned[0]
 
-		if isComplete {
-			// Auto-replace completed bead
-			fmt.Printf("%s Replacing completed bead %s...\n", style.Dim.Render("ℹ"), existing.ID)
-			if !hookDryRun {
-				if hasAttachment {
-					if err := closeCompletedHookedMolecule(workDir, existing.ID); err != nil {
-						return fmt.Errorf("closing completed bead %s: %w", existing.ID, err)
+			// Skip if it's the same bead we're trying to pin
+			if existing.ID == beadID {
+				fmt.Printf("%s Already hooked: %s\n", style.Bold.Render("✓"), beadID)
+				return nil
+			}
+
+			// Check if existing bead is complete
+			isComplete, hasAttachment := checkPinnedBeadComplete(b, existing)
+
+			if isComplete {
+				// Auto-replace completed bead
+				fmt.Printf("%s Replacing completed bead %s...\n", style.Dim.Render("ℹ"), existing.ID)
+				if !hookDryRun {
+					if hasAttachment {
+						if err := closeCompletedHookedMolecule(workDir, existing.ID); err != nil {
+							return fmt.Errorf("closing completed bead %s: %w", existing.ID, err)
+						}
+					} else {
+						// Naked bead - just unpin, don't close (might have value)
+						status := "open"
+						if err := b.Update(existing.ID, beads.UpdateOptions{Status: &status}); err != nil {
+							return fmt.Errorf("unpinning bead %s: %w", existing.ID, err)
+						}
 					}
-				} else {
-					// Naked bead - just unpin, don't close (might have value)
+				}
+			} else if hookForce {
+				// Force replace incomplete bead
+				fmt.Printf("%s Force-replacing incomplete bead %s...\n", style.Dim.Render("⚠"), existing.ID)
+				if !hookDryRun {
+					// Unpin by setting status back to open
 					status := "open"
 					if err := b.Update(existing.ID, beads.UpdateOptions{Status: &status}); err != nil {
 						return fmt.Errorf("unpinning bead %s: %w", existing.ID, err)
 					}
 				}
+			} else {
+				// Existing incomplete bead blocks new hook
+				return fmt.Errorf("existing hooked bead %s is incomplete (%s)\n  Use --force to replace, or complete the existing work first",
+					existing.ID, existing.Title)
 			}
-		} else if hookForce {
-			// Force replace incomplete bead
-			fmt.Printf("%s Force-replacing incomplete bead %s...\n", style.Dim.Render("⚠"), existing.ID)
-			if !hookDryRun {
-				// Unpin by setting status back to open
-				status := "open"
-				if err := b.Update(existing.ID, beads.UpdateOptions{Status: &status}); err != nil {
-					return fmt.Errorf("unpinning bead %s: %w", existing.ID, err)
-				}
-			}
+		}
+
+		if targetAgent != "" {
+			fmt.Printf("%s Hooking %s for %s...\n", style.Bold.Render("🪝"), beadID, agentID)
 		} else {
-			// Existing incomplete bead blocks new hook
-			return fmt.Errorf("existing hooked bead %s is incomplete (%s)\n  Use --force to replace, or complete the existing work first",
-				existing.ID, existing.Title)
+			fmt.Printf("%s Hooking %s...\n", style.Bold.Render("🪝"), beadID)
 		}
-	}
 
-	if targetAgent != "" {
-		fmt.Printf("%s Hooking %s for %s...\n", style.Bold.Render("🪝"), beadID, agentID)
-	} else {
-		fmt.Printf("%s Hooking %s...\n", style.Bold.Render("🪝"), beadID)
-	}
-
-	if hookDryRun {
-		fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, agentID)
-		if hookSubject != "" {
-			fmt.Printf("  subject (for handoff mail): %s\n", hookSubject)
+		if hookDryRun {
+			fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, agentID)
+			if hookSubject != "" {
+				fmt.Printf("  subject (for handoff mail): %s\n", hookSubject)
+			}
+			if hookMessage != "" {
+				fmt.Printf("  context (for handoff mail): %s\n", hookMessage)
+			}
+			return nil
 		}
-		if hookMessage != "" {
-			fmt.Printf("  context (for handoff mail): %s\n", hookMessage)
-		}
-		return nil
-	}
 
-	// Hook the bead using bd update with retry logic (discovery-based approach).
-	// Run from town root so bd can find routes.jsonl for prefix-based routing.
-	// This is essential for hooking convoys (hq-* prefix) stored in town beads.
-	// Dolt can fail with concurrency errors (HTTP 400) when multiple agents write
-	// simultaneously. We retry with exponential backoff, matching sling.go behavior.
-	const hookMaxRetries = 5
-	const hookBaseBackoff = 500 * time.Millisecond
-	const hookBackoffMax = 10 * time.Second
-	var lastHookErr error
-	if err := withPolecatAssignmentFence(agentID, townRoot, func() error {
+		// Hook the bead using bd update with retry logic (discovery-based approach).
+		// Run from town root so bd can find routes.jsonl for prefix-based routing.
+		// This is essential for hooking convoys (hq-* prefix) stored in town beads.
+		// Dolt can fail with concurrency errors (HTTP 400) when multiple agents write
+		// simultaneously. We retry with exponential backoff, matching sling.go behavior.
+		const hookMaxRetries = 5
+		const hookBaseBackoff = 500 * time.Millisecond
+		const hookBackoffMax = 10 * time.Second
+		var lastHookErr error
 		for attempt := 1; attempt <= hookMaxRetries; attempt++ {
 			if err := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
 				Dir(resolveBeadDir(beadID)).
@@ -409,48 +409,45 @@ func runHook(_ *cobra.Command, args []string) error {
 			}
 			break
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
 
-	// Emit a propulsion signal if the target is the mayor.
-	// This allows the ACP propeller to react to hook changes event-driven.
-	if agentID == "mayor/" {
-		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-			session := "hq-mayor"
-			message := fmt.Sprintf("Hook updated: attached bead %s", beadID)
-			_ = nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
-				Sender:   "hook",
-				Message:  message,
-				Priority: nudge.PriorityNormal,
-			})
+		// Emit a propulsion signal if the target is the mayor.
+		// This allows the ACP propeller to react to hook changes event-driven.
+		if agentID == "mayor/" {
+			if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+				session := "hq-mayor"
+				message := fmt.Sprintf("Hook updated: attached bead %s", beadID)
+				_ = nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+					Sender:   "hook",
+					Message:  message,
+					Priority: nudge.PriorityNormal,
+				})
+			}
 		}
-	}
 
-	if targetAgent != "" {
-		fmt.Printf("%s Work attached to %s's hook\n", style.Bold.Render("✓"), agentID)
-	} else {
-		fmt.Printf("%s Work attached to hook (hooked bead)\n", style.Bold.Render("✓"))
-	}
+		if targetAgent != "" {
+			fmt.Printf("%s Work attached to %s's hook\n", style.Bold.Render("✓"), agentID)
+		} else {
+			fmt.Printf("%s Work attached to hook (hooked bead)\n", style.Bold.Render("✓"))
+		}
 
-	// Update agent bead's hook_bead field (matches gt sling behavior)
-	// This ensures gt hook / gt mol status can find hooked work via the agent bead
-	updateAgentHookBead(agentID, beadID, workDir, townBeadsDir)
+		// Update agent bead's hook_bead field (matches gt sling behavior)
+		// This ensures gt hook / gt mol status can find hooked work via the agent bead
+		updateAgentHookBead(agentID, beadID, workDir, townBeadsDir)
 
-	if targetAgent != "" {
-		fmt.Printf("  Use 'gt hook show %s' to verify\n", targetAgent)
-	} else {
-		fmt.Printf("  Use 'gt handoff' to restart with this work\n")
-		fmt.Printf("  Use 'gt hook' to see hook status\n")
-	}
+		if targetAgent != "" {
+			fmt.Printf("  Use 'gt hook show %s' to verify\n", targetAgent)
+		} else {
+			fmt.Printf("  Use 'gt handoff' to restart with this work\n")
+			fmt.Printf("  Use 'gt hook' to see hook status\n")
+		}
 
-	// Log hook event to activity feed (non-fatal)
-	if err := events.LogFeed(events.TypeHook, agentID, events.HookPayload(beadID)); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Warning: failed to log hook event: %v\n", style.Dim.Render("⚠"), err)
-	}
+		// Log hook event to activity feed (non-fatal)
+		if err := events.LogFeed(events.TypeHook, agentID, events.HookPayload(beadID)); err != nil {
+			fmt.Fprintf(os.Stderr, "%s Warning: failed to log hook event: %v\n", style.Dim.Render("⚠"), err)
+		}
 
-	return nil
+		return nil
+	})
 }
 
 func closeCompletedHookedMolecule(workDir, beadID string) error {

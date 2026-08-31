@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,7 +20,7 @@ import (
 
 // runBatchSling handles slinging multiple beads to a rig.
 // Each bead gets its own freshly spawned polecat.
-func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error {
+func runBatchSling(ctx context.Context, beadIDs []string, rigName string, townBeadsDir string) error {
 	// Validate all beads exist before spawning any polecats
 	for _, beadID := range beadIDs {
 		if err := verifyBeadExists(beadID); err != nil {
@@ -147,6 +148,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		fmt.Printf("\n[%d/%d] Slinging %s...\n", i+1, len(beadIDs), beadID)
 
 		params := SlingParams{
+			Context:          ctx,
 			BeadID:           beadID,
 			FormulaName:      formulaName,
 			RigName:          rigName,
@@ -231,6 +233,17 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 // preventing orphaned polecats from accumulating. Cleans up worktree, agent bead, git branch,
 // and optionally the associated auto-convoy.
 func cleanupSpawnedPolecat(spawnInfo *SpawnedPolecatInfo, rigName, convoyID string) {
+	cleanupSpawnedPolecatWithLifecycleFence(spawnInfo, rigName, convoyID, false)
+}
+
+func cleanupSpawnedPolecatWhileAssignmentFenced(spawnInfo *SpawnedPolecatInfo, rigName, convoyID string) {
+	cleanupSpawnedPolecatWithLifecycleFence(spawnInfo, rigName, convoyID, true)
+}
+
+func cleanupSpawnedPolecatWithLifecycleFence(spawnInfo *SpawnedPolecatInfo, rigName, convoyID string, lifecycleFenceHeld bool) {
+	if convoyID != "" {
+		defer closeSlingConvoyFn(convoyID, "Sling rollback - hook failed")
+	}
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return
@@ -249,24 +262,30 @@ func cleanupSpawnedPolecat(spawnInfo *SpawnedPolecatInfo, rigName, convoyID stri
 	polecatGit := git.NewGit(r.Path)
 	t := tmux.NewTmux()
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
-	if err := polecatMgr.Remove(spawnInfo.PolecatName, true); err != nil {
-		fmt.Printf("  %s Could not clean up orphaned polecat %s: %v\n",
-			style.Dim.Render("Warning:"), spawnInfo.PolecatName, err)
+	deleteExactBranch := func() error {
+		if spawnInfo.Branch == "" || spawnInfo.BranchOID == "" {
+			return nil
+		}
+		return getRepoGitForRig(r.Path).DeleteBranchIfMatches(spawnInfo.Branch, spawnInfo.BranchOID)
+	}
+	if spawnInfo.Incarnation == "" {
+		fmt.Printf("  %s Refusing rollback cleanup of %s without an incarnation receipt\n", style.Dim.Render("Warning:"), spawnInfo.PolecatName)
 	} else {
-		fmt.Printf("  %s Cleaned up orphaned polecat %s\n",
-			style.Dim.Render("○"), spawnInfo.PolecatName)
+		var removeErr error
+		if lifecycleFenceHeld {
+			removeErr = polecatMgr.RemoveWithOptionsLocalOnlyIfIncarnationLocked(spawnInfo.PolecatName, spawnInfo.Incarnation, true, true, false, nil, nil, deleteExactBranch)
+		} else {
+			removeErr = polecatMgr.RemoveWithOptionsLocalOnlyIfIncarnation(spawnInfo.PolecatName, spawnInfo.Incarnation, true, true, false, nil, nil, deleteExactBranch)
+		}
+		if removeErr != nil {
+			fmt.Printf("  %s Could not clean up orphaned polecat %s: %v\n",
+				style.Dim.Render("Warning:"), spawnInfo.PolecatName, removeErr)
+		} else {
+			fmt.Printf("  %s Cleaned up orphaned polecat %s\n",
+				style.Dim.Render("○"), spawnInfo.PolecatName)
+		}
 	}
 
-	// Delete the git branch if we know it (following nukePolecatFull pattern)
-	if spawnInfo.Branch != "" {
-		repoGit := getRepoGitForRig(r.Path)
-		deletePolecatBranch(spawnInfo.Branch, repoGit, false)
-	}
-
-	// Close the auto-convoy if one was created
-	if convoyID != "" {
-		closeConvoy(convoyID, "Sling rollback - hook failed")
-	}
 }
 
 // allBeadIDs returns true if every arg looks like a bead ID (syntactic check).
@@ -378,3 +397,5 @@ func closeConvoy(convoyID, reason string) {
 		fmt.Printf("  %s Closed convoy %s\n", style.Dim.Render("○"), convoyID)
 	}
 }
+
+var closeSlingConvoyFn = closeConvoy

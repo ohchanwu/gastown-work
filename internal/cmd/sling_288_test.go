@@ -8,9 +8,43 @@ import (
 	"testing"
 )
 
+func stubFormulaBondCustody(t *testing.T, rootID string) {
+	t.Helper()
+	oldList, oldVerify := listFormulaBondRootIDsFn, verifyFormulaBondOwnershipFn
+	oldFormulaGeneration, oldProof := formulaMutationFormulaGenerationFn, verifyFormulaMoleculeIdentityAndGenerationFn
+	calls := 0
+	listFormulaBondRootIDsFn = func(_ context.Context, _, _, _, _ string) (map[string]bool, error) {
+		calls++
+		if calls%2 == 0 && rootID != "" {
+			return map[string]bool{rootID: true}, nil
+		}
+		return map[string]bool{}, nil
+	}
+	verifyFormulaBondOwnershipFn = func(_, _, candidate, _, _ string) error {
+		if candidate != rootID {
+			t.Fatalf("formula bond ownership candidate = %q, want %q", candidate, rootID)
+		}
+		return nil
+	}
+	verifyFormulaMoleculeIdentityAndGenerationFn = func(_ context.Context, _, candidate string, _ []string, _, _, _, _ string) (string, error) {
+		if candidate != rootID {
+			t.Fatalf("formula molecule identity candidate = %q, want %q", candidate, rootID)
+		}
+		return "generation-" + candidate, nil
+	}
+	formulaMutationFormulaGenerationFn = func(string, string, string) (string, error) {
+		return "test-formula-generation", nil
+	}
+	t.Cleanup(func() {
+		listFormulaBondRootIDsFn, verifyFormulaBondOwnershipFn = oldList, oldVerify
+		formulaMutationFormulaGenerationFn, verifyFormulaMoleculeIdentityAndGenerationFn = oldFormulaGeneration, oldProof
+	})
+}
+
 // TestInstantiateFormulaOnBead verifies the helper function works correctly.
 // This tests the formula-on-bead pattern used by issue #288.
 func TestInstantiateFormulaOnBead(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-288")
 	townRoot := t.TempDir()
 
 	// Minimal workspace marker
@@ -151,6 +185,7 @@ exit /b 0
 
 // TestInstantiateFormulaOnBeadSkipCook verifies the skipCook optimization.
 func TestInstantiateFormulaOnBeadSkipCook(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-skip")
 	townRoot := t.TempDir()
 
 	// Minimal workspace marker
@@ -346,6 +381,7 @@ func TestAutoApplyLogic(t *testing.T) {
 
 // TestFormulaOnBeadPassesVariables verifies that feature and issue variables are passed.
 func TestFormulaOnBeadPassesVariables(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-var")
 	townRoot := t.TempDir()
 
 	// Minimal workspace
@@ -436,6 +472,7 @@ exit /b 0
 }
 
 func TestInstantiateFormulaOnBead_DirectBondParsesIDMapping(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-mol-fallback")
 	townRoot := t.TempDir()
 
 	// Minimal workspace
@@ -578,6 +615,18 @@ exit /b 0
 	}
 }
 
+func TestParseBondSpawnRootIDRejectsConflictingCreationIDs(t *testing.T) {
+	got, ok := parseBondSpawnRootIDWithStatus(
+		[]byte(`{"root_id":"gt-mol-a","new_epic_id":"gt-mol-b"}`),
+		"mol-polecat-work",
+		"gt-work",
+		"fallback",
+	)
+	if ok || got != "fallback" {
+		t.Fatalf("conflicting bond IDs = (%q, %v), want (fallback, false)", got, ok)
+	}
+}
+
 func TestBondFormulaDirectPinsTargetBeadsDir(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -600,6 +649,7 @@ func TestBondFormulaDirectPinsTargetBeadsDir(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			stubFormulaBondCustody(t, "gt-mol-direct")
 			townRoot := canonicalTestTempDir(t)
 			townBeadsDir := filepath.Join(townRoot, ".beads")
 			rigBeadsDir := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
@@ -663,7 +713,7 @@ exit /b 1
 			t.Setenv("BEADS_DB", "stale")
 			t.Setenv("BD_DB", "stale")
 
-			rootID, err := bondFormulaDirect("mol-polecat-work", "mol-polecat-work", tc.beadID, formulaWorkDir, townRoot, formulaVarsForBead("mol-polecat-work", tc.beadID, "Test", nil))
+			rootID, err := bondFormulaDirect(context.Background(), "mol-polecat-work", "mol-polecat-work", tc.beadID, formulaWorkDir, townRoot, formulaVarsForBead("mol-polecat-work", tc.beadID, "Test", nil))
 			if err != nil {
 				t.Fatalf("bondFormulaDirect: %v", err)
 			}
@@ -698,6 +748,7 @@ exit /b 1
 }
 
 func TestInstantiateFormulaOnBead_DirectBondHandlesNonGTIDs(t *testing.T) {
+	stubFormulaBondCustody(t, "oag-wisp-wisp-rsia")
 	townRoot := t.TempDir()
 
 	// Minimal workspace
@@ -805,6 +856,7 @@ exit /b 0
 }
 
 func TestInstantiateFormulaOnBead_DirectBondCreatesNoOrphanCleanup(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-clean")
 	townRoot := t.TempDir()
 
 	// Minimal workspace
@@ -909,6 +961,7 @@ exit /b 0
 }
 
 func TestInstantiateFormulaOnBead_DirectBondParseFailure(t *testing.T) {
+	stubFormulaBondCustody(t, "")
 	townRoot := t.TempDir()
 
 	// Minimal workspace

@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func writeBDStub(t *testing.T, binDir string, unixScript string, windowsScript string) string {
@@ -111,11 +112,33 @@ case "$cmd" in
   update)
     for arg in "$@"; do
       case "$arg" in
-        --description=*) printf "%s" "${arg#--description=}" > "$BD_DESC_FILE" ;;
+        --description=*)
+          if [ "${BD_FAIL_DESCRIPTION_UPDATE:-}" = "1" ]; then exit 1; fi
+          printf "%s" "${arg#--description=}" > "$BD_DESC_FILE"
+          ;;
+        --body-file=-) cat > "$BD_DESC_FILE" ;;
         --status=*) printf "%s" "${arg#--status=}" > "$BD_STATUS_FILE" ;;
         --assignee=*) printf "%s" "${arg#--assignee=}" > "$BD_ASSIGNEE_FILE" ;;
       esac
     done
+    ;;
+  formula)
+    printf '{"name":"mol-anything"}\n'
+    ;;
+  cook)
+    ;;
+	  mol)
+	    if [ "${1:-}" = "wisp" ]; then
+	      if [ "${BD_WISP_EXIT1:-}" = "1" ]; then
+	        printf "%s" "${BD_WISP_OUTPUT:-}"
+	        exit 1
+	      fi
+	      if [ -n "${BD_WISP_OUTPUT:-}" ]; then
+	        printf "%s" "${BD_WISP_OUTPUT}"
+	      else
+	        printf '%s' '{"new_epic_id":"gt-rawrollback"}'
+	      fi
+	    fi
     ;;
   version)
     echo "bd test"
@@ -131,6 +154,34 @@ exit 0
 	t.Setenv(EnvGTRole, "mayor")
 	t.Setenv("GT_TEST_NO_NUDGE", "1")
 	t.Setenv("GT_TEST_ATTACHED_MOLECULE_LOG", "")
+	oldCompareDescription := compareAndUpdateIssueDescriptionFn
+	oldCompareSnapshot := compareAndRestoreIssueSnapshotFn
+	compareAndUpdateIssueDescriptionFn = func(updateDir, id, expectedStatus, expectedAssignee, expectedDescription, newDescription string) error {
+		bd := beads.New(updateDir)
+		issue, err := bd.Show(id)
+		if err != nil {
+			return err
+		}
+		if issue.Status != expectedStatus || issue.Assignee != expectedAssignee || issue.Description != expectedDescription {
+			return errors.New("issue snapshot changed")
+		}
+		return bd.Update(id, beads.UpdateOptions{Description: &newDescription})
+	}
+	compareAndRestoreIssueSnapshotFn = func(updateDir, id, expectedStatus, expectedAssignee, expectedDescription, restoreStatus, restoreAssignee, restoreDescription string) error {
+		bd := beads.New(updateDir)
+		issue, err := bd.Show(id)
+		if err != nil {
+			return err
+		}
+		if issue.Status != expectedStatus || issue.Assignee != expectedAssignee || issue.Description != expectedDescription {
+			return errors.New("issue snapshot changed")
+		}
+		return bd.Update(id, beads.UpdateOptions{Status: &restoreStatus, Assignee: &restoreAssignee, Description: &restoreDescription})
+	}
+	t.Cleanup(func() {
+		compareAndUpdateIssueDescriptionFn = oldCompareDescription
+		compareAndRestoreIssueSnapshotFn = oldCompareSnapshot
+	})
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -210,9 +261,14 @@ func TestParseWispIDFromJSON(t *testing.T) {
 			wantID: "gt-wisp-result",
 		},
 		{
-			name:   "precedence prefers new_epic_id",
-			json:   `{"root_id":"gt-wisp-legacy","new_epic_id":"gt-wisp-new"}`,
-			wantID: "gt-wisp-new",
+			name:    "conflicting IDs are ambiguous",
+			json:    `{"root_id":"gt-wisp-legacy","new_epic_id":"gt-wisp-new"}`,
+			wantErr: true,
+		},
+		{
+			name:   "duplicate IDs agree",
+			json:   `{"root_id":"gt-wisp-one","new_epic_id":"gt-wisp-one","result_id":"gt-wisp-one"}`,
+			wantID: "gt-wisp-one",
 		},
 		{
 			name:    "missing id keys",
@@ -236,6 +292,51 @@ func TestParseWispIDFromJSON(t *testing.T) {
 				t.Fatalf("parseWispIDFromJSON() id = %q, want %q", gotID, tt.wantID)
 			}
 		})
+	}
+}
+
+func stubFormulaWispCreationInventory(t *testing.T, rootID string) {
+	t.Helper()
+	oldList, oldFormulaGeneration, oldProof := listFormulaWispIDsFn, formulaMutationFormulaGenerationFn, verifyFormulaMoleculeIdentityAndGenerationFn
+	calls := 0
+	listFormulaWispIDsFn = func(context.Context, string, string) (map[string]bool, error) {
+		calls++
+		if calls%2 == 0 {
+			return map[string]bool{rootID: true}, nil
+		}
+		return map[string]bool{}, nil
+	}
+	formulaMutationFormulaGenerationFn = func(string, string, string) (string, error) {
+		return "test-formula-generation", nil
+	}
+	verifyFormulaMoleculeIdentityAndGenerationFn = func(_ context.Context, _, candidate string, _ []string, _, _, _, _ string) (string, error) {
+		if candidate != rootID {
+			t.Fatalf("formula molecule identity candidate = %q, want %q", candidate, rootID)
+		}
+		return "generation-" + candidate, nil
+	}
+	t.Cleanup(func() {
+		listFormulaWispIDsFn, formulaMutationFormulaGenerationFn, verifyFormulaMoleculeIdentityAndGenerationFn = oldList, oldFormulaGeneration, oldProof
+	})
+}
+
+func TestParseFormulaWispIDsJSONAcceptsProductionEnvelope(t *testing.T) {
+	got, err := parseFormulaWispIDsJSON([]byte(`{"wisps":[{"id":"gt-wisp-a"},{"id":"gt-wisp-b"}],"count":2}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got["gt-wisp-a"] || !got["gt-wisp-b"] || len(got) != 2 {
+		t.Fatalf("parsed production wisp inventory = %v", got)
+	}
+}
+
+func TestReconcileCreatedFormulaWispRequiresOneNewRoot(t *testing.T) {
+	before := map[string]bool{"gt-existing": true}
+	if got, err := reconcileCreatedFormulaWisp(before, map[string]bool{"gt-existing": true, "gt-new": true}); err != nil || got != "gt-new" {
+		t.Fatalf("single new root = (%q, %v)", got, err)
+	}
+	if got, err := reconcileCreatedFormulaWisp(before, map[string]bool{"gt-one": true, "gt-two": true}); err == nil || got != "" {
+		t.Fatalf("ambiguous roots = (%q, %v), want fail closed", got, err)
 	}
 }
 
@@ -263,6 +364,7 @@ func TestExtractIssueID(t *testing.T) {
 }
 
 func TestSlingNewlyCreatedRigBeadRoutesBDCommandsToTargetRig(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-xyz")
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows: shell stub redacts multiline descriptions")
 	}
@@ -425,6 +527,8 @@ exit /b 0
 	prevNoMerge := slingNoMerge
 	prevResolveTargetAgent := resolveTargetAgentFn
 	prevAssignPolecatWork := assignPolecatWorkIfCurrent
+	prevPrepareFormulaAuthorization := prepareFormulaMoleculeAuthorizationFn
+	prevPublishFormulaAssignment := publishFormulaAssignmentWithReceiptFn
 	t.Cleanup(func() {
 		slingOnTarget = prevOn
 		slingVars = prevVars
@@ -435,6 +539,8 @@ exit /b 0
 		slingNoMerge = prevNoMerge
 		resolveTargetAgentFn = prevResolveTargetAgent
 		assignPolecatWorkIfCurrent = prevAssignPolecatWork
+		prepareFormulaMoleculeAuthorizationFn = prevPrepareFormulaAuthorization
+		publishFormulaAssignmentWithReceiptFn = prevPublishFormulaAssignment
 	})
 
 	slingDryRun = false
@@ -451,6 +557,33 @@ exit /b 0
 		return "gastown/polecats/toast", "", filepath.Join(townRoot, "gastown", "polecats", "toast", "gastown"), nil
 	}
 	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	formulaAuthorizationCount := 0
+	prepareFormulaMoleculeAuthorizationFn = func(root, _, beadID string, _ beads.FormulaMoleculeAuthorization) (string, error) {
+		got := beads.ResolveBeadsDirForID(filepath.Join(root, ".beads"), beadID)
+		want := filepath.Join(rigDir, ".beads")
+		gotInfo, gotErr := os.Stat(got)
+		wantInfo, wantErr := os.Stat(want)
+		if gotErr != nil || wantErr != nil || !os.SameFile(gotInfo, wantInfo) {
+			t.Fatalf("formula authorization beads dir = %q, want %q", got, want)
+		}
+		formulaAuthorizationCount++
+		return strings.Repeat("a", 32), nil
+	}
+	formulaPublicationCount := 0
+	publishFormulaAssignmentWithReceiptFn = func(root, _, _, _, _ string, _ beads.FormulaMoleculeAuthorization, _, beadID, assignee string, updates beadFieldUpdates, receipt *slingAssignmentReceipt) error {
+		got := beads.ResolveBeadsDirForID(filepath.Join(root, ".beads"), beadID)
+		want := filepath.Join(rigDir, ".beads")
+		gotInfo, gotErr := os.Stat(got)
+		wantInfo, wantErr := os.Stat(want)
+		if gotErr != nil || wantErr != nil || !os.SameFile(gotInfo, wantInfo) {
+			t.Fatalf("formula publication beads dir = %q, want %q", got, want)
+		}
+		advanceSlingWorkflowReceipt(receipt, updates)
+		receipt.status = "hooked"
+		receipt.assignee = assignee
+		formulaPublicationCount++
+		return nil
+	}
 
 	// Prevent real tmux nudge from firing during tests (causes agent self-interruption)
 	t.Setenv("GT_TEST_NO_NUDGE", "1")
@@ -514,7 +647,6 @@ exit /b 0
 	gotTargetDBCheck := false
 	gotFormulaShow := false
 	gotHook := false
-	gotMetadata := false
 	gotReviewOnlyMetadata := false
 	assertTargetRig := func(kind, dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args string) {
 		t.Helper()
@@ -590,7 +722,6 @@ exit /b 0
 			lastHookIndex = i
 			assertTargetRig("hook update", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
 		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--description=<attached-molecule-and-formula-fields>"):
-			gotMetadata = true
 			assertTargetRig("metadata update", dir, beadsDir, database, beadsDB, bdDB, dataDir, gtData, args)
 		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--description=<review-only-fields>"):
 			gotReviewOnlyMetadata = true
@@ -608,9 +739,9 @@ exit /b 0
 		}
 	}
 
-	if !gotCreate || !gotTargetDBCheck || !gotFormulaShow || !gotPolecatCook || !gotReviewCook || gotBondCount < 2 || !gotHook || !gotMetadata || !gotReviewOnlyMetadata {
-		t.Fatalf("missing expected bd commands: create=%v targetDBCheck=%v formulaShow=%v polecatCook=%v reviewCook=%v bondCount=%d hook=%v metadata=%v reviewOnlyMetadata=%v (log: %q)",
-			gotCreate, gotTargetDBCheck, gotFormulaShow, gotPolecatCook, gotReviewCook, gotBondCount, gotHook, gotMetadata, gotReviewOnlyMetadata, string(logBytes))
+	if !gotCreate || !gotTargetDBCheck || !gotFormulaShow || !gotPolecatCook || !gotReviewCook || gotBondCount < 2 || !gotHook || formulaAuthorizationCount < 2 || formulaPublicationCount < 2 || !gotReviewOnlyMetadata {
+		t.Fatalf("missing expected routes: create=%v targetDBCheck=%v formulaShow=%v polecatCook=%v reviewCook=%v bondCount=%d hook=%v formulaAuthorizations=%d formulaPublications=%d reviewOnlyMetadata=%v (log: %q)",
+			gotCreate, gotTargetDBCheck, gotFormulaShow, gotPolecatCook, gotReviewCook, gotBondCount, gotHook, formulaAuthorizationCount, formulaPublicationCount, gotReviewOnlyMetadata, string(logBytes))
 	}
 	if firstReviewOnlyMetadataIndex == -1 || lastHookIndex == -1 || firstReviewOnlyMetadataIndex > lastHookIndex {
 		t.Fatalf("review-only metadata must be stored before raw hook assignment: metadataIndex=%d hookIndex=%d log: %q", firstReviewOnlyMetadataIndex, lastHookIndex, string(logBytes))
@@ -855,14 +986,16 @@ exit /b 0
 	prevDryRun := slingDryRun
 	prevHookRaw := slingHookRawBead
 	prevSpawn := spawnPolecatForSling
-	prevRollback := rollbackSlingArtifactsFn
+	prevRollback := rollbackSlingArtifactsWhileAssignmentFencedFn
+	prevAssign := assignPolecatWorkIfCurrent
 	t.Cleanup(func() {
 		slingNoConvoy = prevNoConvoy
 		slingNoBoot = prevNoBoot
 		slingDryRun = prevDryRun
 		slingHookRawBead = prevHookRaw
 		spawnPolecatForSling = prevSpawn
-		rollbackSlingArtifactsFn = prevRollback
+		rollbackSlingArtifactsWhileAssignmentFencedFn = prevRollback
+		assignPolecatWorkIfCurrent = prevAssign
 	})
 
 	slingDryRun = false
@@ -877,9 +1010,10 @@ exit /b 0
 			ClonePath:   filepath.Join(townRoot, "fake-polecat"),
 		}, nil
 	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
 
 	rollbackCalled := false
-	rollbackSlingArtifactsFn = func(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, convoyID string) {
+	rollbackSlingArtifactsWhileAssignmentFencedFn = func(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, convoyID string) {
 		rollbackCalled = true
 		if spawnInfo == nil || spawnInfo.PolecatName != "Toast" {
 			t.Fatalf("unexpected spawnInfo in rollback: %+v", spawnInfo)
@@ -965,18 +1099,24 @@ exit /b 0
 	prevHookRaw := slingHookRawBead
 	prevSpawn := spawnPolecatForSling
 	prevResolveTargetAgent := resolveTargetAgentFn
-	prevRollback := rollbackSlingArtifactsFn
-	prevHook := hookBeadWithRetryFn
+	prevRollback := rollbackSlingArtifactsWhileAssignmentFencedFn
+	prevHook := hookBeadWithRetryAssignmentFn
+	prevAssign := assignPolecatWorkIfCurrent
+	prevTrackedConvoy := slingTrackedConvoyFn
+	prevCreateConvoy := slingCreateAutoConvoyFn
 	t.Cleanup(func() {
 		slingNoConvoy = prevNoConvoy
 		slingNoBoot = prevNoBoot
 		slingHookRawBead = prevHookRaw
 		spawnPolecatForSling = prevSpawn
 		resolveTargetAgentFn = prevResolveTargetAgent
-		rollbackSlingArtifactsFn = prevRollback
-		hookBeadWithRetryFn = prevHook
+		rollbackSlingArtifactsWhileAssignmentFencedFn = prevRollback
+		hookBeadWithRetryAssignmentFn = prevHook
+		assignPolecatWorkIfCurrent = prevAssign
+		slingTrackedConvoyFn = prevTrackedConvoy
+		slingCreateAutoConvoyFn = prevCreateConvoy
 	})
-	slingNoConvoy = true
+	slingNoConvoy = false
 	slingNoBoot = true
 	slingHookRawBead = true
 
@@ -986,15 +1126,21 @@ exit /b 0
 	resolveTargetAgentFn = func(target string) (agentID string, pane string, hookRoot string, err error) {
 		return "", "", "", errors.New("simulated dead target")
 	}
-	hookBeadWithRetryFn = func(beadID, targetAgent, hookDir string) error {
+	hookBeadWithRetryAssignmentFn = func(beadID, targetAgent, hookDir, _ string) error {
 		return errors.New("simulated hook failure")
 	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	slingTrackedConvoyFn = func(string) string { return "" }
+	slingCreateAutoConvoyFn = func(string, string, bool, string, string) (string, error) { return "hq-cv-new", nil }
 
 	rollbackCalled := false
-	rollbackSlingArtifactsFn = func(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, convoyID string) {
+	rollbackSlingArtifactsWhileAssignmentFencedFn = func(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, convoyID string) {
 		rollbackCalled = true
 		if spawnInfo == nil || spawnInfo.PolecatName != "Toast" {
 			t.Fatalf("unexpected spawnInfo in rollback: %+v", spawnInfo)
+		}
+		if convoyID != "hq-cv-new" {
+			t.Fatalf("rollback convoy = %q, want attempt-owned hq-cv-new", convoyID)
 		}
 	}
 
@@ -1382,7 +1528,7 @@ func TestBatchSlingRejectsMissingTargetRigDatabaseBeforeSpawn(t *testing.T) {
 		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "toast", ClonePath: filepath.Join(townRoot, "fake-polecat")}, nil
 	}
 
-	err := runBatchSling([]string{"gt-r2405"}, "gastown", filepath.Join(townRoot, ".beads"))
+	err := runBatchSling(context.Background(), []string{"gt-r2405"}, "gastown", filepath.Join(townRoot, ".beads"))
 	if err == nil {
 		t.Fatal("expected target-rig database validation error")
 	}
@@ -1631,7 +1777,7 @@ exit /b 0
 	collectExistingMoleculesForRollback = collectExistingMolecules
 
 	burnCalled := false
-	burnExistingMoleculesForRollback = func(molecules []string, beadID, gotTownRoot string) error {
+	burnExistingMoleculesForRollback = func(molecules []string, beadID, gotTownRoot string, _ *beadInfo) error {
 		burnCalled = true
 		if beadID != "gt-abc123" {
 			t.Fatalf("unexpected burn bead id: %q", beadID)
@@ -1702,7 +1848,7 @@ func TestRollbackSlingArtifactsKeepsMetadataWhenMoleculeBurnFails(t *testing.T) 
 	collectExistingMoleculesForRollback = func(info *beadInfo) []string {
 		return []string{"gt-wisp-stale"}
 	}
-	burnExistingMoleculesForRollback = func(molecules []string, beadID, townRoot string) error {
+	burnExistingMoleculesForRollback = func(molecules []string, beadID, townRoot string, _ *beadInfo) error {
 		return errors.New("forced burn failure")
 	}
 
@@ -1739,7 +1885,7 @@ func TestRollbackSlingArtifactsClearsRawReviewOnlyMetadataAfterMoleculeBurnSucce
 	collectExistingMoleculesForRollback = func(info *beadInfo) []string {
 		return []string{"gt-wisp-stale"}
 	}
-	burnExistingMoleculesForRollback = func(molecules []string, beadID, townRoot string) error {
+	burnExistingMoleculesForRollback = func(molecules []string, beadID, townRoot string, _ *beadInfo) error {
 		if len(molecules) != 1 || molecules[0] != "gt-wisp-stale" {
 			t.Fatalf("unexpected molecules: %#v", molecules)
 		}
@@ -1812,7 +1958,7 @@ func TestRunSlingRawReviewOnlyExistingTargetHookFailureClearsPreHookMetadata(t *
 	prevNoConvoy := slingNoConvoy
 	prevDryRun := slingDryRun
 	prevResolve := resolveTargetAgentFn
-	prevHook := hookBeadWithRetryFn
+	prevHook := hookBeadWithRetryAssignmentFn
 	t.Cleanup(func() {
 		slingHookRawBead = prevHookRaw
 		slingNoMerge = prevNoMerge
@@ -1820,7 +1966,7 @@ func TestRunSlingRawReviewOnlyExistingTargetHookFailureClearsPreHookMetadata(t *
 		slingNoConvoy = prevNoConvoy
 		slingDryRun = prevDryRun
 		resolveTargetAgentFn = prevResolve
-		hookBeadWithRetryFn = prevHook
+		hookBeadWithRetryAssignmentFn = prevHook
 	})
 	slingHookRawBead = true
 	slingNoMerge = true
@@ -1830,7 +1976,7 @@ func TestRunSlingRawReviewOnlyExistingTargetHookFailureClearsPreHookMetadata(t *
 	resolveTargetAgentFn = func(target string) (string, string, string, error) {
 		return "gastown/crew/toast", "", workDir, nil
 	}
-	hookBeadWithRetryFn = func(beadID, targetAgent, hookDir string) error {
+	hookBeadWithRetryAssignmentFn = func(beadID, targetAgent, hookDir, _ string) error {
 		assertHasRawReviewMetadata(t, readMutableBDDescription(t, descPath))
 		return errors.New("forced hook failure")
 	}
@@ -1846,14 +1992,413 @@ func TestRunSlingRawReviewOnlyExistingTargetHookFailureClearsPreHookMetadata(t *
 	}
 }
 
+func TestRunSlingPartialHookFailureRestoresExactAssignment(t *testing.T) {
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+	workDir := filepath.Join(townRoot, "gastown", "crew", "toast")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldRaw, oldConvoy, oldDryRun, oldResolve, oldHook :=
+		slingHookRawBead, slingNoConvoy, slingDryRun, resolveTargetAgentFn, hookBeadWithRetryAssignmentFn
+	t.Cleanup(func() {
+		slingHookRawBead, slingNoConvoy, slingDryRun, resolveTargetAgentFn, hookBeadWithRetryAssignmentFn =
+			oldRaw, oldConvoy, oldDryRun, oldResolve, oldHook
+	})
+	slingHookRawBead, slingNoConvoy, slingDryRun = true, true, false
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "gastown/crew/toast", "", workDir, nil
+	}
+	hookBeadWithRetryAssignmentFn = func(_, target, _, _ string) error {
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644); err != nil {
+			return err
+		}
+		return errors.New("forced post-hook verification failure")
+	}
+	err := runSling(nil, []string{"gt-rawrollback", "gastown/crew/toast"})
+	if err == nil || !strings.Contains(err.Error(), "post-hook verification failure") {
+		t.Fatalf("runSling error = %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "open" {
+		t.Fatalf("status=%q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "" {
+		t.Fatalf("assignee=%q", got)
+	}
+	if got := readMutableBDDescription(t, descPath); got != "Keep this body." {
+		t.Fatalf("description=%q", got)
+	}
+}
+
+func TestRunSlingFormulaExistingTargetMetadataFailureRollsBackWithoutPanic(t *testing.T) {
+	stubFormulaWispCreationInventory(t, "gt-rawrollback")
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+	workDir := filepath.Join(townRoot, "gastown", "crew", "toast")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldResolve, oldFind, oldHook, oldStore, oldDryRun, oldNoBoot :=
+		resolveTargetAgentFn, findHookedFormulaSingletonFn, hookBeadWithRetryAssignmentFn,
+		storeSlingFieldsInBeadFromTownRootFn, slingDryRun, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, findHookedFormulaSingletonFn, hookBeadWithRetryAssignmentFn,
+			storeSlingFieldsInBeadFromTownRootFn, slingDryRun, slingNoBoot =
+			oldResolve, oldFind, oldHook, oldStore, oldDryRun, oldNoBoot
+	})
+	slingDryRun, slingNoBoot = false, true
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "gastown/crew/toast", "", workDir, nil
+	}
+	findHookedFormulaSingletonFn = func(_, _, _ string) (*beads.Issue, error) { return nil, nil }
+	hookBeadWithRetryAssignmentFn = func(_, target, _, _ string) error {
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	storeErr := errors.New("forced committed metadata acknowledgement failure")
+	storeSlingFieldsInBeadFromTownRootFn = func(townRoot, beadID string, updates beadFieldUpdates) error {
+		if err := oldStore(townRoot, beadID, updates); err != nil {
+			return err
+		}
+		return storeErr
+	}
+	err := runSlingFormula(context.Background(), []string{"mol-anything", "gastown/crew/toast"})
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("runSlingFormula error = %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "open" {
+		t.Fatalf("status=%q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "" {
+		t.Fatalf("assignee=%q", got)
+	}
+	if got := readMutableBDDescription(t, descPath); got != "Keep this body." {
+		t.Fatalf("description=%q", got)
+	}
+}
+
+func TestRunSlingFormulaSpawnedTargetCommittedMetadataFailureRestoresAssignment(t *testing.T) {
+	stubFormulaWispCreationInventory(t, "gt-rawrollback")
+	const initial = "Keep this body."
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, initial)
+	oldAdmission, oldSpawn, oldFind, oldHook, oldAssign, oldStore, oldCleanup, oldDryRun, oldNoBoot :=
+		acquirePolecatAdmissionFn, spawnPolecatForSling, findHookedFormulaSingletonFn,
+		hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, storeSlingFieldsInBeadFromTownRootFn,
+		cleanupSpawnedPolecatWhileAssignmentFencedFn, slingDryRun, slingNoBoot
+	t.Cleanup(func() {
+		acquirePolecatAdmissionFn, spawnPolecatForSling, findHookedFormulaSingletonFn,
+			hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, storeSlingFieldsInBeadFromTownRootFn,
+			cleanupSpawnedPolecatWhileAssignmentFencedFn, slingDryRun, slingNoBoot =
+			oldAdmission, oldSpawn, oldFind, oldHook, oldAssign, oldStore, oldCleanup, oldDryRun, oldNoBoot
+	})
+	slingDryRun, slingNoBoot = false, true
+	inFence := false
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error {
+		inFence = true
+		defer func() { inFence = false }()
+		return assign()
+	}
+	acquirePolecatAdmissionFn = func(_, _, _, _ string) (*polecatAdmissionHandle, polecatCapacitySnapshot, error) {
+		return &polecatAdmissionHandle{disabled: true}, polecatCapacitySnapshot{}, nil
+	}
+	findHookedFormulaSingletonFn = func(_, _, _ string) (*beads.Issue, error) { return nil, nil }
+	spawned := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", ClonePath: rigPath, Incarnation: "gen-1"}
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) { return spawned, nil }
+	hookBeadWithRetryAssignmentFn = func(_, target, _, _ string) error {
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	storeErr := errors.New("forced committed metadata acknowledgement failure")
+	storeSlingFieldsInBeadFromTownRootFn = func(townRoot, beadID string, updates beadFieldUpdates) error {
+		if err := oldStore(townRoot, beadID, updates); err != nil {
+			return err
+		}
+		return storeErr
+	}
+	cleanupCalls := 0
+	cleanupSpawnedPolecatWhileAssignmentFencedFn = func(got *SpawnedPolecatInfo, rigName, convoyID string) {
+		cleanupCalls++
+		if !inFence || got != spawned || rigName != "gastown" || convoyID != "" {
+			t.Fatalf("cleanup = (%+v, %q, %q), inFence=%v", got, rigName, convoyID, inFence)
+		}
+	}
+
+	if err := runSlingFormula(context.Background(), []string{"mol-anything", "gastown"}); !errors.Is(err, storeErr) {
+		t.Fatalf("runSlingFormula error = %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "open" {
+		t.Fatalf("status after rollback = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "" {
+		t.Fatalf("assignee after rollback = %q", got)
+	}
+	if got := readMutableBDDescription(t, descPath); got != initial {
+		t.Fatalf("description after rollback = %q", got)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("spawn cleanup calls = %d, want 1", cleanupCalls)
+	}
+}
+
+func TestRunSlingFormulaCreationAcknowledgementFailurePreservesReconciledWisp(t *testing.T) {
+	for _, tc := range []struct {
+		name, output string
+		exitFailure  bool
+	}{
+		{name: "malformed stdout", output: "malformed"},
+		{name: "lost stdout and exit acknowledgement", exitFailure: true},
+		{name: "conflicting IDs use inventory singleton", output: `{"root_id":"gt-wrong","new_epic_id":"gt-other"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			townRoot, _, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+			t.Setenv("BD_WISP_OUTPUT", tc.output)
+			if tc.exitFailure {
+				t.Setenv("BD_WISP_EXIT1", "1")
+			}
+			oldResolve, oldFind, oldList, oldCleanup, oldProof, oldDryRun, oldNoBoot :=
+				resolveTargetAgentFn, findHookedFormulaSingletonFn, listFormulaWispIDsFn,
+				cleanupFailedFormulaWispFn, verifyFormulaMoleculeIdentityAndGenerationFn, slingDryRun, slingNoBoot
+			t.Cleanup(func() {
+				resolveTargetAgentFn, findHookedFormulaSingletonFn, listFormulaWispIDsFn,
+					cleanupFailedFormulaWispFn, verifyFormulaMoleculeIdentityAndGenerationFn, slingDryRun, slingNoBoot =
+					oldResolve, oldFind, oldList, oldCleanup, oldProof, oldDryRun, oldNoBoot
+			})
+			slingDryRun, slingNoBoot = false, true
+			resolveTargetAgentFn = func(string) (string, string, string, error) {
+				return "gastown/crew/toast", "", townRoot, nil
+			}
+			findHookedFormulaSingletonFn = func(_, _, _ string) (*beads.Issue, error) { return nil, nil }
+			lists := []map[string]bool{{}, {"gt-rawrollback": true}}
+			listFormulaWispIDsFn = func(context.Context, string, string) (map[string]bool, error) {
+				got := lists[0]
+				lists = lists[1:]
+				return got, nil
+			}
+			cleaned := ""
+			cleanupFailedFormulaWispFn = func(id, _ string) error {
+				cleaned = id
+				return nil
+			}
+			verifyFormulaMoleculeIdentityAndGenerationFn = func(_ context.Context, _, candidate string, _ []string, _, _, _, _ string) (string, error) {
+				if candidate != "gt-rawrollback" {
+					t.Fatalf("formula molecule identity candidate = %q", candidate)
+				}
+				return "generation-" + candidate, nil
+			}
+
+			err := runSlingFormula(context.Background(), []string{"mol-polecat-work", "gastown/crew/toast"})
+			if err != nil {
+				t.Fatalf("runSlingFormula error = %v", err)
+			}
+			if cleaned != "" {
+				t.Fatalf("inventory-reconciled wisp was cleaned: %q", cleaned)
+			}
+		})
+	}
+}
+
+func TestRunSlingReconcilesPendingFormulaBondBeforeBurningStaleMolecules(t *testing.T) {
+	townRoot, _, _ := setupMutableBDRawSlingTest(t, "attached_molecule: gt-recovered\n\nKeep this body.")
+	workDir := filepath.Join(townRoot, "gastown", "crew", "toast")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := formulaBondMutationKey("mol-anything", "gt-rawrollback")
+	if err := writeFormulaMutationAttempt(townRoot, &formulaMutationAttempt{
+		Key: key, Scope: "test-scope", RequestFingerprint: "test-request",
+		OperationNonce: "11111111-1111-4111-8111-111111111111",
+		RootID:         "gt-recovered", RootGeneration: "generation-gt-recovered",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldResolve := resolveTargetAgentFn
+	oldInstantiate, oldCollect, oldBurn, oldBurnPreserving := instantiateFormulaOnBeadFn, collectExistingMoleculesForBeadFn, burnExistingMoleculesFn, burnExistingMoleculesPreservingFn
+	oldOn, oldDryRun, oldNoConvoy, oldNoBoot := slingOnTarget, slingDryRun, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn = oldResolve
+		instantiateFormulaOnBeadFn, collectExistingMoleculesForBeadFn, burnExistingMoleculesFn, burnExistingMoleculesPreservingFn = oldInstantiate, oldCollect, oldBurn, oldBurnPreserving
+		slingOnTarget, slingDryRun, slingNoConvoy, slingNoBoot = oldOn, oldDryRun, oldNoConvoy, oldNoBoot
+	})
+	slingOnTarget, slingDryRun, slingNoConvoy, slingNoBoot = "gt-rawrollback", false, true, true
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "gastown/crew/toast", "", workDir, nil
+	}
+	instantiateCalls := 0
+	instantiateFormulaOnBeadFn = func(context.Context, string, string, string, string, string, bool, []string) (*FormulaOnBeadResult, error) {
+		instantiateCalls++
+		return &FormulaOnBeadResult{WispRootID: "gt-recovered", BeadToHook: "gt-rawrollback"}, nil
+	}
+	collectExistingMoleculesForBeadFn = func(*beadInfo, string, string) ([]string, error) {
+		if instantiateCalls != 1 {
+			t.Fatalf("stale inventory collected before pending bond reconciliation: calls=%d", instantiateCalls)
+		}
+		return []string{"gt-old", "gt-recovered"}, nil
+	}
+	burnExistingMoleculesFn = func([]string, string, string, *beadInfo) error {
+		t.Fatal("pending formula cleanup used the non-preserving burn path")
+		return nil
+	}
+	burnExistingMoleculesPreservingFn = func(molecules, preserved []string, _ string, _ string, _ *beadInfo) error {
+		if len(molecules) != 1 || molecules[0] != "gt-old" || len(preserved) != 1 || preserved[0] != "gt-recovered" {
+			t.Fatalf("burn candidates = %v preserved = %v", molecules, preserved)
+		}
+		return nil
+	}
+
+	if err := runSling(nil, []string{"mol-anything"}); err != nil {
+		t.Fatalf("runSling: %v", err)
+	}
+	if instantiateCalls != 1 {
+		t.Fatalf("formula instantiated %d times, want one reconciliation", instantiateCalls)
+	}
+}
+
+func TestRunSlingUsesLockedBeadSnapshotForOrphanCleanup(t *testing.T) {
+	townRoot, _, _ := setupMutableBDRawSlingTest(t, "attached_molecule: gt-stale\n\nKeep this body.")
+	workDir := filepath.Join(townRoot, "gastown", "crew", "toast")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldResolve, oldAssigneeLock := resolveTargetAgentFn, tryAcquireSlingAssigneeLockFn
+	oldInstantiate, oldCollect, oldBurn := instantiateFormulaOnBeadFn, collectExistingMoleculesForBeadFn, burnExistingMoleculesFn
+	oldOn, oldDryRun, oldNoConvoy, oldNoBoot, oldForce := slingOnTarget, slingDryRun, slingNoConvoy, slingNoBoot, slingForce
+	t.Cleanup(func() {
+		resolveTargetAgentFn = oldResolve
+		tryAcquireSlingAssigneeLockFn = oldAssigneeLock
+		instantiateFormulaOnBeadFn, collectExistingMoleculesForBeadFn, burnExistingMoleculesFn = oldInstantiate, oldCollect, oldBurn
+		slingOnTarget, slingDryRun, slingNoConvoy, slingNoBoot, slingForce = oldOn, oldDryRun, oldNoConvoy, oldNoBoot, oldForce
+	})
+	slingOnTarget, slingDryRun, slingNoConvoy, slingNoBoot, slingForce = "gt-rawrollback", false, true, true, false
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "gastown/crew/toast", "", workDir, nil
+	}
+	tryAcquireSlingAssigneeLockFn = func(string, string) (func(), error) {
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return func() {}, nil
+	}
+	instantiateFormulaOnBeadFn = func(context.Context, string, string, string, string, string, bool, []string) (*FormulaOnBeadResult, error) {
+		return &FormulaOnBeadResult{WispRootID: "gt-new", BeadToHook: "gt-rawrollback"}, nil
+	}
+	collectExistingMoleculesForBeadFn = func(locked *beadInfo, _, _ string) ([]string, error) {
+		if locked.Status != "hooked" || locked.Assignee != "" {
+			t.Fatalf("locked snapshot = status %q assignee %q", locked.Status, locked.Assignee)
+		}
+		return []string{"gt-stale"}, nil
+	}
+	burned := false
+	burnExistingMoleculesFn = func([]string, string, string, *beadInfo) error {
+		burned = true
+		return nil
+	}
+
+	if err := runSling(nil, []string{"mol-anything"}); err != nil {
+		t.Fatalf("runSling: %v", err)
+	}
+	if !burned {
+		t.Fatal("locked orphan snapshot did not authorize stale molecule cleanup")
+	}
+}
+
+func TestBurnExistingMoleculesPreservingAcceptsAttachedPreservedRoot(t *testing.T) {
+	oldApply, oldDeps := applyPreservingMoleculeCleanupFn, collectExistingMoleculeDepsFn
+	t.Cleanup(func() {
+		applyPreservingMoleculeCleanupFn, collectExistingMoleculeDepsFn = oldApply, oldDeps
+	})
+	collectExistingMoleculeDepsFn = func(string, string) ([]string, error) {
+		return []string{"gt-old", "gt-recovered"}, nil
+	}
+	called := false
+	applyPreservingMoleculeCleanupFn = func(_ *beads.Beads, beadID string, _ *beadInfo, _, _, _, _ string, cleanup, preserved []string) (int, error) {
+		called = true
+		if beadID != "gt-work" || len(cleanup) != 1 || cleanup[0] != "gt-old" || len(preserved) != 1 || preserved[0] != "gt-recovered" {
+			t.Fatalf("cleanup call = bead %q cleanup %v preserved %v", beadID, cleanup, preserved)
+		}
+		return 0, nil
+	}
+	err := burnExistingMoleculesPreserving(
+		[]string{"gt-old"}, []string{"gt-recovered"}, "gt-work", t.TempDir(),
+		&beadInfo{Description: "attached_molecule: gt-recovered"},
+	)
+	if err != nil {
+		t.Fatalf("burnExistingMoleculesPreserving: %v", err)
+	}
+	if !called {
+		t.Fatal("preserving cleanup was not applied")
+	}
+}
+
+func TestBurnExistingMoleculesPreservesMetadataOnlyRoot(t *testing.T) {
+	oldDeps, oldDetach := collectExistingMoleculeDepsFn, detachAndCleanupMoleculesFn
+	t.Cleanup(func() {
+		collectExistingMoleculeDepsFn, detachAndCleanupMoleculesFn = oldDeps, oldDetach
+	})
+	collectExistingMoleculeDepsFn = func(string, string) ([]string, error) {
+		return []string{"gt-bonded"}, nil
+	}
+	detachAndCleanupMoleculesFn = func(_ *beads.Beads, _ string, _ *beadInfo, _, _, _, _ string, molecules []string) (int, error) {
+		if len(molecules) != 1 || molecules[0] != "gt-bonded" {
+			t.Fatalf("destructive cleanup roots = %v, want only bonded root", molecules)
+		}
+		return 0, nil
+	}
+	err := burnExistingMolecules(
+		[]string{"gt-bonded", "gt-metadata"}, "gt-work", t.TempDir(),
+		&beadInfo{Status: "hooked", Assignee: "gastown/polecats/nux", Description: "attached_molecule: gt-metadata"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBurnExistingMoleculesCASClearsMetadataOnlyAttachment(t *testing.T) {
+	oldDeps, oldDetach, oldClear := collectExistingMoleculeDepsFn, detachAndCleanupMoleculesFn, clearUnbondedMoleculeAttachmentFn
+	t.Cleanup(func() {
+		collectExistingMoleculeDepsFn, detachAndCleanupMoleculesFn, clearUnbondedMoleculeAttachmentFn = oldDeps, oldDetach, oldClear
+	})
+	collectExistingMoleculeDepsFn = func(string, string) ([]string, error) { return nil, nil }
+	detachAndCleanupMoleculesFn = func(*beads.Beads, string, *beadInfo, string, string, string, string, []string) (int, error) {
+		t.Fatal("metadata-only root reached destructive cleanup")
+		return 0, nil
+	}
+	cleared := false
+	clearUnbondedMoleculeAttachmentFn = func(_, _, status, assignee, expected, replacement string) error {
+		cleared = true
+		if status != "hooked" || assignee != "gastown/polecats/nux" || expected != "attached_molecule: gt-metadata\n\nKeep this body." || strings.Contains(replacement, "attached_molecule") || !strings.Contains(replacement, "Keep this body.") {
+			t.Fatalf("metadata CAS = status %q assignee %q expected %q replacement %q", status, assignee, expected, replacement)
+		}
+		return nil
+	}
+	err := burnExistingMolecules(
+		[]string{"gt-metadata"}, "gt-work", t.TempDir(),
+		&beadInfo{Status: "hooked", Assignee: "gastown/polecats/nux", Description: "attached_molecule: gt-metadata\n\nKeep this body."},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleared {
+		t.Fatal("metadata-only attachment was not CAS-cleared")
+	}
+}
+
 func TestExecuteSlingRawReviewOnlyHookFailureClearsPreHookMetadata(t *testing.T) {
 	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
 
 	prevSpawn := spawnPolecatForSling
 	prevHook := hookBeadWithRetryWithTownRootFn
+	prevAssign := assignPolecatWorkIfCurrent
 	t.Cleanup(func() {
 		spawnPolecatForSling = prevSpawn
 		hookBeadWithRetryWithTownRootFn = prevHook
+		assignPolecatWorkIfCurrent = prevAssign
 	})
 	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
 		return &SpawnedPolecatInfo{
@@ -1882,6 +2427,167 @@ func TestExecuteSlingRawReviewOnlyHookFailureClearsPreHookMetadata(t *testing.T)
 		t.Fatal("expected hook failure from executeSling")
 	}
 	assertNoRawReviewMetadata(t, readMutableBDDescription(t, descPath))
+}
+
+func TestExecuteSlingPostHookMetadataFailureRollsBack(t *testing.T) {
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldSpawn, oldHook, oldAssign, oldStart := spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn
+	oldStore, oldRollback, oldCleanup := storeSlingFieldsInBeadFromTownRootFn, rollbackSlingArtifactsWhileAssignmentFencedFn, cleanupSpawnedPolecatWhileAssignmentFencedFn
+	t.Cleanup(func() {
+		spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn = oldSpawn, oldHook, oldAssign, oldStart
+		storeSlingFieldsInBeadFromTownRootFn, rollbackSlingArtifactsWhileAssignmentFencedFn = oldStore, oldRollback
+		cleanupSpawnedPolecatWhileAssignmentFencedFn = oldCleanup
+	})
+	spawnPolecatForSling = func(rigName string, _ SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "toast", ClonePath: filepath.Join(townRoot, "gastown", "polecats", "toast")}, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	startSpawnedPolecatSessionFn = func(*SpawnedPolecatInfo, bool) (string, error) { return "%1", nil }
+	hookBeadWithRetryWithTownRootFn = func(_, target, _, _ string) error {
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	storeErr := errors.New("forced post-hook metadata failure")
+	storeSlingFieldsInBeadFromTownRootFn = func(townRoot, beadID string, updates beadFieldUpdates) error {
+		if err := oldStore(townRoot, beadID, updates); err != nil {
+			return err
+		}
+		return storeErr
+	}
+	rolledBack := false
+	rollbackSlingArtifactsWhileAssignmentFencedFn = rollbackSlingArtifactsWhileAssignmentFenced
+	cleanupSpawnedPolecatWhileAssignmentFencedFn = func(*SpawnedPolecatInfo, string, string) { rolledBack = true }
+
+	_, err := executeSling(SlingParams{
+		Context: context.Background(), BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot,
+		BeadsDir: filepath.Join(rigPath, ".beads"), HookRawBead: true, NoConvoy: true, NoBoot: true,
+	})
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("executeSling error = %v, want metadata failure", err)
+	}
+	if !rolledBack {
+		t.Fatal("post-hook metadata failure did not roll back assignment artifacts")
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "open" {
+		t.Fatalf("status after rollback = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "" {
+		t.Fatalf("assignee after rollback = %q", got)
+	}
+	if got := readMutableBDDescription(t, descPath); got != "Keep this body." {
+		t.Fatalf("description after rollback = %q", got)
+	}
+}
+
+func TestRunSlingPostHookMetadataFailureRestoresAssignment(t *testing.T) {
+	townRoot, _, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldAssign, oldHook, oldStore := resolveTargetAgentFn, assignPolecatWorkIfCurrent, hookBeadWithRetryAssignmentFn, storeSlingFieldsInBeadFromTownRootFn
+	oldRaw, oldConvoy, oldBoot := slingHookRawBead, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, assignPolecatWorkIfCurrent, hookBeadWithRetryAssignmentFn, storeSlingFieldsInBeadFromTownRootFn = oldResolve, oldAssign, oldHook, oldStore
+		slingHookRawBead, slingNoConvoy, slingNoBoot = oldRaw, oldConvoy, oldBoot
+	})
+	slingHookRawBead, slingNoConvoy, slingNoBoot = true, true, true
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "gastown/crew/toast", "", townRoot, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	hookBeadWithRetryAssignmentFn = func(_, target, _, _ string) error {
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	storeErr := errors.New("forced post-hook metadata failure")
+	storeSlingFieldsInBeadFromTownRootFn = func(townRoot, beadID string, updates beadFieldUpdates) error {
+		if err := oldStore(townRoot, beadID, updates); err != nil {
+			return err
+		}
+		return storeErr
+	}
+
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/crew/toast"}); !errors.Is(err, storeErr) {
+		t.Fatalf("runSling error = %v, want metadata failure", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "open" {
+		t.Fatalf("status after rollback = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "" {
+		t.Fatalf("assignee after rollback = %q", got)
+	}
+	if got := readMutableBDDescription(t, filepath.Join(townRoot, "description.txt")); got != "Keep this body." {
+		t.Fatalf("description after rollback = %q", got)
+	}
+}
+
+func TestRunSlingExistingTargetFailureClosesAttemptConvoy(t *testing.T) {
+	initial := "attached_molecule: gt-preexisting\nKeep this body."
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, initial)
+	oldResolve, oldLock := resolveTargetAgentFn, tryAcquireSlingAssigneeLockFn
+	oldTracked, oldCreate, oldClose := slingTrackedConvoyFn, slingCreateAutoConvoyFn, closeSlingConvoyFn
+	oldRollback := rollbackSlingArtifactsFn
+	oldRaw, oldConvoy, oldBoot, oldDryRun := slingHookRawBead, slingNoConvoy, slingNoBoot, slingDryRun
+	t.Cleanup(func() {
+		resolveTargetAgentFn, tryAcquireSlingAssigneeLockFn = oldResolve, oldLock
+		slingTrackedConvoyFn, slingCreateAutoConvoyFn, closeSlingConvoyFn = oldTracked, oldCreate, oldClose
+		rollbackSlingArtifactsFn = oldRollback
+		slingHookRawBead, slingNoConvoy, slingNoBoot, slingDryRun = oldRaw, oldConvoy, oldBoot, oldDryRun
+	})
+	slingHookRawBead, slingNoConvoy, slingNoBoot, slingDryRun = true, false, true, false
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "gastown/crew/toast", "", townRoot, nil
+	}
+	slingTrackedConvoyFn = func(string) string { return "" }
+	slingCreateAutoConvoyFn = func(string, string, bool, string, string) (string, error) { return "hq-cv-attempt", nil }
+	lockErr := errors.New("forced assignee lock failure")
+	tryAcquireSlingAssigneeLockFn = func(string, string) (func(), error) { return nil, lockErr }
+	closed := []string{}
+	closeSlingConvoyFn = func(convoyID, _ string) { closed = append(closed, convoyID) }
+	rollbackSlingArtifactsFn = func(*SpawnedPolecatInfo, string, string, string) {
+		t.Fatal("convoy-only rollback invoked full assignment cleanup")
+	}
+
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/crew/toast"}); !errors.Is(err, lockErr) {
+		t.Fatalf("runSling error = %v, want assignee lock failure", err)
+	}
+	if len(closed) != 1 || closed[0] != "hq-cv-attempt" {
+		t.Fatalf("closed convoys = %v, want exact attempt convoy once", closed)
+	}
+	if got := readMutableBDDescription(t, descPath); got != initial {
+		t.Fatalf("preexisting molecule workflow changed: %q", got)
+	}
+}
+
+func TestRunSlingExistingTargetFenceRejectionClosesAttemptConvoy(t *testing.T) {
+	townRoot, _, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldAssign, oldLock := resolveTargetAgentFn, assignPolecatWorkIfCurrent, tryAcquireSlingAssigneeLockFn
+	oldTracked, oldCreate, oldClose := slingTrackedConvoyFn, slingCreateAutoConvoyFn, closeSlingConvoyFn
+	oldRaw, oldConvoy, oldBoot, oldDryRun := slingHookRawBead, slingNoConvoy, slingNoBoot, slingDryRun
+	t.Cleanup(func() {
+		resolveTargetAgentFn, assignPolecatWorkIfCurrent, tryAcquireSlingAssigneeLockFn = oldResolve, oldAssign, oldLock
+		slingTrackedConvoyFn, slingCreateAutoConvoyFn, closeSlingConvoyFn = oldTracked, oldCreate, oldClose
+		slingHookRawBead, slingNoConvoy, slingNoBoot, slingDryRun = oldRaw, oldConvoy, oldBoot, oldDryRun
+	})
+	slingHookRawBead, slingNoConvoy, slingNoBoot, slingDryRun = true, false, true, false
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "gastown/polecats/toast", "", townRoot, nil
+	}
+	tryAcquireSlingAssigneeLockFn = func(string, string) (func(), error) { return func() {}, nil }
+	slingTrackedConvoyFn = func(string) string { return "" }
+	slingCreateAutoConvoyFn = func(string, string, bool, string, string) (string, error) { return "hq-cv-attempt", nil }
+	fenceErr := errors.New("forced generation rejection")
+	assignPolecatWorkIfCurrent = func(_, _, _ string, _ func() error) error { return fenceErr }
+	closed := []string{}
+	closeSlingConvoyFn = func(convoyID, _ string) { closed = append(closed, convoyID) }
+
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"}); !errors.Is(err, fenceErr) {
+		t.Fatalf("runSling error = %v, want generation rejection", err)
+	}
+	if len(closed) != 1 || closed[0] != "hq-cv-attempt" {
+		t.Fatalf("closed convoys = %v, want exact attempt convoy once", closed)
+	}
 }
 
 func TestExecuteSlingRawReviewOnlyHookFailureRestoresOriginalMetadata(t *testing.T) {
@@ -1953,8 +2659,12 @@ func TestExecuteSlingRawReviewOnlySuccessKeepsMetadata(t *testing.T) {
 	}
 	hookBeadWithRetryWithTownRootFn = func(beadID, targetAgent, hookDir, townRoot string) error {
 		assertHasRawReviewMetadata(t, readMutableBDDescription(t, descPath))
-		return nil
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(targetAgent), 0o644)
 	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
 
 	result, err := executeSling(SlingParams{
 		BeadID:      "gt-rawrollback",
@@ -1974,6 +2684,1077 @@ func TestExecuteSlingRawReviewOnlySuccessKeepsMetadata(t *testing.T) {
 		t.Fatalf("executeSling result not successful: %+v", result)
 	}
 	assertHasRawReviewMetadata(t, readMutableBDDescription(t, descPath))
+}
+
+func TestExecuteSlingFencesRawMetadataAndHookAsOneAssignment(t *testing.T) {
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+
+	prevSpawn := spawnPolecatForSling
+	prevHook := hookBeadWithRetryWithTownRootFn
+	prevAssign := assignPolecatWorkIfCurrent
+	t.Cleanup(func() {
+		spawnPolecatForSling = prevSpawn
+		hookBeadWithRetryWithTownRootFn = prevHook
+		assignPolecatWorkIfCurrent = prevAssign
+	})
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: "toast",
+			ClonePath:   filepath.Join(townRoot, "gastown", "polecats", "toast"),
+			Pane:        "%1",
+		}, nil
+	}
+	inAssignment := false
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error {
+		inAssignment = true
+		defer func() { inAssignment = false }()
+		return assign()
+	}
+	hookBeadWithRetryWithTownRootFn = func(_, targetAgent, _, _ string) error {
+		if !inAssignment {
+			t.Fatal("hook mutation ran outside the polecat assignment transaction")
+		}
+		assertHasRawReviewMetadata(t, readMutableBDDescription(t, descPath))
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(targetAgent), 0o644)
+	}
+
+	result, err := executeSling(SlingParams{
+		BeadID:      "gt-rawrollback",
+		RigName:     "gastown",
+		TownRoot:    townRoot,
+		BeadsDir:    filepath.Join(rigPath, ".beads"),
+		HookRawBead: true,
+		NoMerge:     true,
+		ReviewOnly:  true,
+		NoConvoy:    true,
+		NoBoot:      true,
+	})
+	if err != nil {
+		t.Fatalf("executeSling: %v", err)
+	}
+	if result == nil || !result.Success {
+		t.Fatalf("executeSling result not successful: %+v", result)
+	}
+}
+
+func TestExecuteSlingFencesStaleBurnAndFailureRollback(t *testing.T) {
+	initial := "attached_molecule: gt-old-wisp\n\nKeep this body."
+	townRoot, rigPath, _ := setupMutableBDRawSlingTest(t, initial)
+	prevSpawn, prevAssign := spawnPolecatForSling, assignPolecatWorkIfCurrent
+	prevBurn, prevRollback := burnExistingMoleculesFn, rollbackSlingArtifactsWhileAssignmentFencedFn
+	t.Cleanup(func() {
+		spawnPolecatForSling, assignPolecatWorkIfCurrent = prevSpawn, prevAssign
+		burnExistingMoleculesFn, rollbackSlingArtifactsWhileAssignmentFencedFn = prevBurn, prevRollback
+	})
+	spawnPolecatForSling = func(rigName string, _ SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "toast", ClonePath: filepath.Join(townRoot, "gastown", "polecats", "toast")}, nil
+	}
+	inAssignment := false
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error {
+		inAssignment = true
+		defer func() { inAssignment = false }()
+		return assign()
+	}
+	burnExistingMoleculesFn = func([]string, string, string, *beadInfo) error {
+		if !inAssignment {
+			t.Fatal("stale molecule burn ran outside generation fence")
+		}
+		return errors.New("injected burn failure")
+	}
+	rollbackSlingArtifactsWhileAssignmentFencedFn = func(*SpawnedPolecatInfo, string, string, string) {
+		if !inAssignment {
+			t.Fatal("failure rollback ran outside generation fence")
+		}
+	}
+	_, err := executeSling(SlingParams{
+		Context: context.Background(), BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot,
+		BeadsDir: filepath.Join(rigPath, ".beads"), FormulaName: "formula", NoConvoy: true, NoBoot: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "injected burn failure") {
+		t.Fatalf("executeSling error = %v", err)
+	}
+}
+
+func TestExecuteSlingReconcilesPendingFormulaBeforePreservingCleanup(t *testing.T) {
+	townRoot, rigPath, _ := setupMutableBDRawSlingTest(t, "attached_molecule: gt-recovered\n\nKeep this body.")
+	if err := writeFormulaMutationAttempt(townRoot, &formulaMutationAttempt{
+		Key:                formulaBondMutationKey("formula", "gt-rawrollback"),
+		Scope:              "test-scope",
+		RequestFingerprint: "test-request",
+		OperationNonce:     "22222222-2222-4222-8222-222222222222",
+		RootID:             "gt-recovered",
+		RootGeneration:     "generation-gt-recovered",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prevSpawn, prevAssign := spawnPolecatForSling, assignPolecatWorkIfCurrent
+	prevInstantiate, prevCollect := instantiateFormulaOnBeadFn, collectExistingMoleculesForBeadFn
+	prevBurn, prevBurnPreserving := burnExistingMoleculesFn, burnExistingMoleculesPreservingFn
+	t.Cleanup(func() {
+		spawnPolecatForSling, assignPolecatWorkIfCurrent = prevSpawn, prevAssign
+		instantiateFormulaOnBeadFn, collectExistingMoleculesForBeadFn = prevInstantiate, prevCollect
+		burnExistingMoleculesFn, burnExistingMoleculesPreservingFn = prevBurn, prevBurnPreserving
+	})
+	spawnPolecatForSling = func(rigName string, _ SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "toast", ClonePath: filepath.Join(townRoot, "gastown", "polecats", "toast")}, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+
+	callerCtx := context.WithValue(context.Background(), struct{}{}, "caller")
+	instantiateCalls := 0
+	instantiateFormulaOnBeadFn = func(ctx context.Context, _, _, _, _, _ string, _ bool, _ []string) (*FormulaOnBeadResult, error) {
+		if ctx != callerCtx {
+			t.Fatal("formula reconciliation did not receive caller context")
+		}
+		instantiateCalls++
+		return &FormulaOnBeadResult{WispRootID: "gt-recovered", BeadToHook: "gt-rawrollback"}, nil
+	}
+	collectExistingMoleculesForBeadFn = func(*beadInfo, string, string) ([]string, error) {
+		if instantiateCalls != 1 {
+			t.Fatalf("stale inventory collected before pending reconciliation: calls=%d", instantiateCalls)
+		}
+		return []string{"gt-old", "gt-recovered"}, nil
+	}
+	burnExistingMoleculesFn = func([]string, string, string, *beadInfo) error {
+		t.Fatal("pending formula cleanup used the non-preserving path")
+		return nil
+	}
+	stop := errors.New("stop after preserving cleanup")
+	burnExistingMoleculesPreservingFn = func(molecules, preserved []string, _ string, _ string, _ *beadInfo) error {
+		if len(molecules) != 1 || molecules[0] != "gt-old" || len(preserved) != 1 || preserved[0] != "gt-recovered" {
+			t.Fatalf("burn candidates = %v preserved = %v", molecules, preserved)
+		}
+		return stop
+	}
+
+	_, err := executeSling(SlingParams{
+		Context: callerCtx, BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot,
+		BeadsDir: filepath.Join(rigPath, ".beads"), FormulaName: "formula", Force: true, NoConvoy: true, NoBoot: true,
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("executeSling error = %v", err)
+	}
+	if instantiateCalls != 1 {
+		t.Fatalf("formula instantiated %d times, want one reconciliation", instantiateCalls)
+	}
+}
+
+func TestExecuteSlingRollbackPreservesPostHookStatusDrift(t *testing.T) {
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "no_merge: true\nreview_only: true\nKeep this body.\n")
+	statusPath := filepath.Join(townRoot, "status.txt")
+	assigneePath := filepath.Join(townRoot, "assignee.txt")
+	prevSpawn, prevHook, prevAssign := spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent
+	prevCleanup := cleanupSpawnedPolecatFn
+	t.Cleanup(func() {
+		spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, cleanupSpawnedPolecatFn = prevSpawn, prevHook, prevAssign, prevCleanup
+	})
+	cleanupCalls := 0
+	cleanupSpawnedPolecatFn = func(*SpawnedPolecatInfo, string, string) { cleanupCalls++ }
+	spawnPolecatForSling = func(rigName string, _ SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{
+			RigName: rigName, PolecatName: "toast",
+			ClonePath: filepath.Join(townRoot, "sentinel-clone"),
+		}, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	hookBeadWithRetryWithTownRootFn = func(_, targetAgent, _, _ string) error {
+		if err := os.WriteFile(statusPath, []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(assigneePath, []byte(targetAgent), 0o644); err != nil {
+			return err
+		}
+		// Replacement keeps status/assignee but swaps workflow ownership after hook.
+		if err := os.WriteFile(descPath, []byte("attached_molecule: gt-replacement\nno_merge: true\nreview_only: true\nKeep this body.\n"), 0o644); err != nil {
+			return err
+		}
+		// A concurrent worker advances the exact assignment after the hook write.
+		return os.WriteFile(statusPath, []byte("in_progress"), 0o644)
+	}
+
+	_, err := executeSling(SlingParams{
+		BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot,
+		BeadsDir: filepath.Join(rigPath, ".beads"), NoConvoy: true, NoBoot: true,
+	})
+	if err == nil {
+		t.Fatal("executeSling unexpectedly started the missing fixture session")
+	}
+	status, readErr := os.ReadFile(statusPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got := string(status); got != "in_progress" {
+		t.Fatalf("rollback overwrote post-hook status drift: got %q, want in_progress", got)
+	}
+	desc, readErr := os.ReadFile(descPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(desc), "attached_molecule: gt-replacement") || !strings.Contains(string(desc), "no_merge: true") || !strings.Contains(string(desc), "review_only: true") {
+		t.Fatalf("rollback overwrote replacement workflow metadata: %s", desc)
+	}
+}
+
+func TestExecuteSlingRollbackPreservesSameStatusWorkflowReplacement(t *testing.T) {
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "no_merge: true\nKeep this body.\n")
+	replacement := "attached_molecule: gt-replacement\nattached_formula: mol-replacement\nattached_args: replacement args\nattached_vars: mode=repair\nformula_vars: mode=repair\nconvoy_id: hq-replacement\nmerge_strategy: local\nconvoy_owned: true\nno_merge: true\nKeep this body.\n"
+	prevCleanup := cleanupSpawnedPolecatFn
+	cleanupCalls := 0
+	cleanupSpawnedPolecatFn = func(*SpawnedPolecatInfo, string, string) { cleanupCalls++ }
+	t.Cleanup(func() { cleanupSpawnedPolecatFn = prevCleanup })
+	prevSpawn, prevHook, prevAssign := spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent
+	t.Cleanup(func() {
+		spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent = prevSpawn, prevHook, prevAssign
+	})
+	spawnPolecatForSling = func(rigName string, _ SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "toast"}, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	hookBeadWithRetryWithTownRootFn = func(_, targetAgent, _, _ string) error {
+		_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+		_ = os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(targetAgent), 0o644)
+		return os.WriteFile(descPath, []byte(replacement), 0o644)
+	}
+	result, err := executeSling(SlingParams{BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot, BeadsDir: filepath.Join(rigPath, ".beads"), NoConvoy: true, NoBoot: true})
+	if err == nil || result == nil {
+		t.Fatalf("expected forced session-start failure, result=%+v err=%v", result, err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "hooked" {
+		t.Fatalf("status changed: %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "gastown/polecats/toast" {
+		t.Fatalf("assignee changed: %q", got)
+	}
+	desc, err := os.ReadFile(descPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{
+		"attached_molecule: gt-replacement",
+		"attached_formula: mol-replacement",
+		"attached_args: replacement args",
+		`attached_vars: ["mode=repair"]`,
+		`formula_vars: ["mode=repair"]`,
+		"convoy_id: hq-replacement",
+		"merge_strategy: local",
+		"convoy_owned: true",
+	} {
+		if !strings.Contains(string(desc), field) {
+			t.Fatalf("replacement workflow field %q lost: %s", field, desc)
+		}
+	}
+	if cleanupCalls != 0 {
+		t.Fatalf("destructive polecat cleanup called %d times", cleanupCalls)
+	}
+}
+
+func TestExecuteSlingNoDriftRestoresAssignmentOnStartupFailure(t *testing.T) {
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "no_merge: true\nKeep this body.\n")
+	prevSpawn, prevHook, prevAssign, prevStart := spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn
+	t.Cleanup(func() {
+		spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn = prevSpawn, prevHook, prevAssign, prevStart
+	})
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "sentinel")}, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	hookBeadWithRetryWithTownRootFn = func(_, target, _, _ string) error {
+		_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	startErr := errors.New("forced startup failure")
+	startSpawnedPolecatSessionFn = func(_ *SpawnedPolecatInfo, callerLocked bool) (string, error) {
+		if !callerLocked {
+			t.Fatal("dispatch session start did not reuse the held lifecycle fence")
+		}
+		return "", startErr
+	}
+	_, err := executeSling(SlingParams{BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot, BeadsDir: filepath.Join(rigPath, ".beads"), NoConvoy: true, NoBoot: true})
+	if !errors.Is(err, startErr) {
+		t.Fatalf("error=%v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "open" {
+		t.Fatalf("status=%q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "" {
+		t.Fatalf("assignee=%q", got)
+	}
+	desc, _ := os.ReadFile(descPath)
+	if !strings.Contains(string(desc), "no_merge: true") || !strings.Contains(string(desc), "Keep this body.") {
+		t.Fatalf("workflow=%s", desc)
+	}
+}
+
+func TestExecuteSlingForceRetiresOldOwnerOnlyAfterReplacementStarts(t *testing.T) {
+	townRoot, rigPath, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte("gastown/polecats/toast"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldSpawn, oldHook, oldAssign, oldStart := spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn
+	oldCapture, oldComplete, oldAbort := capturePolecatIncarnationFn, completeRetirementRecordFn, abortRetirementRecordFn
+	oldAvailable := lifecycleRetirementAvailableFn
+	t.Cleanup(func() {
+		spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn = oldSpawn, oldHook, oldAssign, oldStart
+		capturePolecatIncarnationFn, completeRetirementRecordFn, abortRetirementRecordFn = oldCapture, oldComplete, oldAbort
+		lifecycleRetirementAvailableFn = oldAvailable
+	})
+	lifecycleRetirementAvailableFn = func() bool { return true }
+	capturePolecatIncarnationFn = func(string, string) (string, error) { return "old-generation", nil }
+	abortRetirementRecordFn = func(string, *slingRetirementRecord) error { return nil }
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "sentinel"), Incarnation: "new-generation"}, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	hookBeadWithRetryWithTownRootFn = func(_, target, _, _ string) error {
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	started := false
+	startSpawnedPolecatSessionFn = func(_ *SpawnedPolecatInfo, callerLocked bool) (string, error) {
+		if !callerLocked {
+			t.Fatal("replacement start did not reuse lifecycle fence")
+		}
+		started = true
+		return "%1", nil
+	}
+	notifyCalls := 0
+	completeRetirementRecordFn = func(_ string, record *slingRetirementRecord) error {
+		notifyCalls++
+		if record == nil || !started || record.OldAssignee != "gastown/polecats/toast" || record.OldIncarnation != "old-generation" || record.NewAssignee != "gastown/polecats/toast" || record.NewIncarnation != "new-generation" || record.BeadID != "gt-rawrollback" {
+			t.Fatalf("premature/incorrect retirement: started=%v record=%+v", started, record)
+		}
+		if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != record.NewAssignee {
+			t.Fatalf("retirement preceded replacement hook: assignee=%q", got)
+		}
+		return nil
+	}
+
+	result, err := executeSling(SlingParams{BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot, BeadsDir: filepath.Join(rigPath, ".beads"), Force: true, NoConvoy: true, NoBoot: true})
+	if err != nil || result == nil || !result.Success {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if notifyCalls != 1 {
+		t.Fatalf("retirement calls=%d, want 1", notifyCalls)
+	}
+}
+
+func TestExecuteSlingForceDoesNotRetireOldOwnerWhenReplacementStartFails(t *testing.T) {
+	townRoot, rigPath, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+	_ = os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte("gastown/polecats/old"), 0o644)
+	oldSpawn, oldHook, oldAssign, oldStart := spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn
+	oldCapture, oldComplete, oldAbort := capturePolecatIncarnationFn, completeRetirementRecordFn, abortRetirementRecordFn
+	oldAvailable := lifecycleRetirementAvailableFn
+	t.Cleanup(func() {
+		spawnPolecatForSling, hookBeadWithRetryWithTownRootFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn = oldSpawn, oldHook, oldAssign, oldStart
+		capturePolecatIncarnationFn, completeRetirementRecordFn, abortRetirementRecordFn = oldCapture, oldComplete, oldAbort
+		lifecycleRetirementAvailableFn = oldAvailable
+	})
+	lifecycleRetirementAvailableFn = func() bool { return true }
+	capturePolecatIncarnationFn = func(string, string) (string, error) { return "old-generation", nil }
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "sentinel"), Incarnation: "new-generation"}, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	hookBeadWithRetryWithTownRootFn = func(_, target, _, _ string) error {
+		_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	startErr := errors.New("replacement did not start")
+	startSpawnedPolecatSessionFn = func(*SpawnedPolecatInfo, bool) (string, error) { return "", startErr }
+	notifyCalls := 0
+	completeRetirementRecordFn = func(string, *slingRetirementRecord) error { notifyCalls++; return nil }
+	abortRetirementRecordFn = func(string, *slingRetirementRecord) error { return nil }
+
+	_, err := executeSling(SlingParams{BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot, BeadsDir: filepath.Join(rigPath, ".beads"), Force: true, NoConvoy: true, NoBoot: true})
+	if !errors.Is(err, startErr) {
+		t.Fatalf("error=%v", err)
+	}
+	if notifyCalls != 0 {
+		t.Fatalf("retired old owner after failed replacement: calls=%d", notifyCalls)
+	}
+}
+
+func TestExecuteSlingForceRejectsReplacementBeforeSpawnWithoutLifecycleExecutor(t *testing.T) {
+	townRoot, rigPath, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte("gastown/polecats/old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldAvailable, oldSpawn, oldCapture := lifecycleRetirementAvailableFn, spawnPolecatForSling, capturePolecatIncarnationFn
+	t.Cleanup(func() {
+		lifecycleRetirementAvailableFn, spawnPolecatForSling, capturePolecatIncarnationFn = oldAvailable, oldSpawn, oldCapture
+	})
+	lifecycleRetirementAvailableFn = func() bool { return false }
+	spawned, captured := false, false
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		spawned = true
+		return nil, errors.New("replacement spawned")
+	}
+	capturePolecatIncarnationFn = func(string, string) (string, error) {
+		captured = true
+		return "old-generation", nil
+	}
+
+	_, err := executeSling(SlingParams{
+		BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot,
+		BeadsDir: filepath.Join(rigPath, ".beads"), Force: true, NoConvoy: true, NoBoot: true,
+	})
+	if !errors.Is(err, tmux.ErrSessionCustodyUnsupported) {
+		t.Fatalf("executeSling error = %v, want unsupported lifecycle executor", err)
+	}
+	if spawned || captured {
+		t.Fatalf("unsupported lifecycle path mutated replacement custody: spawned=%v captured=%v", spawned, captured)
+	}
+}
+
+func TestRunSlingForceSameOwnerGenerationDoesNotCreateRetirement(t *testing.T) {
+	townRoot, _, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+	_ = os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte("gastown/polecats/toast"), 0o644)
+	oldResolve, oldAssign, oldHook, oldCapture, oldComplete, oldAvailable := resolveTargetAgentFn, assignPolecatWorkIfCurrent, hookBeadWithRetryAssignmentFn, capturePolecatIncarnationFn, completeRetirementRecordFn, lifecycleRetirementAvailableFn
+	oldForce, oldRaw, oldConvoy, oldBoot := slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, assignPolecatWorkIfCurrent, hookBeadWithRetryAssignmentFn, capturePolecatIncarnationFn, completeRetirementRecordFn, lifecycleRetirementAvailableFn = oldResolve, oldAssign, oldHook, oldCapture, oldComplete, oldAvailable
+		slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot = oldForce, oldRaw, oldConvoy, oldBoot
+	})
+	slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot = true, true, true, true
+	lifecycleRetirementAvailableFn = func() bool { return true }
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "gastown/polecats/toast", "%1", townRoot, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	hookBeadWithRetryAssignmentFn = func(_, _, _, _ string) error { return nil }
+	captureCalls := 0
+	capturePolecatIncarnationFn = func(string, string) (string, error) {
+		captureCalls++
+		return "same-generation", nil
+	}
+	completeRetirementRecordFn = func(_ string, record *slingRetirementRecord) error {
+		if record != nil {
+			t.Fatalf("same-owner force sling created retirement: %+v", record)
+		}
+		return nil
+	}
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"}); err != nil {
+		t.Fatalf("same-owner force sling: %v", err)
+	}
+	if captureCalls == 0 {
+		t.Fatal("same-owner force sling did not capture immutable generation custody")
+	}
+}
+
+func TestRunSlingForceCapturesOldGenerationBeforeResolvingSameOwnerReplacement(t *testing.T) {
+	townRoot, _, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+	_ = os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte("gastown/polecats/toast"), 0o644)
+	oldResolve, oldAssign, oldHook, oldCapture, oldComplete, oldAvailable := resolveTargetAgentFn, assignPolecatWorkIfCurrent, hookBeadWithRetryAssignmentFn, capturePolecatIncarnationFn, completeRetirementRecordFn, lifecycleRetirementAvailableFn
+	oldForce, oldRaw, oldConvoy, oldBoot := slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, assignPolecatWorkIfCurrent, hookBeadWithRetryAssignmentFn, capturePolecatIncarnationFn, completeRetirementRecordFn, lifecycleRetirementAvailableFn = oldResolve, oldAssign, oldHook, oldCapture, oldComplete, oldAvailable
+		slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot = oldForce, oldRaw, oldConvoy, oldBoot
+	})
+	slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot = true, true, true, true
+	lifecycleRetirementAvailableFn = func() bool { return true }
+	resolved := false
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		resolved = true
+		return "gastown/polecats/toast", "%1", townRoot, nil
+	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	hookBeadWithRetryAssignmentFn = func(_, _, _, _ string) error { return nil }
+	capturePolecatIncarnationFn = func(string, string) (string, error) {
+		if resolved {
+			return "new-generation", nil
+		}
+		return "old-generation", nil
+	}
+	retired := false
+	completeRetirementRecordFn = func(_ string, record *slingRetirementRecord) error {
+		retired = true
+		if record == nil {
+			t.Fatal("same-owner replacement produced no retirement record")
+		}
+		if record.OldIncarnation != "old-generation" || record.NewIncarnation != "new-generation" {
+			t.Fatalf("retirement generations = %s -> %s", record.OldIncarnation, record.NewIncarnation)
+		}
+		return nil
+	}
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"}); err != nil {
+		t.Fatalf("same-owner replacement sling: %v", err)
+	}
+	if !retired {
+		t.Fatal("same-owner replacement lost the old incarnation before retirement")
+	}
+}
+
+func TestRunSlingForceRejectsReplacementBeforeResolveWithoutLifecycleExecutor(t *testing.T) {
+	townRoot, _, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+	_ = os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte("gastown/polecats/toast"), 0o644)
+
+	oldResolve, oldAvailable := resolveTargetAgentFn, lifecycleRetirementAvailableFn
+	oldForce, oldRaw, oldConvoy, oldBoot := slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, lifecycleRetirementAvailableFn = oldResolve, oldAvailable
+		slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot = oldForce, oldRaw, oldConvoy, oldBoot
+	})
+	slingForce, slingHookRawBead, slingNoConvoy, slingNoBoot = true, true, true, true
+	lifecycleRetirementAvailableFn = func() bool { return false }
+	resolved := false
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		resolved = true
+		return "gastown/polecats/toast", "%1", townRoot, nil
+	}
+
+	err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"})
+	if !errors.Is(err, tmux.ErrSessionCustodyUnsupported) {
+		t.Fatalf("runSling error = %v, want unsupported lifecycle executor", err)
+	}
+	if resolved {
+		t.Fatal("replacement target resolved before lifecycle capability rejection")
+	}
+}
+
+func TestRunSlingForceNoDriftRestoresOriginalPinnedAssignmentOnStartupFailure(t *testing.T) {
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, "no_merge: true\nKeep this body.\n")
+	if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("pinned"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte("gastown/polecats/old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldResolve, oldSpawn, oldStart, oldHook, oldAssign, oldRaw, oldForce, oldConvoy, oldBoot := resolveTargetAgentFn, spawnPolecatForSling, startSpawnedPolecatSessionFn, hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, slingHookRawBead, slingForce, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, startSpawnedPolecatSessionFn, hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, slingHookRawBead, slingForce, slingNoConvoy, slingNoBoot = oldResolve, oldSpawn, oldStart, oldHook, oldAssign, oldRaw, oldForce, oldConvoy, oldBoot
+	})
+	slingHookRawBead, slingForce, slingNoConvoy, slingNoBoot = true, true, true, true
+	fenceHeld := false
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error {
+		fenceHeld = true
+		defer func() { fenceHeld = false }()
+		return assign()
+	}
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "sentinel"), Incarnation: "gen-1"}, nil
+	}
+	hookBeadWithRetryAssignmentFn = func(_, target, _, _ string) error {
+		if !fenceHeld {
+			t.Fatal("hook ran outside the assignment fence")
+		}
+		_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	startErr := errors.New("forced startup failure")
+	startSpawnedPolecatSessionFn = func(_ *SpawnedPolecatInfo, callerLocked bool) (string, error) {
+		if !fenceHeld {
+			t.Fatal("session start ran outside the assignment fence")
+		}
+		if !callerLocked {
+			t.Fatal("run sling session start did not reuse the held lifecycle fence")
+		}
+		return "", startErr
+	}
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"}); !errors.Is(err, startErr) {
+		t.Fatalf("error=%v, want startup failure", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "pinned" {
+		t.Fatalf("status=%q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "gastown/polecats/old" {
+		t.Fatalf("assignee=%q", got)
+	}
+	desc, _ := os.ReadFile(descPath)
+	if !strings.Contains(string(desc), "no_merge: true") || !strings.Contains(string(desc), "Keep this body.") {
+		t.Fatalf("workflow=%s", desc)
+	}
+}
+
+func TestRunSlingForceRollbackPreservesOpenReplacementOfPinnedAssignment(t *testing.T) {
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+	if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("pinned"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte("gastown/polecats/old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldResolve, oldSpawn, oldHook, oldAssign, oldCleanup, oldRaw, oldForce, oldConvoy, oldBoot :=
+		resolveTargetAgentFn, spawnPolecatForSling, hookBeadWithRetryAssignmentFn,
+		assignPolecatWorkIfCurrent, cleanupSpawnedPolecatFn, slingHookRawBead, slingForce, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, hookBeadWithRetryAssignmentFn,
+			assignPolecatWorkIfCurrent, cleanupSpawnedPolecatFn, slingHookRawBead, slingForce, slingNoConvoy, slingNoBoot =
+			oldResolve, oldSpawn, oldHook, oldAssign, oldCleanup, oldRaw, oldForce, oldConvoy, oldBoot
+	})
+	slingHookRawBead, slingForce, slingNoConvoy, slingNoBoot = true, true, true, true
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Incarnation: "gen-1"}, nil
+	}
+	cleanupSpawnedPolecatFn = func(*SpawnedPolecatInfo, string, string) {}
+	replacement := "no_merge: false\nReplacement body."
+	hookErr := errors.New("forced partial hook failure")
+	hookBeadWithRetryAssignmentFn = func(_, _, _, _ string) error {
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("open"), 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(townRoot, "assignee.txt"), nil, 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(descPath, []byte(replacement), 0o644); err != nil {
+			return err
+		}
+		return hookErr
+	}
+
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"}); !errors.Is(err, hookErr) {
+		t.Fatalf("error=%v, want partial hook failure", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "open" {
+		t.Fatalf("replacement status changed: %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "" {
+		t.Fatalf("replacement assignee changed: %q", got)
+	}
+	if got, _ := os.ReadFile(descPath); string(got) != replacement {
+		t.Fatalf("replacement workflow changed: %q", got)
+	}
+}
+
+func TestRunSlingCleansSpawnWhenAssignmentFenceFails(t *testing.T) {
+	setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldSpawn, oldAssign, oldCleanup, oldRaw, oldConvoy, oldBoot :=
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent,
+		cleanupSpawnedPolecatFn, slingHookRawBead, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent,
+			cleanupSpawnedPolecatFn, slingHookRawBead, slingNoConvoy, slingNoBoot =
+			oldResolve, oldSpawn, oldAssign, oldCleanup, oldRaw, oldConvoy, oldBoot
+	})
+	slingHookRawBead, slingNoConvoy, slingNoBoot = true, true, true
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawned := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Incarnation: "gen-1"}
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) { return spawned, nil }
+	fenceErr := errors.New("forced assignment fence failure")
+	assignPolecatWorkIfCurrent = func(_, _, _ string, _ func() error) error { return fenceErr }
+	cleanupCalls := 0
+	cleanupSpawnedPolecatFn = func(got *SpawnedPolecatInfo, rigName, convoyID string) {
+		cleanupCalls++
+		if got != spawned || rigName != "gastown" || convoyID != "" {
+			t.Fatalf("cleanup args = (%+v, %q, %q)", got, rigName, convoyID)
+		}
+	}
+
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"}); !errors.Is(err, fenceErr) {
+		t.Fatalf("error=%v, want assignment fence failure", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("spawn cleanup calls=%d, want 1", cleanupCalls)
+	}
+}
+
+func TestRunSlingFormulaCleansSpawnWhenAssignmentFenceFails(t *testing.T) {
+	setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldSpawn, oldAssign, oldCleanup, oldDryRun, oldBoot :=
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent,
+		cleanupSpawnedPolecatFn, slingDryRun, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent,
+			cleanupSpawnedPolecatFn, slingDryRun, slingNoBoot =
+			oldResolve, oldSpawn, oldAssign, oldCleanup, oldDryRun, oldBoot
+	})
+	slingDryRun, slingNoBoot = false, true
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawned := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Incarnation: "gen-1"}
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) { return spawned, nil }
+	fenceErr := errors.New("forced assignment fence failure")
+	assignPolecatWorkIfCurrent = func(_, _, _ string, _ func() error) error { return fenceErr }
+	cleanupCalls := 0
+	cleanupSpawnedPolecatFn = func(got *SpawnedPolecatInfo, rigName, convoyID string) {
+		cleanupCalls++
+		if got != spawned || rigName != "gastown" || convoyID != "" {
+			t.Fatalf("cleanup args = (%+v, %q, %q)", got, rigName, convoyID)
+		}
+	}
+
+	if err := runSlingFormula(context.Background(), []string{"mol-anything", "gastown/polecats/toast"}); !errors.Is(err, fenceErr) {
+		t.Fatalf("error=%v, want assignment fence failure", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("spawn cleanup calls=%d, want 1", cleanupCalls)
+	}
+}
+
+func TestRunSlingFormulaCleansSpawnWhenAssigneeLockFails(t *testing.T) {
+	setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldSpawn, oldLock, oldRollback, oldDryRun, oldBoot :=
+		resolveTargetAgentFn, spawnPolecatForSling, tryAcquireSlingAssigneeLockFn,
+		rollbackSlingArtifactsFn, slingDryRun, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, tryAcquireSlingAssigneeLockFn,
+			rollbackSlingArtifactsFn, slingDryRun, slingNoBoot =
+			oldResolve, oldSpawn, oldLock, oldRollback, oldDryRun, oldBoot
+	})
+	slingDryRun, slingNoBoot = false, true
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawned := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Incarnation: "gen-1"}
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) { return spawned, nil }
+	lockErr := errors.New("forced assignee lock failure")
+	tryAcquireSlingAssigneeLockFn = func(string, string) (func(), error) { return nil, lockErr }
+	cleanupCalls := 0
+	rollbackSlingArtifactsFn = func(got *SpawnedPolecatInfo, beadID, _ string, _ string) {
+		cleanupCalls++
+		if got != spawned || beadID != "" {
+			t.Fatalf("rollback = (%+v, %q)", got, beadID)
+		}
+	}
+	if err := runSlingFormula(context.Background(), []string{"mol-anything", "gastown/polecats/toast"}); !errors.Is(err, lockErr) {
+		t.Fatalf("error=%v, want assignee lock failure", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("spawn cleanup calls=%d, want 1", cleanupCalls)
+	}
+}
+
+func TestRunSlingFormulaCleansSpawnWhenWorkflowReceiptFails(t *testing.T) {
+	stubFormulaWispCreationInventory(t, "gt-rawrollback")
+	setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldSpawn, oldAssign, oldFind, oldCapture, oldRollback, oldDryRun, oldBoot :=
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent, findHookedFormulaSingletonFn,
+		captureSlingWorkflowReceiptFn, rollbackSlingArtifactsFn, slingDryRun, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent, findHookedFormulaSingletonFn,
+			captureSlingWorkflowReceiptFn, rollbackSlingArtifactsFn, slingDryRun, slingNoBoot =
+			oldResolve, oldSpawn, oldAssign, oldFind, oldCapture, oldRollback, oldDryRun, oldBoot
+	})
+	slingDryRun, slingNoBoot = false, true
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawned := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Incarnation: "gen-1"}
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) { return spawned, nil }
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	findHookedFormulaSingletonFn = func(_, _, _ string) (*beads.Issue, error) { return nil, nil }
+	receiptErr := errors.New("forced workflow receipt failure")
+	captureSlingWorkflowReceiptFn = func(string) (*slingAssignmentReceipt, error) { return nil, receiptErr }
+	cleanupCalls := 0
+	rollbackSlingArtifactsFn = func(got *SpawnedPolecatInfo, beadID, _ string, _ string) {
+		cleanupCalls++
+		if got != spawned || beadID != "gt-rawrollback" {
+			t.Fatalf("rollback = (%+v, %q)", got, beadID)
+		}
+	}
+	if err := runSlingFormula(context.Background(), []string{"mol-anything", "gastown/polecats/toast"}); !errors.Is(err, receiptErr) {
+		t.Fatalf("error=%v, want receipt failure", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("spawn cleanup calls=%d, want 1", cleanupCalls)
+	}
+}
+
+func TestRunSlingPreservesWorkflowDriftOnStartupFailure(t *testing.T) {
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldSpawn, oldStart, oldHook, oldAssign, oldCleanup, oldRaw, oldConvoy, oldBoot :=
+		resolveTargetAgentFn, spawnPolecatForSling, startSpawnedPolecatSessionFn,
+		hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, cleanupSpawnedPolecatFn, slingHookRawBead, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, startSpawnedPolecatSessionFn,
+			hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, cleanupSpawnedPolecatFn, slingHookRawBead, slingNoConvoy, slingNoBoot =
+			oldResolve, oldSpawn, oldStart, oldHook, oldAssign, oldCleanup, oldRaw, oldConvoy, oldBoot
+	})
+	slingHookRawBead, slingNoConvoy, slingNoBoot = true, true, true
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "sentinel"), Incarnation: "gen-1"}, nil
+	}
+	replacement := "attached_formula: mol-replacement\nattached_args: replacement args\nKeep replacement body."
+	hookBeadWithRetryAssignmentFn = func(_, target, _, _ string) error {
+		_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+		_ = os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+		return os.WriteFile(descPath, []byte(replacement), 0o644)
+	}
+	startErr := errors.New("forced startup failure")
+	startSpawnedPolecatSessionFn = func(*SpawnedPolecatInfo, bool) (string, error) { return "", startErr }
+	cleanupCalls := 0
+	cleanupSpawnedPolecatFn = func(*SpawnedPolecatInfo, string, string) { cleanupCalls++ }
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"}); !errors.Is(err, startErr) {
+		t.Fatalf("error=%v, want startup failure", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "hooked" {
+		t.Fatalf("status=%q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "gastown/polecats/toast" {
+		t.Fatalf("assignee=%q", got)
+	}
+	if desc, _ := os.ReadFile(descPath); !strings.Contains(string(desc), "attached_formula: mol-replacement") || !strings.Contains(string(desc), "Keep replacement body.") {
+		t.Fatalf("workflow=%q", desc)
+	}
+	if cleanupCalls != 0 {
+		t.Fatalf("destructive polecat cleanup called %d times", cleanupCalls)
+	}
+}
+
+func TestRunSlingFormulaNoDriftRestoresAssignmentOnStartupFailure(t *testing.T) {
+	stubFormulaWispCreationInventory(t, "gt-rawrollback")
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldAdmission, oldSpawn, oldFind, oldHook, oldAssign, oldStart, oldDryRun, oldNoBoot :=
+		acquirePolecatAdmissionFn, spawnPolecatForSling, findHookedFormulaSingletonFn,
+		hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn, slingDryRun, slingNoBoot
+	t.Cleanup(func() {
+		acquirePolecatAdmissionFn, spawnPolecatForSling, findHookedFormulaSingletonFn,
+			hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn, slingDryRun, slingNoBoot =
+			oldAdmission, oldSpawn, oldFind, oldHook, oldAssign, oldStart, oldDryRun, oldNoBoot
+	})
+	slingDryRun, slingNoBoot = false, true
+	fenceHeld := false
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error {
+		fenceHeld = true
+		defer func() { fenceHeld = false }()
+		return assign()
+	}
+	acquirePolecatAdmissionFn = func(_, rigName, beadID, operation string) (*polecatAdmissionHandle, polecatCapacitySnapshot, error) {
+		if rigName != "gastown" || beadID != "mol-anything" || operation != "formula" {
+			t.Fatalf("admission args = (%q,%q,%q)", rigName, beadID, operation)
+		}
+		return &polecatAdmissionHandle{disabled: true}, polecatCapacitySnapshot{}, nil
+	}
+	findHookedFormulaSingletonFn = func(_, _, _ string) (*beads.Issue, error) { return nil, nil }
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{
+			RigName: "gastown", PolecatName: "toast", ClonePath: rigPath, Incarnation: "gen-1",
+		}, nil
+	}
+	hookBeadWithRetryAssignmentFn = func(_, target, _, _ string) error {
+		if !fenceHeld {
+			t.Fatal("formula hook ran outside the assignment fence")
+		}
+		if err := os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+	}
+	startErr := errors.New("forced formula startup failure")
+	startSpawnedPolecatSessionFn = func(_ *SpawnedPolecatInfo, callerLocked bool) (string, error) {
+		if !fenceHeld {
+			t.Fatal("formula session start ran outside the assignment fence")
+		}
+		if !callerLocked {
+			t.Fatal("formula session start did not reuse the held lifecycle fence")
+		}
+		desc, readErr := os.ReadFile(descPath)
+		if readErr != nil || !strings.Contains(string(desc), "attached_formula: mol-anything") {
+			t.Fatalf("formula metadata was not durable before session start: %q err=%v", desc, readErr)
+		}
+		return "", startErr
+	}
+
+	if err := runSlingFormula(context.Background(), []string{"mol-anything", "gastown"}); !errors.Is(err, startErr) {
+		t.Fatalf("error=%v, want formula startup failure", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "open" {
+		t.Fatalf("status=%q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "" {
+		t.Fatalf("assignee=%q", got)
+	}
+	if desc, _ := os.ReadFile(descPath); string(desc) != "Keep this body." {
+		t.Fatalf("workflow=%q", desc)
+	}
+}
+
+func TestRunSlingRawMetadataFailureCleansSpawnInsideLifecycleFence(t *testing.T) {
+	setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldSpawn, oldAssign, oldCleanup := resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent, cleanupSpawnedPolecatWhileAssignmentFencedFn
+	oldRaw, oldNoMerge, oldConvoy, oldBoot := slingHookRawBead, slingNoMerge, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent, cleanupSpawnedPolecatWhileAssignmentFencedFn = oldResolve, oldSpawn, oldAssign, oldCleanup
+		slingHookRawBead, slingNoMerge, slingNoConvoy, slingNoBoot = oldRaw, oldNoMerge, oldConvoy, oldBoot
+	})
+	slingHookRawBead, slingNoMerge, slingNoConvoy, slingNoBoot = true, true, true, true
+	t.Setenv("BD_FAIL_DESCRIPTION_UPDATE", "1")
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawned := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Incarnation: "gen-1"}
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) { return spawned, nil }
+	inFence := false
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error {
+		inFence = true
+		defer func() { inFence = false }()
+		return assign()
+	}
+	cleanupCalls := 0
+	cleanupSpawnedPolecatWhileAssignmentFencedFn = func(got *SpawnedPolecatInfo, rigName, convoyID string) {
+		cleanupCalls++
+		if !inFence || got != spawned || rigName != "gastown" || convoyID != "" {
+			t.Fatalf("caller-locked cleanup args=(%+v,%q,%q) inFence=%v", got, rigName, convoyID, inFence)
+		}
+	}
+
+	err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"})
+	if err == nil || !strings.Contains(err.Error(), "storing raw sling metadata") {
+		t.Fatalf("error=%v", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("caller-locked cleanup calls=%d, want 1", cleanupCalls)
+	}
+}
+
+func TestRunSlingCleansSpawnWhenWorkflowReceiptFails(t *testing.T) {
+	setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldResolve, oldSpawn, oldAssign, oldCapture, oldRollback :=
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent,
+		captureSlingWorkflowReceiptFn, rollbackSlingArtifactsFn
+	oldRaw, oldConvoy, oldBoot := slingHookRawBead, slingNoConvoy, slingNoBoot
+	t.Cleanup(func() {
+		resolveTargetAgentFn, spawnPolecatForSling, assignPolecatWorkIfCurrent,
+			captureSlingWorkflowReceiptFn, rollbackSlingArtifactsFn =
+			oldResolve, oldSpawn, oldAssign, oldCapture, oldRollback
+		slingHookRawBead, slingNoConvoy, slingNoBoot = oldRaw, oldConvoy, oldBoot
+	})
+	slingHookRawBead, slingNoConvoy, slingNoBoot = true, true, true
+	resolveTargetAgentFn = func(string) (string, string, string, error) { return "", "", "", errors.New("simulated dead target") }
+	spawned := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Incarnation: "gen-1"}
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) { return spawned, nil }
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	receiptErr := errors.New("forced workflow receipt failure")
+	captureSlingWorkflowReceiptFn = func(string) (*slingAssignmentReceipt, error) { return nil, receiptErr }
+	cleanupCalls := 0
+	rollbackSlingArtifactsFn = func(got *SpawnedPolecatInfo, beadID, _ string, _ string) {
+		cleanupCalls++
+		if got != spawned || beadID != "gt-rawrollback" {
+			t.Fatalf("rollback = (%+v, %q)", got, beadID)
+		}
+	}
+	if err := runSling(nil, []string{"gt-rawrollback", "gastown/polecats/toast"}); !errors.Is(err, receiptErr) {
+		t.Fatalf("error=%v, want receipt failure", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("spawn cleanup calls=%d, want 1", cleanupCalls)
+	}
+}
+
+func TestExecuteSlingCleansSpawnWhenLifecycleFenceRejectsBeforeCallback(t *testing.T) {
+	townRoot, rigPath, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldSpawn, oldAssign, oldCleanup := spawnPolecatForSling, assignPolecatWorkIfCurrent, cleanupSpawnedPolecatFn
+	t.Cleanup(func() {
+		spawnPolecatForSling, assignPolecatWorkIfCurrent, cleanupSpawnedPolecatFn = oldSpawn, oldAssign, oldCleanup
+	})
+	spawned := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Incarnation: "gen-1"}
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) { return spawned, nil }
+	fenceErr := errors.New("forced generation rejection")
+	assignPolecatWorkIfCurrent = func(_, _, _ string, _ func() error) error { return fenceErr }
+	cleanupCalls := 0
+	cleanupSpawnedPolecatFn = func(got *SpawnedPolecatInfo, rigName, convoyID string) {
+		cleanupCalls++
+		if got != spawned || rigName != "gastown" || convoyID != "" {
+			t.Fatalf("cleanup args=(%+v,%q,%q)", got, rigName, convoyID)
+		}
+	}
+
+	_, err := executeSling(SlingParams{BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot, BeadsDir: filepath.Join(rigPath, ".beads"), NoConvoy: true, NoBoot: true})
+	if !errors.Is(err, fenceErr) {
+		t.Fatalf("error=%v, want generation rejection", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("spawn cleanup calls=%d, want 1", cleanupCalls)
+	}
+}
+
+func TestRunSlingFormulaPreservesWorkflowDriftOnStartupFailure(t *testing.T) {
+	stubFormulaWispCreationInventory(t, "gt-rawrollback")
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+	oldAdmission, oldSpawn, oldFind, oldHook, oldAssign, oldStart, oldCleanup, oldDryRun, oldNoBoot :=
+		acquirePolecatAdmissionFn, spawnPolecatForSling, findHookedFormulaSingletonFn,
+		hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn, cleanupSpawnedPolecatFn, slingDryRun, slingNoBoot
+	t.Cleanup(func() {
+		acquirePolecatAdmissionFn, spawnPolecatForSling, findHookedFormulaSingletonFn,
+			hookBeadWithRetryAssignmentFn, assignPolecatWorkIfCurrent, startSpawnedPolecatSessionFn, cleanupSpawnedPolecatFn, slingDryRun, slingNoBoot =
+			oldAdmission, oldSpawn, oldFind, oldHook, oldAssign, oldStart, oldCleanup, oldDryRun, oldNoBoot
+	})
+	slingDryRun, slingNoBoot = false, true
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
+	acquirePolecatAdmissionFn = func(_, _, _, _ string) (*polecatAdmissionHandle, polecatCapacitySnapshot, error) {
+		return &polecatAdmissionHandle{disabled: true}, polecatCapacitySnapshot{}, nil
+	}
+	findHookedFormulaSingletonFn = func(_, _, _ string) (*beads.Issue, error) { return nil, nil }
+	spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", ClonePath: rigPath, Incarnation: "gen-1"}, nil
+	}
+	replacement := "attached_molecule: gt-replacement\nattached_formula: mol-replacement\nKeep replacement body."
+	hookBeadWithRetryAssignmentFn = func(_, target, _, _ string) error {
+		_ = os.WriteFile(filepath.Join(townRoot, "status.txt"), []byte("hooked"), 0o644)
+		_ = os.WriteFile(filepath.Join(townRoot, "assignee.txt"), []byte(target), 0o644)
+		return os.WriteFile(descPath, []byte(replacement), 0o644)
+	}
+	startErr := errors.New("forced formula startup failure")
+	startSpawnedPolecatSessionFn = func(*SpawnedPolecatInfo, bool) (string, error) { return "", startErr }
+	cleanupCalls := 0
+	cleanupSpawnedPolecatFn = func(*SpawnedPolecatInfo, string, string) { cleanupCalls++ }
+	if err := runSlingFormula(context.Background(), []string{"mol-anything", "gastown"}); !errors.Is(err, startErr) {
+		t.Fatalf("error=%v, want formula startup failure", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "status.txt")); string(got) != "hooked" {
+		t.Fatalf("status=%q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(townRoot, "assignee.txt")); string(got) != "gastown/polecats/toast" {
+		t.Fatalf("assignee=%q", got)
+	}
+	if desc, _ := os.ReadFile(descPath); !strings.Contains(string(desc), "attached_molecule: gt-replacement") || !strings.Contains(string(desc), "Keep replacement body.") {
+		t.Fatalf("workflow=%q", desc)
+	}
+	if cleanupCalls != 0 {
+		t.Fatalf("destructive polecat cleanup called %d times", cleanupCalls)
+	}
+}
+
+func TestExecuteSlingCleansExactPartialSpawnAfterBranchReceiptFailure(t *testing.T) {
+	for _, kind := range []string{"reused", "spawned"} {
+		t.Run(kind, func(t *testing.T) {
+			townRoot, rigPath, _ := setupMutableBDRawSlingTest(t, "Keep this body.")
+			partial := &SpawnedPolecatInfo{
+				RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(rigPath, "polecats", "toast"),
+				Branch: "polecat/toast/work", Incarnation: kind + "-generation",
+			}
+			prevSpawn, prevCleanup := spawnPolecatForSling, cleanupSpawnedPolecatFn
+			t.Cleanup(func() {
+				spawnPolecatForSling, cleanupSpawnedPolecatFn = prevSpawn, prevCleanup
+			})
+			spawnPolecatForSling = func(string, SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+				return partial, errors.New("injected rev failure")
+			}
+			cleaned := false
+			cleanupSpawnedPolecatFn = func(got *SpawnedPolecatInfo, rigName, convoyID string) {
+				cleaned = true
+				if got != partial || got.Incarnation != kind+"-generation" || rigName != "gastown" || convoyID != "" {
+					t.Fatalf("cleanup receipt = %+v rig=%q convoy=%q", got, rigName, convoyID)
+				}
+			}
+
+			result, err := executeSling(SlingParams{
+				BeadID: "gt-rawrollback", RigName: "gastown", TownRoot: townRoot,
+				BeadsDir: filepath.Join(rigPath, ".beads"), NoConvoy: true, NoBoot: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), "injected rev failure") {
+				t.Fatalf("executeSling error = %v", err)
+			}
+			if result == nil || result.ErrMsg != "injected rev failure" || !cleaned {
+				t.Fatalf("result=%+v cleaned=%v", result, cleaned)
+			}
+		})
+	}
 }
 
 func TestSlingFormulaRollsBackSpawnedPolecatOnWispFailure(t *testing.T) {
@@ -2072,11 +3853,13 @@ exit /b 0
 	prevDryRun := slingDryRun
 	prevSpawn := spawnPolecatForSling
 	prevRollback := rollbackSlingArtifactsFn
+	prevAssign := assignPolecatWorkIfCurrent
 	t.Cleanup(func() {
 		slingNoBoot = prevNoBoot
 		slingDryRun = prevDryRun
 		spawnPolecatForSling = prevSpawn
 		rollbackSlingArtifactsFn = prevRollback
+		assignPolecatWorkIfCurrent = prevAssign
 	})
 
 	slingDryRun = false
@@ -2093,6 +3876,7 @@ exit /b 0
 			ClonePath:   fakeWorkDir,
 		}, nil
 	}
+	assignPolecatWorkIfCurrent = func(_, _, _ string, assign func() error) error { return assign() }
 
 	rollbackCalled := false
 	rollbackSlingArtifactsFn = func(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, convoyID string) {
@@ -2118,6 +3902,7 @@ exit /b 0
 }
 
 func TestRunSlingFormulaPersistsVarContext(t *testing.T) {
+	stubFormulaWispCreationInventory(t, "gt-wisp-xyz")
 	townRoot := t.TempDir()
 
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
@@ -2139,6 +3924,9 @@ echo "$PWD|$*" >> "${BD_LOG}"
 cmd="$1"
 shift || true
 case "$cmd" in
+  show)
+    echo '[{"id":"gt-wisp-xyz","title":"formula wisp","status":"open","assignee":"","description":""}]'
+    ;;
   formula)
     echo '{"name":"mol-anything"}'
     ;;
@@ -2164,6 +3952,10 @@ set "cmd=%1"
 set "sub=%2"
 if "%cmd%"=="formula" (
   echo {"name":"mol-anything"}
+  exit /b 0
+)
+if "%cmd%"=="show" (
+  echo [{"id":"gt-wisp-xyz","title":"formula wisp","status":"open","assignee":"","description":""}]
   exit /b 0
 )
 if "%cmd%"=="cook" exit /b 0
@@ -2403,6 +4195,7 @@ exit /b 0
 // gt sling <formula> --on <bead>, both --var feature=<title> and --var issue=<beadID>
 // are passed to the canonical bd mol bond command.
 func TestSlingFormulaOnBeadPassesFeatureAndIssueVars(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-xyz")
 	townRoot := t.TempDir()
 
 	// Minimal workspace marker so workspace.FindFromCwd() succeeds.
@@ -2897,6 +4690,7 @@ func TestLooksLikeBeadID(t *testing.T) {
 // but doesn't record attached_molecule in the description. This causes
 // gt hook to report "No molecule attached".
 func TestSlingFormulaOnBeadSetsAttachedMolecule(t *testing.T) {
+	stubFormulaBondCustody(t, "gt-wisp-xyz")
 	townRoot := t.TempDir()
 
 	// Minimal workspace marker so workspace.FindFromCwd() succeeds.

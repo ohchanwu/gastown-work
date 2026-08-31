@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	gitpkg "github.com/steveyegge/gastown/internal/git"
 )
 
 func writeRollbackCleanupBDStub(t *testing.T, binDir, unixScript, windowsScript string) {
@@ -183,6 +185,127 @@ exit 0
 
 	// If we get here, the empty branch check works
 	t.Logf("cleanupSpawnedPolecat with empty Branch completed without panic")
+}
+
+func TestCleanupSpawnedPolecatPreservesKnownBranchWithoutOIDReceipt(t *testing.T) {
+	townRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	mayorRig := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(mayorRig, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigs := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{
+		"gastown": {GitURL: "git@github.com:test/gastown.git", AddedAt: time.Now().Truncate(time.Second)},
+	}}
+	if err := config.SaveRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"), rigs); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mayorRig, "init", "-b", "main")
+	runGit(t, mayorRig, "config", "user.email", "test@example.com")
+	runGit(t, mayorRig, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(mayorRig, "README.md"), []byte("base\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mayorRig, "add", "README.md")
+	runGit(t, mayorRig, "commit", "-m", "base")
+	runGit(t, mayorRig, "branch", "polecat/toast/work")
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeRollbackCleanupBDStub(t, binDir, "#!/bin/sh\nprintf '[]\\n'\n", "@echo off\r\necho []\r\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "mayor")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatal(err)
+	}
+	cleanupSpawnedPolecat(&SpawnedPolecatInfo{
+		RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "gastown", "polecats", "toast"),
+		Branch: "polecat/toast/work", Incarnation: "partial-generation",
+	}, "gastown", "")
+	if _, err := gitpkg.NewGit(mayorRig).Rev("polecat/toast/work"); err != nil {
+		t.Fatalf("branch without exact OID receipt was deleted: %v", err)
+	}
+}
+
+func TestCleanupSpawnedPolecatPreservesSameNameReplacementAfterIncarnationMismatch(t *testing.T) {
+	townRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	mayorRig := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(mayorRig, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigs := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{
+		"gastown": {GitURL: "git@github.com:test/gastown.git", AddedAt: time.Now().Truncate(time.Second)},
+	}}
+	if err := config.SaveRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"), rigs); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mayorRig, "init", "-b", "main")
+	runGit(t, mayorRig, "config", "user.email", "test@example.com")
+	runGit(t, mayorRig, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(mayorRig, "README.md"), []byte("replacement\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mayorRig, "add", "README.md")
+	runGit(t, mayorRig, "commit", "-m", "replacement")
+	const branch = "polecat/toast/work"
+	runGit(t, mayorRig, "branch", branch)
+	branchOID, err := gitpkg.NewGit(mayorRig).Rev(branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	bdScript := `#!/bin/sh
+case " $* " in
+  *" show gt-gastown-polecat-toast "*)
+    printf '%s\n' '[{"id":"gt-gastown-polecat-toast","title":"replacement","status":"open","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: working\nincarnation: replacement-generation\nhook_bead: null\ncleanup_status: clean"}]'
+    ;;
+  *" list "*) printf '[]\n' ;;
+  *) exit 0 ;;
+esac
+`
+	writeRollbackCleanupBDStub(t, binDir, bdScript, "@echo off\r\necho []\r\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "mayor")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatal(err)
+	}
+	cleanupSpawnedPolecat(&SpawnedPolecatInfo{
+		RigName: "gastown", PolecatName: "toast", ClonePath: filepath.Join(townRoot, "gastown", "polecats", "toast"),
+		Branch: branch, BranchOID: branchOID, Incarnation: "old-generation",
+	}, "gastown", "")
+	if _, err := gitpkg.NewGit(mayorRig).Rev(branch); err != nil {
+		t.Fatalf("same-name replacement branch was deleted: %v", err)
+	}
+	_, fields, err := beads.New(mayorRig).GetAgentBead("gt-gastown-polecat-toast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fields.Incarnation != "replacement-generation" {
+		t.Fatalf("replacement incarnation = %q", fields.Incarnation)
+	}
 }
 
 // TestCleanupSpawnedPolecat_WithNilSpawnInfo handles nil spawnInfo gracefully.

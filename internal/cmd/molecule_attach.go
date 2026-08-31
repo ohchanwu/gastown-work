@@ -96,13 +96,32 @@ func runMoleculeDetach(cmd *cobra.Command, args []string) error {
 
 	b := beads.New(workDir)
 
-	// Check current attachment first
-	attachment, err := b.GetAttachment(pinnedBeadID)
+	pending, err := b.PendingDetachAttempt(pinnedBeadID, "detach")
+	if err != nil {
+		return err
+	}
+	if pending != nil {
+		expectedMolecule := pending.DetachedMolecule
+		if _, err := b.DetachMoleculeWithAudit(pinnedBeadID, beads.DetachOptions{
+			Operation: "detach", Agent: pending.DetachedBy, Reason: pending.Reason,
+			ExpectedMolecule: &expectedMolecule, ExpectedAssignee: &pending.PreviousAssignee,
+			ExpectedStatus: &pending.PreviousStatus, ExpectedDescription: &pending.PreviousDescription,
+			AttemptID: pending.AttemptID,
+		}); err != nil {
+			return fmt.Errorf("reconciling detach: %w", err)
+		}
+		fmt.Printf("%s Reconciled detach from %s\n", style.Bold.Render("✓"), pinnedBeadID)
+		return nil
+	}
+
+	// Check the full immutable snapshot first.
+	issue, err := b.Show(pinnedBeadID)
 	if err != nil {
 		return fmt.Errorf("checking attachment: %w", err)
 	}
+	attachment := beads.ParseAttachmentFields(issue)
 
-	if attachment == nil {
+	if attachment == nil || attachment.AttachedMolecule == "" {
 		fmt.Printf("%s No molecule attached to %s\n", style.Dim.Render("ℹ"), pinnedBeadID)
 		return nil
 	}
@@ -111,8 +130,12 @@ func runMoleculeDetach(cmd *cobra.Command, args []string) error {
 
 	// Detach the molecule with audit logging
 	_, err = b.DetachMoleculeWithAudit(pinnedBeadID, beads.DetachOptions{
-		Operation: "detach",
-		Agent:     detectCurrentAgent(),
+		Operation:           "detach",
+		Agent:               detectCurrentAgent(),
+		ExpectedMolecule:    &previousMolecule,
+		ExpectedAssignee:    &issue.Assignee,
+		ExpectedStatus:      &issue.Status,
+		ExpectedDescription: &issue.Description,
 	})
 	if err != nil {
 		return fmt.Errorf("detaching molecule: %w", err)

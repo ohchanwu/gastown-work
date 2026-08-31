@@ -473,15 +473,412 @@ func TestResetAgentBeadForReuseFencesBeforeDestructiveCallback(t *testing.T) {
 func TestAgentRetirementRecordRoundTrips(t *testing.T) {
 	fields := &AgentFields{RetirementPhase: AgentRetirementPhaseLocalRemoved}
 	applyAgentRetirementRecord(fields, AgentRetirementRecord{
-		Phase: AgentRetirementPhaseWorkUnassigned, WorkBead: "gt-work", Molecule: "gt-wisp",
-		ClonePath: "/tmp/polecat", Branch: "polecat/nux", GitHead: "abc123", GitState: `{"Head":"abc123"}`,
+		Version: AgentRetirementJournalVersion, Phase: AgentRetirementPhaseWorkUnassigned,
+		HookBead: "gt-work", LastSourceIssue: "gt-previous",
+		WorkReceipts: []AgentRetirementWorkReceipt{{WorkBead: "gt-previous"}, {WorkBead: "gt-work", Molecule: "gt-wisp"}},
+		ClonePath:    "/tmp/polecat", Branch: "polecat/nux", GitHead: "abc123", GitState: `{"WorktreePresent":true,"Head":"abc123"}`,
 		Targets: []string{"refs/heads/main", "refs/remotes/origin/main"},
 	})
 	got := ParseAgentFields(FormatAgentDescription("Polecat nux", fields)).RetirementRecord()
-	if got.Phase != AgentRetirementPhaseWorkUnassigned || got.WorkBead != "gt-work" || got.Molecule != "gt-wisp" ||
+	if got.Version != AgentRetirementJournalVersion || got.Phase != AgentRetirementPhaseWorkUnassigned ||
+		got.HookBead != "gt-work" || got.LastSourceIssue != "gt-previous" ||
+		!slices.Equal(got.WorkReceipts, []AgentRetirementWorkReceipt{{WorkBead: "gt-previous"}, {WorkBead: "gt-work", Molecule: "gt-wisp"}}) ||
 		got.ClonePath != "/tmp/polecat" || got.Branch != "polecat/nux" || got.GitHead != "abc123" ||
-		got.GitState != `{"Head":"abc123"}` || !slices.Equal(got.Targets, []string{"refs/heads/main", "refs/remotes/origin/main"}) {
+		got.GitState != `{"WorktreePresent":true,"Head":"abc123"}` || !slices.Equal(got.Targets, []string{"refs/heads/main", "refs/remotes/origin/main"}) {
 		t.Fatalf("retirement record = %+v", got)
+	}
+}
+
+func TestParsedRetirementRecordRejectsMalformedJSONFields(t *testing.T) {
+	base := "retirement_version: 1\nretirement_phase: fenced\nretirement_clone_path: /tmp/polecat\nretirement_git_state: {}\n"
+	for _, tt := range []struct {
+		name  string
+		field string
+	}{
+		{name: "work receipts", field: "retirement_work_receipts: not-json\n"},
+		{name: "targets", field: "retirement_targets: not-json\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			record := ParseAgentFields(base + tt.field).RetirementRecord()
+			if err := ValidateAgentRetirementRecord(record); err == nil {
+				t.Fatalf("malformed %s passed retirement validation: %+v", tt.name, record)
+			}
+		})
+	}
+}
+
+func TestValidateAgentRetirementRecordRejectsIncompleteReceipts(t *testing.T) {
+	valid := AgentRetirementRecord{
+		Version:  AgentRetirementJournalVersion,
+		Phase:    AgentRetirementPhaseFenced,
+		HookBead: "gt-work", LastSourceIssue: "gt-previous",
+		WorkReceipts: []AgentRetirementWorkReceipt{{WorkBead: "gt-previous"}, {WorkBead: "gt-work", Molecule: "gt-wisp"}},
+		ClonePath:    "/tmp/polecat", Branch: "polecat/nux", GitHead: "abc123", GitState: `{"WorktreePresent":true,"Head":"abc123"}`,
+		Targets: []string{"refs/heads/main"},
+	}
+	if err := ValidateAgentRetirementRecord(valid); err != nil {
+		t.Fatalf("valid record: %v", err)
+	}
+	branchless := valid
+	branchless.Branch, branchless.GitHead, branchless.Targets = "", "", nil
+	branchless.GitState = `{"WorktreePresent":false}`
+	if err := ValidateAgentRetirementRecord(branchless); err != nil {
+		t.Fatalf("valid branchless record with absent worktree: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*AgentRetirementRecord)
+	}{
+		{name: "missing version", edit: func(r *AgentRetirementRecord) { r.Version = "" }},
+		{name: "unsupported future version", edit: func(r *AgentRetirementRecord) { r.Version = "2" }},
+		{name: "unknown phase", edit: func(r *AgentRetirementRecord) { r.Phase = "future-phase" }},
+		{name: "relative clone", edit: func(r *AgentRetirementRecord) { r.ClonePath = "relative/polecat" }},
+		{name: "unclean absolute clone", edit: func(r *AgentRetirementRecord) { r.ClonePath = "/tmp/../tmp/polecat" }},
+		{name: "missing git state", edit: func(r *AgentRetirementRecord) { r.GitState = "" }},
+		{name: "non-authoritative work", edit: func(r *AgentRetirementRecord) { r.WorkReceipts[0].WorkBead = "gt-other" }},
+		{name: "missing last source receipt", edit: func(r *AgentRetirementRecord) { r.WorkReceipts = r.WorkReceipts[1:] }},
+		{name: "duplicate work receipt", edit: func(r *AgentRetirementRecord) { r.WorkReceipts[0] = r.WorkReceipts[1] }},
+		{name: "branch without head", edit: func(r *AgentRetirementRecord) { r.GitHead = "" }},
+		{name: "branch without targets", edit: func(r *AgentRetirementRecord) { r.Targets = nil }},
+		{name: "duplicate targets", edit: func(r *AgentRetirementRecord) { r.Targets = []string{"refs/heads/main", "refs/heads/main"} }},
+		{name: "empty Git custody", edit: func(r *AgentRetirementRecord) { r.GitState = `{}` }},
+		{name: "null worktree custody", edit: func(r *AgentRetirementRecord) { r.GitState = `{"WorktreePresent":null}` }},
+		{name: "string worktree custody", edit: func(r *AgentRetirementRecord) { r.GitState = `{"WorktreePresent":"true"}` }},
+		{name: "numeric worktree custody", edit: func(r *AgentRetirementRecord) { r.GitState = `{"WorktreePresent":1}` }},
+		{name: "self preservation target", edit: func(r *AgentRetirementRecord) { r.Targets = []string{"refs/heads/polecat/nux"} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := valid
+			record.Targets = append([]string(nil), valid.Targets...)
+			record.WorkReceipts = append([]AgentRetirementWorkReceipt(nil), valid.WorkReceipts...)
+			tt.edit(&record)
+			if err := ValidateAgentRetirementRecord(record); err == nil {
+				t.Fatalf("ValidateAgentRetirementRecord(%+v) succeeded", record)
+			}
+		})
+	}
+}
+
+func TestClearAgentActiveMRIfMatchesRejectsFrozenAgent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	for _, state := range []string{"completing", "retiring", "nuked"} {
+		t.Run(state, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			show := `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: ` + state + `\nactive_mr: gt-wisp-old"}]`
+			logPath := installMockBDShowRecorder(t, show)
+			cleared, err := NewIsolated(tmpDir).ClearAgentActiveMRIfMatches("gt-gastown-polecat-nux", "gt-wisp-old")
+			if err == nil || cleared {
+				t.Fatalf("frozen clear = %v, %v", cleared, err)
+			}
+			if log := readMockBDLog(t, logPath); strings.Contains(log, "update ") {
+				t.Fatalf("frozen agent mutated: %q", log)
+			}
+		})
+	}
+}
+
+func TestFinalizeAgentCompletionIfOwnerPreservesRecoveryMarkersOnFailedAtomicWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	showOutput := `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent","done-intent:COMPLETED:1","done-cp:pushed:branch:2"],"description":"role_type: polecat\nrig: gastown\nagent_state: completing\nincarnation: generation-1\ncompletion_attempt: attempt-1"}]`
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$MOCK_BD_LOG"
+while [ "$1" = "--allow-stale" ]; do shift; done
+case "$1" in
+version) exit 0 ;;
+show) printf '%s\n' "$MOCK_BD_SHOW_OUTPUT" ;;
+update) cat >> "$MOCK_BD_LOG"; echo 'injected atomic update failure' >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOCK_BD_LOG", logPath)
+	t.Setenv("MOCK_BD_SHOW_OUTPUT", showOutput)
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(ResetBdAllowStaleCacheForTest)
+
+	bd := NewIsolated(tmpDir)
+	err := bd.FinalizeAgentCompletionIfOwner("gt-gastown-polecat-nux", "generation-1", "attempt-1", AgentStateDone)
+	if err == nil {
+		t.Fatal("final completion suppressed atomic update failure")
+	}
+	log := readMockBDLog(t, logPath)
+	if updates := strings.Count(log, "update gt-gastown-polecat-nux"); updates != 1 {
+		t.Fatalf("final completion updates = %d, want one atomic write; log=%q", updates, log)
+	}
+	for _, want := range []string{
+		"--body-file=-",
+		"--remove-label=done-intent:COMPLETED:1",
+		"--remove-label=done-cp:pushed:branch:2",
+		"agent_state: done",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("atomic finalization log missing %q: %q", want, log)
+		}
+	}
+	issue, showErr := bd.Show("gt-gastown-polecat-nux")
+	if showErr != nil {
+		t.Fatal(showErr)
+	}
+	if fields := ParseAgentFields(issue.Description); fields.AgentState != string(AgentStateCompleting) {
+		t.Fatalf("agent state after failed finalization = %q", fields.AgentState)
+	}
+	if !HasLabel(issue, "done-intent:COMPLETED:1") || !HasLabel(issue, "done-cp:pushed:branch:2") {
+		t.Fatalf("recovery markers lost after failed finalization: %v", issue.Labels)
+	}
+}
+
+func TestNextAgentRetirementPhaseRejectsSkippedAndUnknownTransitions(t *testing.T) {
+	if err := ValidateAgentRetirementTransition(AgentRetirementPhaseFenced, AgentRetirementPhaseSessionStopped); err != nil {
+		t.Fatalf("exact successor: %v", err)
+	}
+	for _, transition := range [][2]string{
+		{AgentRetirementPhaseFenced, AgentRetirementPhaseLocalRemoved},
+		{AgentRetirementPhaseLocalRemoved, AgentRetirementPhaseFenced},
+		{"future-phase", AgentRetirementPhaseSessionStopped},
+		{AgentRetirementPhaseFenced, "future-phase"},
+	} {
+		if err := ValidateAgentRetirementTransition(transition[0], transition[1]); err == nil {
+			t.Fatalf("transition %q -> %q succeeded", transition[0], transition[1])
+		}
+	}
+}
+
+func TestCompareAndRestoreIssueStatusIfAssigneeRejectsMissingMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	showOutput := `[{"id":"gt-work","title":"work","issue_type":"task","status":"in_progress","assignee":"gastown/polecats/nux"}]`
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	if err := bd.CompareAndRestoreIssueStatusIfAssignee("gt-work", "in_progress", "gastown/polecats/nux", "hooked"); err == nil || !strings.Contains(err.Error(), "missing Dolt metadata") {
+		t.Fatalf("CompareAndRestoreIssueStatusIfAssignee: %v", err)
+	}
+	if log := readMockBDLog(t, logPath); strings.Contains(log, "update gt-work") {
+		t.Fatalf("missing metadata mutated issue: %q", log)
+	}
+}
+
+func TestCompareAndRestoreIssueStatusIfAssigneePreservesStatusDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	showOutput := `[{"id":"gt-work","title":"work","issue_type":"task","status":"blocked","assignee":"gastown/polecats/nux"}]`
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	err := bd.CompareAndRestoreIssueStatusIfAssignee("gt-work", "in_progress", "gastown/polecats/nux", "open")
+	if err == nil || !strings.Contains(err.Error(), "missing Dolt metadata") {
+		t.Fatalf("status drift error = %v, want missing metadata", err)
+	}
+	if log := readMockBDLog(t, logPath); strings.Contains(log, "update gt-work") {
+		t.Fatalf("status drift overwritten: %q", log)
+	}
+}
+
+func TestCompareAndRestoreIssueAssignmentIfMatchesRestoresExactReceipt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	showOutput := `[{"id":"gt-work","title":"work","issue_type":"task","status":"hooked","assignee":"gastown/polecats/nux"}]`
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	if err := bd.CompareAndRestoreIssueAssignmentIfMatches("gt-work", "hooked", "gastown/polecats/nux", "open", ""); err == nil || !strings.Contains(err.Error(), "missing Dolt metadata") {
+		t.Fatalf("CompareAndRestoreIssueAssignmentIfMatches: %v", err)
+	}
+	log := readMockBDLog(t, logPath)
+	if strings.Contains(log, "update gt-work") {
+		t.Fatalf("missing metadata mutated assignment: %q", log)
+	}
+}
+
+func TestRetireAgentGenerationRejectsMalformedResumeBeforeCleanup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: retiring\nincarnation: generation-1\nretirement_version: 2\nretirement_phase: fenced\nretirement_clone_path: /tmp/polecat\nretirement_git_state: {}"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	cleanupCalled := false
+	err := bd.RetireAgentGeneration(
+		"gt-gastown-polecat-nux",
+		AgentFieldExpectations{Incarnation: agentStringPointer("generation-1")},
+		AgentRetirementRecord{}, nil,
+		func(AgentRetirementRecord, func(string) error) error {
+			cleanupCalled = true
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "unsupported retirement journal version") {
+		t.Fatalf("error = %v", err)
+	}
+	if cleanupCalled {
+		t.Fatal("cleanup ran for malformed resumed journal")
+	}
+	if log := readMockBDLog(t, logPath); strings.Contains(log, "update gt-gastown-polecat-nux") {
+		t.Fatalf("malformed resume mutated agent: %q", log)
+	}
+}
+
+func TestClaimAgentCompletionTakesOverStaleAttemptUnderProcessLease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: completing\nincarnation: generation-1\ncompletion_attempt: crashed-attempt"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+
+	if err := bd.ClaimAgentCompletion("gt-gastown-polecat-nux", "generation-1", "recovery-attempt"); err != nil {
+		t.Fatalf("ClaimAgentCompletion takeover: %v", err)
+	}
+	log := readMockBDLog(t, logPath)
+	if !strings.Contains(log, "agent_state: completing") || !strings.Contains(log, "completion_attempt: recovery-attempt") {
+		t.Fatalf("takeover receipt not persisted: %q", log)
+	}
+}
+
+func TestOrdinaryAgentWritersRejectFrozenLifecycleStates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	for _, state := range []AgentState{AgentStateCompleting, AgentStateRetiring, AgentStateNuked} {
+		t.Run(string(state), func(t *testing.T) {
+			tmpDir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			description := fmt.Sprintf("role_type: polecat\nrig: gastown\nagent_state: %s\nincarnation: generation-1\ncompletion_attempt: attempt-1", state)
+			showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+			logPath := installMockBDShowRecorder(t, showOutput)
+			bd := NewIsolated(tmpDir)
+			mode := "ralph"
+			if err := bd.UpdateAgentDescriptionFields("gt-gastown-polecat-nux", AgentFieldUpdates{Mode: &mode}); !errors.Is(err, ErrAgentFieldsChanged) {
+				t.Fatalf("description writer error = %v, want ErrAgentFieldsChanged", err)
+			}
+			if err := bd.UpdateAgentIfIncarnation("gt-gastown-polecat-nux", "generation-1", UpdateOptions{AddLabels: []string{"ordinary"}}); !errors.Is(err, ErrAgentFieldsChanged) {
+				t.Fatalf("issue writer error = %v, want ErrAgentFieldsChanged", err)
+			}
+			if log := readMockBDLog(t, logPath); strings.Contains(log, "update gt-gastown-polecat-nux") {
+				t.Fatalf("frozen generation was mutated: %q", log)
+			}
+		})
+	}
+}
+
+func TestExactCompletionOwnerCanWriteCompletingGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	description := "role_type: polecat\nrig: gastown\nagent_state: completing\nincarnation: generation-1\ncompletion_attempt: attempt-1"
+	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
+	logPath := installMockBDShowRecorder(t, showOutput)
+	bd := NewIsolated(tmpDir)
+	mode := "ralph"
+	if err := bd.UpdateAgentDescriptionFieldsIfCompletionOwner(
+		"gt-gastown-polecat-nux", "generation-1", "attempt-1", AgentFieldUpdates{Mode: &mode},
+	); err != nil {
+		t.Fatalf("completion owner update: %v", err)
+	}
+	if log := readMockBDLog(t, logPath); !strings.Contains(log, "mode: ralph") {
+		t.Fatalf("completion owner write missing: %q", log)
+	}
+	if err := bd.UpdateAgentDescriptionFieldsIfCompletionOwner(
+		"gt-gastown-polecat-nux", "generation-1", "wrong-attempt", AgentFieldUpdates{Mode: &mode},
+	); !errors.Is(err, ErrAgentFieldsChanged) {
+		t.Fatalf("wrong completion owner error = %v, want ErrAgentFieldsChanged", err)
+	}
+}
+
+func TestCompletionOwnerActiveMRWriterPersistsAndRereads(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	descriptionPath := filepath.Join(stateDir, "description")
+	description := "role_type: polecat\nrig: gastown\nagent_state: completing\nincarnation: generation-1\ncompletion_attempt: attempt-1\nactive_mr: null\n"
+	if err := os.WriteFile(descriptionPath, []byte(description), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+while [ "$1" = "--allow-stale" ]; do shift; done
+case "$1" in
+version) exit 0 ;;
+show)
+  escaped=$(awk 'BEGIN { printf "\"" } { gsub(/\\/, "\\\\"); gsub(/\"/, "\\\""); if (NR > 1) printf "\\n"; printf "%s", $0 } END { print "\"" }' "$GT_TEST_AGENT_DESCRIPTION")
+  printf '[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%s}]\n' "$escaped"
+  ;;
+update)
+  for arg in "$@"; do
+    if [ "$arg" = "--body-file=-" ]; then cat > "$GT_TEST_AGENT_DESCRIPTION"; fi
+  done
+  ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_TEST_AGENT_DESCRIPTION", descriptionPath)
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(ResetBdAllowStaleCacheForTest)
+
+	bd := NewIsolated(tmpDir)
+	if err := bd.UpdateAgentActiveMRIfCompletionOwner("gt-gastown-polecat-nux", "generation-1", "attempt-1", "gt-mr-new"); err != nil {
+		t.Fatalf("completion-owner ActiveMR write: %v", err)
+	}
+	issue, err := bd.Show("gt-gastown-polecat-nux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := ParseAgentFields(issue.Description)
+	if fields.AgentState != string(AgentStateCompleting) || fields.CompletionAttempt != "attempt-1" || fields.ActiveMR != "gt-mr-new" {
+		t.Fatalf("persisted completion owner fields = %+v", fields)
 	}
 }
 
@@ -497,7 +894,7 @@ func TestClaimAgentCompletionFencesBeforeExternalWork(t *testing.T) {
 	showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, description)
 	logPath := installMockBDShowRecorder(t, showOutput)
 	bd := NewIsolated(tmpDir)
-	if err := bd.ClaimAgentCompletion("gt-gastown-polecat-nux", "generation-1"); err != nil {
+	if err := bd.ClaimAgentCompletion("gt-gastown-polecat-nux", "generation-1", "attempt-1"); err != nil {
 		t.Fatalf("ClaimAgentCompletion: %v", err)
 	}
 	if log := readMockBDLog(t, logPath); !strings.Contains(log, "agent_state: completing") {
@@ -542,8 +939,15 @@ func TestRetireAgentGenerationPersistsCursorBeforeFailure(t *testing.T) {
 	injected := errors.New("cleanup interrupted")
 	err := bd.RetireAgentGeneration(
 		"gt-gastown-polecat-nux", fields.LifecycleExpectations(),
-		AgentRetirementRecord{WorkBead: "gt-work"}, nil,
+		AgentRetirementRecord{
+			Version: AgentRetirementJournalVersion, HookBead: "gt-work",
+			WorkReceipts: []AgentRetirementWorkReceipt{{WorkBead: "gt-work"}},
+			ClonePath:    filepath.Clean(tmpDir), GitState: `{"WorktreePresent":true}`,
+		}, nil,
 		func(_ AgentRetirementRecord, advance func(string) error) error {
+			if err := advance(AgentRetirementPhaseSessionStopped); err != nil {
+				return err
+			}
 			if err := advance(AgentRetirementPhaseLocalRemoved); err != nil {
 				return err
 			}

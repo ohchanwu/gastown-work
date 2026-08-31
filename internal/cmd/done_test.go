@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -881,6 +882,37 @@ func TestDoneIntentLabelFormat(t *testing.T) {
 	}
 }
 
+func TestDoneDurableOwnerWritesReturnFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+while [ "$1" = "--allow-stale" ]; do shift; done
+case "$1" in
+version) echo 'bd mock' ;;
+show) echo '[{"id":"gt-agent","title":"agent","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nagent_state: working\nincarnation: generation"}]' ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+	bd := beads.NewIsolated(dir)
+	if err := setDoneIntentLabel(bd, "gt-agent", "generation", "attempt", ExitCompleted); err == nil {
+		t.Fatal("done intent suppressed completion-owner failure")
+	}
+	if err := writeDoneCheckpoint(bd, "gt-agent", "generation", "attempt", CheckpointPushed, "branch"); err == nil {
+		t.Fatal("done checkpoint suppressed completion-owner failure")
+	}
+}
+
 // TestShouldNudgeRefinery locks in the gh#3885 invariant: only COMPLETED
 // exits with a created MR bead may wake the refinery. DEFERRED/ESCALATED
 // exits — used by polecats finishing operational tasks with no code changes —
@@ -934,26 +966,38 @@ func TestShouldUpdateAgentStateOnDone(t *testing.T) {
 	}
 }
 
-func TestUpdateAgentStateAfterSubmissionSkipsFailedSubmissions(t *testing.T) {
+func TestUpdateAgentStateAfterSubmissionFailedSubmissions(t *testing.T) {
 	calls := 0
 	old := updateAgentStateOnDoneFn
-	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID, expectedIncarnation string) error {
+	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID, expectedIncarnation, completionAttempt string) error {
 		calls++
 		return nil
 	}
 	t.Cleanup(func() { updateAgentStateOnDoneFn = old })
 
-	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", true, false); err != nil {
-		t.Fatalf("updateAgentStateAfterSubmission push failure: %v", err)
-	}
-	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", false, true); err != nil {
-		t.Fatalf("updateAgentStateAfterSubmission mr failure: %v", err)
+	for _, tt := range []struct {
+		name       string
+		pushFailed bool
+		mrFailed   bool
+	}{
+		{name: "push failure", pushFailed: true},
+		{name: "MR failure", mrFailed: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", "attempt-1", tt.pushFailed, tt.mrFailed)
+			if err == nil || !strings.Contains(err.Error(), "completion attempt") {
+				t.Fatalf("owned failed submission error = %v", err)
+			}
+		})
 	}
 	if calls != 0 {
 		t.Fatalf("state update calls after failed submissions = %d, want 0", calls)
 	}
+	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", "", true, false); err != nil {
+		t.Fatalf("legacy unowned push failure: %v", err)
+	}
 
-	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", false, false); err != nil {
+	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", "generation-1", "attempt-1", false, false); err != nil {
 		t.Fatalf("updateAgentStateAfterSubmission clean submission: %v", err)
 	}
 	if calls != 1 {
@@ -1809,6 +1853,73 @@ func TestCheckpointResumeSkipsPush(t *testing.T) {
 				t.Errorf("skipPush = %v, want %v", skipPush, tt.wantSkip)
 			}
 		})
+	}
+}
+
+func TestPushedCheckpointRequiresCurrentAndRemoteExactOID(t *testing.T) {
+	workDir, _, _ := setupRoutedSourceTestTown(t)
+	branch := setupRoutedSubmitGitRepo(t, workDir, true)
+	g := gitpkg.NewGit(workDir)
+	oidA, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := formatPushedCheckpointReceipt(branch, oidA)
+	if !pushedCheckpointStillValid(g, branch, receipt) {
+		t.Fatal("exact current and remote push receipt was not reusable")
+	}
+
+	writeMQSubmitTestFile(t, workDir, "file.txt", "generation B\n")
+	runGitForMQSubmitTest(t, workDir, "commit", "-am", "generation B")
+	oidB, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pushedCheckpointStillValid(g, branch, receipt) {
+		t.Fatalf("same branch checkpoint for OID A %s skipped push at current OID B %s", oidA, oidB)
+	}
+
+	runGitForMQSubmitTest(t, workDir, "push", "origin", branch)
+	runGitForMQSubmitTest(t, workDir, "reset", "--hard", oidA)
+	if pushedCheckpointStillValid(g, branch, receipt) {
+		t.Fatalf("checkpoint for OID A %s trusted remote branch advanced to OID B %s", oidA, oidB)
+	}
+}
+
+func TestCheckpointMRRequiresCurrentCommitSHA(t *testing.T) {
+	branch, oidA, oidB := "polecat/rictus/work", strings.Repeat("a", 40), strings.Repeat("b", 40)
+	checkpoint := &beads.Issue{Description: "branch: " + branch + "\ncommit_sha: " + oidA}
+	if !checkpointMRMatchesSubmission(checkpoint, branch, oidA) {
+		t.Fatal("exact branch and commit checkpoint was not reusable")
+	}
+	if checkpointMRMatchesSubmission(checkpoint, branch, oidB) {
+		t.Fatal("same-branch stale commit checkpoint was reused")
+	}
+	if checkpointMRMatchesSubmission(&beads.Issue{Description: "branch: " + branch}, branch, oidA) {
+		t.Fatal("checkpoint without commit receipt was reused")
+	}
+}
+
+func TestPersistCompletionActiveMRRetriesFailOnce(t *testing.T) {
+	calls := 0
+	write := func(agentID, incarnation, attempt, mrID string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("injected active_mr failure")
+		}
+		if agentID != "gt-agent" || incarnation != "generation" || attempt != "attempt" || mrID != "gt-mr" {
+			t.Fatalf("unexpected owner receipt: %q %q %q %q", agentID, incarnation, attempt, mrID)
+		}
+		return nil
+	}
+	if err := persistCompletionActiveMR("gt-agent", "generation", "attempt", "gt-mr", write); err == nil {
+		t.Fatal("first active_mr persistence unexpectedly succeeded")
+	}
+	if err := persistCompletionActiveMR("gt-agent", "generation", "attempt", "gt-mr", write); err != nil {
+		t.Fatalf("retry active_mr persistence: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("active_mr writes = %d, want 2", calls)
 	}
 }
 

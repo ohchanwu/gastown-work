@@ -63,7 +63,10 @@ func mailStoreCtx() (context.Context, context.CancelFunc) {
 func (m *Mailbox) storeListFromDir(includeClosedWork bool) ([]*Message, error) {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
+	return m.storeListFromDirContext(ctx, includeClosedWork)
+}
 
+func (m *Mailbox) storeListFromDirContext(ctx context.Context, includeClosedWork bool) ([]*Message, error) {
 	identities := m.identityVariants()
 
 	seen := make(map[string]bool)
@@ -170,7 +173,10 @@ func (m *Mailbox) storeCloseInDir(id string) error {
 func (m *Mailbox) storeMarkReadOnly(id string) error {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
+	return m.storeMarkReadOnlyContext(ctx, id)
+}
 
+func (m *Mailbox) storeMarkReadOnlyContext(ctx context.Context, id string) error {
 	err := m.store.AddLabel(ctx, id, "read", "")
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {

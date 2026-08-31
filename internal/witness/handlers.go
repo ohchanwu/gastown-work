@@ -382,6 +382,22 @@ func isStalePolecatDone(workDir, rigName, polecatName string, msg *mail.Message)
 // Similar to POLECAT_DONE but triggered by daemon rather than polecat.
 // Persistent polecat model (gt-4ac): sandbox preserved, polecat goes idle.
 func HandleLifecycleShutdown(workDir, rigName string, msg *mail.Message) *HandlerResult {
+	return handleLifecycleShutdown(context.Background(), workDir, rigName, msg, false)
+}
+
+// HandleLifecycleShutdownBrokered is the destructive lifecycle entrypoint. It
+// is called only by the trusted parent-side session broker executor.
+func HandleLifecycleShutdownBrokered(workDir, rigName string, msg *mail.Message) *HandlerResult {
+	return HandleLifecycleShutdownBrokeredContext(context.Background(), workDir, rigName, msg)
+}
+
+// HandleLifecycleShutdownBrokeredContext is the cancellation-aware destructive
+// lifecycle entrypoint used by the trusted parent-side broker.
+func HandleLifecycleShutdownBrokeredContext(ctx context.Context, workDir, rigName string, msg *mail.Message) *HandlerResult {
+	return handleLifecycleShutdown(ctx, workDir, rigName, msg, true)
+}
+
+func handleLifecycleShutdown(ctx context.Context, workDir, rigName string, msg *mail.Message, brokered bool) *HandlerResult {
 	result := &HandlerResult{
 		MessageID:    msg.ID,
 		ProtocolType: ProtoLifecycleShutdown,
@@ -390,10 +406,126 @@ func HandleLifecycleShutdown(workDir, rigName string, msg *mail.Message) *Handle
 	// Extract polecat name from subject
 	matches := PatternLifecycleShutdown.FindStringSubmatch(msg.Subject)
 	if len(matches) < 2 {
-		result.Error = fmt.Errorf("invalid LIFECYCLE:Shutdown subject: %s", msg.Subject)
+		result.Error = fmt.Errorf("%w: invalid LIFECYCLE:Shutdown subject: %s", ErrLifecycleRequestRejected, msg.Subject)
 		return result
 	}
 	polecatName := matches[1]
+	if protocolBodyValue(msg.Body, "Reason") == "work_reassigned" {
+		attemptID := protocolBodyValue(msg.Body, "AttemptID")
+		if !validLifecycleRetirementAttemptID(attemptID) {
+			result.Error = fmt.Errorf("%w: lifecycle retirement request has an invalid attempt ID", ErrLifecycleRequestRejected)
+			return result
+		}
+		townRoot, err := workspace.Find(workDir)
+		if err != nil {
+			result.Error = fmt.Errorf("resolving town root for lifecycle retirement: %w", err)
+			return result
+		}
+		if townRoot == "" {
+			result.Error = fmt.Errorf("resolving town root for lifecycle retirement: no Gas Town workspace found")
+			return result
+		}
+		intent, err := LoadLifecycleRetirementIntent(townRoot, attemptID)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				result.Error = fmt.Errorf("%w: %v", ErrLifecycleRequestRejected, err)
+			} else {
+				result.Error = err
+			}
+			return result
+		}
+		if err := ValidateLifecycleRetirementRequest(intent, rigName, polecatName, msg); err != nil {
+			result.Error = err
+			return result
+		}
+		if lifecycleRetirementPortableAuthorityRequiredFn() {
+			if err := ValidateLifecycleWitnessAuthority(ctx, rigName, intent.WitnessAuthority); err != nil {
+				result.Error = err
+				return result
+			}
+		}
+		if lifecycleReassignmentDatabaseConfigured(townRoot, intent) {
+			if err := validateLifecycleReassignmentDatabaseDelivery(townRoot, intent); err != nil {
+				result.Error = fmt.Errorf("%w: %v", ErrLifecycleRequestRejected, err)
+				return result
+			}
+		}
+		if !brokered {
+			result.Error = fmt.Errorf("lifecycle retirement requires a live session broker request")
+			return result
+		}
+		if err := ctx.Err(); err != nil {
+			result.Error = err
+			return result
+		}
+		receipt, err := LoadLifecycleRetirementReceipt(townRoot, intent)
+		if err != nil {
+			result.Error = err
+			return result
+		}
+		preparedNow := false
+		if receipt == nil {
+			receipt, err = prepareLifecycleRetirementReceipt(townRoot, intent, msg.ID, true)
+			if err != nil {
+				result.Error = fmt.Errorf("journaling pending lifecycle retirement: %w", err)
+				return result
+			}
+			preparedNow = true
+		}
+		applied := false
+		if !preparedNow {
+			applied, err = reassignmentShutdownAppliedFn(ctx, townRoot, rigName, polecatName, intent.OldIncarnation)
+			if err != nil {
+				result.Error = err
+				return result
+			}
+		}
+		if !applied {
+			if err := applyReassignmentShutdownFn(ctx, workDir, rigName, polecatName, intent.BeadID, intent.OldAssignee, intent.OldIncarnation, intent.NewAssignee, intent.NewIncarnation); err != nil {
+				result.Error = err
+				return result
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			result.Error = err
+			return result
+		}
+		if receipt.State != "applied" {
+			receipt, err = markLifecycleRetirementAppliedReceipt(townRoot, intent, msg.ID, true)
+			if err != nil {
+				result.Error = fmt.Errorf("journaling applied lifecycle retirement: %w", err)
+				return result
+			}
+		}
+		if lifecycleReassignmentDatabaseConfigured(townRoot, intent) {
+			if err := markLifecycleReassignmentDatabaseApplied(townRoot, intent); err != nil {
+				result.Error = fmt.Errorf("recording applied reassignment custody: %w", err)
+				return result
+			}
+		}
+		ack := &mail.Message{
+			From: rigName + "/witness", To: msg.From,
+			Subject: "ACK " + msg.Subject,
+			Body:    LifecycleRetirementAcceptanceBody(intent, receipt),
+			Type:    mail.TypeReply, Priority: mail.PriorityHigh, ThreadID: msg.ThreadID, ReplyTo: msg.ID,
+		}
+		if err := ctx.Err(); err != nil {
+			result.Error = err
+			return result
+		}
+		if err := sendLifecycleRetirementAcceptanceFn(ctx, townRoot, ack); err != nil {
+			result.Error = fmt.Errorf("storing lifecycle acceptance: %w", err)
+			return result
+		}
+		result.Handled = true
+		result.MailSent = "submitted"
+		if intent.NewIncarnation != "" {
+			result.Action = fmt.Sprintf("polecat %s incarnation %s shutdown after replacement %s incarnation %s became viable — now idle, sandbox preserved", polecatName, intent.OldIncarnation, intent.NewAssignee, intent.NewIncarnation)
+		} else {
+			result.Action = fmt.Sprintf("polecat %s incarnation %s shutdown after replacement %s became viable — now idle, sandbox preserved", polecatName, intent.OldIncarnation, intent.NewAssignee)
+		}
+		return result
+	}
 
 	// Persistent model: polecat goes idle, sandbox preserved for reuse.
 	// If polecat has dirty state, that's fine — it stays idle until
@@ -402,6 +534,125 @@ func HandleLifecycleShutdown(workDir, rigName string, msg *mail.Message) *Handle
 	result.Action = fmt.Sprintf("polecat %s shutdown — now idle, sandbox preserved", polecatName)
 
 	return result
+}
+
+var applyReassignmentShutdownFn = applyReassignmentShutdownContext
+var reassignmentShutdownAppliedFn = reassignmentShutdownAppliedContext
+var sendLifecycleRetirementAcceptanceFn = func(ctx context.Context, townRoot string, msg *mail.Message) error {
+	return mail.NewRouter(townRoot).SendDirectContext(ctx, msg)
+}
+
+func applyReassignmentShutdown(workDir, rigName, polecatName, beadID, oldAssignee, oldIncarnation, newAssignee, newIncarnation string) error {
+	return applyReassignmentShutdownContext(context.Background(), workDir, rigName, polecatName, beadID, oldAssignee, oldIncarnation, newAssignee, newIncarnation)
+}
+
+func applyReassignmentShutdownContext(ctx context.Context, workDir, rigName, polecatName, beadID, oldAssignee, oldIncarnation, newAssignee, newIncarnation string) error {
+	townRoot, err := workspace.Find(workDir)
+	if err != nil {
+		return fmt.Errorf("resolving town root for reassignment shutdown: %w", err)
+	}
+	if townRoot == "" {
+		return fmt.Errorf("resolving town root for reassignment shutdown: no Gas Town workspace found")
+	}
+	bd := beads.New(townRoot)
+	work, err := bd.ShowContext(ctx, beadID)
+	if err != nil {
+		return fmt.Errorf("reading replacement work custody: %w", err)
+	}
+	if work.Assignee != newAssignee {
+		return fmt.Errorf("replacement custody for %s changed from %s to %s", beadID, newAssignee, work.Assignee)
+	}
+	oldPrefix := beads.GetPrefixForRig(townRoot, rigName)
+	if strings.Contains(newAssignee, "/polecats/") {
+		parts := strings.Split(newAssignee, "/")
+		if len(parts) != 3 || parts[0] == "" || parts[1] != "polecats" || parts[2] == "" {
+			return fmt.Errorf("replacement assignee %s is not a polecat address", newAssignee)
+		}
+		newPrefix := beads.GetPrefixForRig(townRoot, parts[0])
+		_, fields, err := bd.GetAgentBeadContext(ctx, beads.PolecatBeadIDWithPrefix(newPrefix, parts[0], parts[2]))
+		if err != nil {
+			return fmt.Errorf("reading replacement incarnation: %w", err)
+		}
+		if fields == nil {
+			return fmt.Errorf("replacement incarnation for %s is missing", newAssignee)
+		}
+		if fields.Incarnation != newIncarnation {
+			return fmt.Errorf("replacement incarnation for %s changed from %s to %s", newAssignee, newIncarnation, fields.Incarnation)
+		}
+	} else if newIncarnation != "" {
+		return fmt.Errorf("non-polecat replacement %s has unexpected incarnation", newAssignee)
+	}
+	if oldAssignee == newAssignee {
+		if oldIncarnation == newIncarnation {
+			return fmt.Errorf("same-name reassignment did not change incarnation")
+		}
+	}
+	oldID := beads.PolecatBeadIDWithPrefix(oldPrefix, rigName, polecatName)
+	if oldAssignee != newAssignee {
+		_, fields, err := bd.GetAgentBeadContext(ctx, oldID)
+		if err != nil {
+			return fmt.Errorf("reading retiring incarnation: %w", err)
+		}
+		if fields == nil || fields.Incarnation != oldIncarnation {
+			return fmt.Errorf("retiring incarnation for %s changed", oldAssignee)
+		}
+	}
+	r := &rig.Rig{Name: rigName, Path: filepath.Join(townRoot, rigName)}
+	commit := func(context.Context) error { return nil }
+	if oldAssignee != newAssignee {
+		idle := string(beads.AgentStateIdle)
+		commit = func(ctx context.Context) error {
+			return bd.UpdateAgentDescriptionFieldsIfIncarnationContext(ctx, oldID, oldIncarnation, beads.AgentFieldUpdates{AgentState: &idle})
+		}
+	}
+	if err := polecat.NewSessionManager(tmux.NewTmux(), r).RetireIfIncarnationContext(ctx, polecatName, oldIncarnation, commit); err != nil {
+		return fmt.Errorf("stopping retiring session generation: %w", err)
+	}
+	return nil
+}
+
+func reassignmentShutdownApplied(townRoot, rigName, polecatName, oldIncarnation string) (bool, error) {
+	return reassignmentShutdownAppliedContext(context.Background(), townRoot, rigName, polecatName, oldIncarnation)
+}
+
+func reassignmentShutdownAppliedContext(ctx context.Context, townRoot, rigName, polecatName, oldIncarnation string) (bool, error) {
+	oldPrefix := beads.GetPrefixForRig(townRoot, rigName)
+	oldID := beads.PolecatBeadIDWithPrefix(oldPrefix, rigName, polecatName)
+	bd := beads.New(townRoot)
+	r := &rig.Rig{Name: rigName, Path: filepath.Join(townRoot, rigName)}
+	return polecat.NewSessionManager(tmux.NewTmux(), r).RetirementAppliedContext(ctx, polecatName, oldIncarnation, func(ctx context.Context) (bool, error) {
+		_, fields, err := bd.GetAgentBeadContext(ctx, oldID)
+		if err != nil {
+			return false, fmt.Errorf("reconciling retiring generation: %w", err)
+		}
+		if fields == nil {
+			return false, fmt.Errorf("reconciling retiring generation: agent fields are missing")
+		}
+		return fields.Incarnation != oldIncarnation || fields.AgentState == string(beads.AgentStateIdle), nil
+	})
+}
+
+// LifecycleRetirementApplied independently verifies the terminal effect named
+// by an intent. Receipts and mail are coordination records, not authority.
+func LifecycleRetirementApplied(townRoot string, intent *LifecycleRetirementIntent) (bool, error) {
+	if err := validateLifecycleRetirementIntent(intent); err != nil {
+		return false, err
+	}
+	parts := strings.Split(intent.OldAssignee, "/")
+	if len(parts) != 3 || parts[0] == "" || parts[1] != "polecats" || parts[2] == "" {
+		return false, fmt.Errorf("retiring assignee %s is not an exact polecat address", intent.OldAssignee)
+	}
+	return reassignmentShutdownApplied(townRoot, parts[0], parts[2], intent.OldIncarnation)
+}
+
+func protocolBodyValue(body, key string) string {
+	prefix := key + ":"
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
 }
 
 // HandleHelp processes a HELP message from a polecat requesting intervention.

@@ -1,14 +1,20 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -103,6 +109,18 @@ Examples:
 	RunE: runWitnessAttach,
 }
 
+var witnessHandleLifecycleCmd = &cobra.Command{
+	Use:   "handle-lifecycle <rig> <message-id>",
+	Short: "Validate and accept one lifecycle shutdown request",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsCobra,
+		brokerSafeFlagsAnnotation: "",
+	},
+	Args: cobra.ExactArgs(2),
+	RunE: runWitnessHandleLifecycle,
+}
+
 var witnessRestartCmd = &cobra.Command{
 	Use:   "restart <rig>",
 	Short: "Restart the witness",
@@ -138,8 +156,182 @@ func init() {
 	witnessCmd.AddCommand(witnessRestartCmd)
 	witnessCmd.AddCommand(witnessStatusCmd)
 	witnessCmd.AddCommand(witnessAttachCmd)
+	witnessCmd.AddCommand(witnessHandleLifecycleCmd)
 
 	rootCmd.AddCommand(witnessCmd)
+}
+
+func runWitnessHandleLifecycle(_ *cobra.Command, args []string) error {
+	return fmt.Errorf("witness handle-lifecycle requires a live session broker request")
+}
+
+func executeWitnessHandleLifecycle(rigName, messageID string, output io.Writer) error {
+	return executeWitnessHandleLifecycleContext(context.Background(), rigName, messageID, output)
+}
+
+func executeWitnessHandleLifecycleContext(ctx context.Context, rigName, messageID string, output io.Writer) error {
+	_, r, err := getRig(rigName)
+	if err != nil {
+		return err
+	}
+	townRoot, err := workspace.Find(r.Path)
+	if err != nil {
+		return fmt.Errorf("finding town root for %s: %w", rigName, err)
+	}
+	if townRoot == "" {
+		return fmt.Errorf("finding town root for %s: no Gas Town workspace found", rigName)
+	}
+	mailbox := mail.NewMailboxFromAddress(rigName+"/witness", townRoot)
+	msg, err := mailbox.GetContext(ctx, messageID)
+	if err != nil {
+		return fmt.Errorf("reading lifecycle message: %w", err)
+	}
+	return executeWitnessLifecycleMessageContext(ctx, r.Path, rigName, mailbox, msg, output)
+}
+
+func executeWitnessLifecycleMessageContext(ctx context.Context, workDir, rigName string, mailbox *mail.Mailbox, msg *mail.Message, output io.Writer) error {
+	if witness.ClassifyMessage(msg.Subject) != witness.ProtoLifecycleShutdown {
+		return fmt.Errorf("message %s is not a lifecycle shutdown request", msg.ID)
+	}
+	result := witness.HandleLifecycleShutdownBrokeredContext(ctx, workDir, rigName, msg)
+	if result.Error != nil {
+		return result.Error
+	}
+	if !result.Handled {
+		return fmt.Errorf("lifecycle message %s was not handled", msg.ID)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := mailbox.MarkReadOnlyContext(ctx, msg.ID); err != nil {
+		return fmt.Errorf("marking lifecycle message read: %w", err)
+	}
+	msg.Read = true
+	if output != nil {
+		_, _ = fmt.Fprintln(output, result.Action)
+	}
+	return nil
+}
+
+func dispatchWitnessLifecycleMessagesContext(
+	ctx context.Context,
+	messages []*mail.Message,
+	quarantine func(context.Context, string) error,
+	execute func(context.Context, *mail.Message) error,
+) error {
+	for _, msg := range messages {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if msg == nil || msg.Read || witness.ClassifyMessage(msg.Subject) != witness.ProtoLifecycleShutdown || messageHasLabel(msg, mail.LifecycleRejectedLabel) {
+			continue
+		}
+		if err := execute(ctx, msg); err != nil {
+			if !errors.Is(err, witness.ErrLifecycleRequestRejected) {
+				return fmt.Errorf("executing lifecycle message %s: %w", msg.ID, err)
+			}
+			if quarantineErr := quarantine(ctx, msg.ID); quarantineErr != nil {
+				return fmt.Errorf("quarantining rejected lifecycle message %s: %w", msg.ID, quarantineErr)
+			}
+		}
+		msg.Read = true
+	}
+	return nil
+}
+
+func messageHasLabel(msg *mail.Message, label string) bool {
+	for _, candidate := range msg.Labels {
+		if candidate == label {
+			return true
+		}
+	}
+	return false
+}
+
+func dispatchPortableWitnessLifecycleMessagesContext(ctx context.Context, address string, mailbox *mail.Mailbox, messages []*mail.Message) error {
+	if runtime.GOOS == "linux" || os.Getenv("GT_ROLE") != "witness" {
+		return nil
+	}
+	rigName := strings.TrimSpace(os.Getenv("GT_RIG"))
+	if rigName == "" {
+		return errors.New("witness inbox dispatcher has no owned rig")
+	}
+	if mail.AddressToIdentity(address) != mail.AddressToIdentity(rigName+"/witness") {
+		return nil
+	}
+	_, r, err := getRig(rigName)
+	if err != nil {
+		return err
+	}
+	townRoot, err := workspace.Find(r.Path)
+	if err != nil {
+		return fmt.Errorf("finding town root for %s: %w", rigName, err)
+	}
+	if townRoot == "" {
+		return fmt.Errorf("finding town root for %s: no Gas Town workspace found", rigName)
+	}
+	expectedSession := session.WitnessSessionName(session.PrefixFor(rigName))
+	canonical := tmux.NewTmuxWithSocketAndEnv(session.TownSocketName(townRoot), []string{"PATH=" + os.Getenv("PATH")})
+	generation, err := canonical.CaptureSessionGeneration(expectedSession)
+	if err != nil || generation.Nonce != os.Getenv(tmux.EnvSessionGeneration) || strings.TrimPrefix(generation.PaneID, "%") != os.Getenv(tmux.EnvSessionPane) {
+		return nil
+	}
+	bound, err := tmux.NewTmuxForSessionGeneration(generation)
+	if err != nil {
+		return nil
+	}
+	paneID, panePID, currentSession, err := bound.ResolveCurrentPaneGeneration()
+	if err != nil || currentSession != expectedSession || paneID != generation.PaneID {
+		return nil
+	}
+	confirmed, err := bound.CaptureSessionGenerationContext(ctx, expectedSession)
+	if err != nil || !generation.Equal(confirmed) {
+		return nil
+	}
+	paneGeneration, err := bound.CapturePaneProcessGeneration(confirmed)
+	if err != nil || paneGeneration.PID != panePID {
+		return nil
+	}
+	return dispatchWitnessLifecycleMessagesContext(
+		ctx, messages,
+		mailbox.QuarantineLifecycleContext,
+		func(ctx context.Context, msg *mail.Message) error {
+			return executeWitnessLifecycleMessageContext(ctx, r.Path, rigName, mailbox, msg, io.Discard)
+		},
+	)
+}
+
+func dispatchWitnessLifecycleInboxContext(ctx context.Context) error {
+	if os.Getenv("GT_ROLE") != "witness" {
+		return nil
+	}
+	rigName := strings.TrimSpace(os.Getenv("GT_RIG"))
+	if rigName == "" {
+		return errors.New("witness inbox dispatcher has no owned rig")
+	}
+	_, r, err := getRig(rigName)
+	if err != nil {
+		return err
+	}
+	townRoot, err := workspace.Find(r.Path)
+	if err != nil {
+		return fmt.Errorf("finding town root for %s: %w", rigName, err)
+	}
+	if townRoot == "" {
+		return fmt.Errorf("finding town root for %s: no Gas Town workspace found", rigName)
+	}
+	mailbox := mail.NewMailboxFromAddress(rigName+"/witness", townRoot)
+	messages, err := mailbox.ListUnreadContext(ctx)
+	if err != nil {
+		return fmt.Errorf("listing lifecycle inbox: %w", err)
+	}
+	return dispatchWitnessLifecycleMessagesContext(
+		ctx, messages,
+		mailbox.QuarantineLifecycleContext,
+		func(ctx context.Context, msg *mail.Message) error {
+			return executeWitnessLifecycleMessageContext(ctx, r.Path, rigName, mailbox, msg, io.Discard)
+		},
+	)
 }
 
 // getWitnessManager creates a witness manager for a rig.

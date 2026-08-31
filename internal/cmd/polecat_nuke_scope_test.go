@@ -45,14 +45,17 @@ func TestPolecatNukeUsesOnlyLocalRemovalPrimitives(t *testing.T) {
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptions"); calls != 0 {
 		t.Fatalf("nukePolecatFullWithOptions called publishing RemoveWithOptions %d time(s), want 0", calls)
 	}
-	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnationJournaled"); calls != 1 {
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "removePolecatJournaled"); calls != 1 {
 		t.Fatalf("nukePolecatFullWithOptions incarnation-bound local-only removal calls = %d, want 1", calls)
 	}
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "resetPolecatAgentBeadForReuse"); calls != 0 {
 		t.Fatalf("nukePolecatFullWithOptions stale-name bead resets = %d, want 0", calls)
 	}
-	if !callNestedWithinCallArgument(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnationJournaled", "DeleteBranch") {
+	if !callNestedWithinCallArgument(t, file, "nukePolecatFullWithOptions", "removePolecatJournaled", "deletePreservedLocalPolecatBranch") {
 		t.Fatal("local branch deletion is not contained by the exact polecat lifecycle transaction")
+	}
+	if calls := callsTo(t, file, "deletePreservedLocalPolecatBranch", "DeleteBranchIfMatches"); calls != 1 {
+		t.Fatalf("expected-OID branch deletion calls = %d, want 1", calls)
 	}
 }
 

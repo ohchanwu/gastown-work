@@ -174,6 +174,12 @@ func townSocketName(townRoot string) string {
 	return base + "-" + suffix
 }
 
+// TownSocketName returns the deterministic socket name for a town root without
+// consulting caller-controlled tmux routing environment variables.
+func TownSocketName(townRoot string) string {
+	return townSocketName(townRoot)
+}
+
 // LegacySocketName returns the old-format socket name (basename only, no hash)
 // used before path-based socket derivation was added. Used by gt down to clean
 // up sessions orphaned on the old socket during migration.

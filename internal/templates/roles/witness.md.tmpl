@@ -220,7 +220,7 @@ Every mail = a Dolt commit in the permanent history. Nudges = zero storage cost.
 
 | Subject Contains | Meaning | What to Do |
 |------------------|---------|------------|
-| `LIFECYCLE:` | Shutdown request | Run pre-kill verification per mol step |
+| `LIFECYCLE:` | Shutdown request | Run `{{ cmd }} witness handle-lifecycle {{ .RigName }} <message-id>` |
 | `SPAWN:` | New polecat | Verify their hook is loaded |
 | `🤝 HANDOFF` | Context from predecessor | Load state, continue work |
 | `Blocked` / `Help` | Polecat needs help | Assess if resolvable or escalate |

@@ -30,7 +30,8 @@ func TestPolecatNukeBranchDeletionDoesNotPublishPreservedWork(t *testing.T) {
 	runGitCmd(t, repo, "switch", "main")
 
 	before := remoteRefSnapshot(t, remote)
-	if err := deletePreservedLocalPolecatBranch(git.NewGit(repo), "polecat/nitro", []string{"integration/test"}); err != nil {
+	expectedOID := gitOutput(t, repo, "rev-parse", "polecat/nitro")
+	if err := deletePreservedLocalPolecatBranch(git.NewGit(repo), "polecat/nitro", expectedOID, []string{"integration/test"}); err != nil {
 		t.Fatalf("deletePreservedLocalPolecatBranch: %v", err)
 	}
 	after := remoteRefSnapshot(t, remote)
@@ -55,7 +56,8 @@ func TestPolecatNukeBranchDeletionRefusesUnpreservedWork(t *testing.T) {
 	runGitCmd(t, repo, "switch", "main")
 
 	before := remoteRefSnapshot(t, remote)
-	err := deletePreservedLocalPolecatBranch(git.NewGit(repo), "polecat/nitro", []string{"integration/test"})
+	expectedOID := gitOutput(t, repo, "rev-parse", "polecat/nitro")
+	err := deletePreservedLocalPolecatBranch(git.NewGit(repo), "polecat/nitro", expectedOID, []string{"integration/test"})
 	if err == nil || !strings.Contains(err.Error(), "reconciliation") {
 		t.Fatalf("error = %v, want reconciliation guidance", err)
 	}
@@ -87,7 +89,8 @@ func TestPolecatNukeBranchDeletionRefusesAmbiguousRemoteEvidence(t *testing.T) {
 	runGitCmd(t, publisher, "push", "origin", "polecat/nitro")
 
 	before := remoteRefSnapshot(t, remote)
-	err := deletePreservedLocalPolecatBranch(git.NewGit(repo), "polecat/nitro", nil)
+	expectedOID := gitOutput(t, repo, "rev-parse", "polecat/nitro")
+	err := deletePreservedLocalPolecatBranch(git.NewGit(repo), "polecat/nitro", expectedOID, nil)
 	if err == nil || !strings.Contains(err.Error(), "could not be verified") {
 		t.Fatalf("error = %v, want ambiguous preservation refusal", err)
 	}

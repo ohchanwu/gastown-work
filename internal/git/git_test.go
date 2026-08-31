@@ -630,6 +630,65 @@ func TestRev(t *testing.T) {
 	}
 }
 
+func TestDeleteBranchIfMatchesRejectsChangedOID(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-b", "main")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "file.txt")
+	runGit(t, repo, "commit", "-m", "one")
+	g := NewGit(repo)
+	oldOID, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "branch", "retire-me", oldOID)
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "commit", "-am", "two")
+	newOID, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "update-ref", "refs/heads/retire-me", newOID, oldOID)
+
+	if err := g.DeleteBranchIfMatches("retire-me", oldOID); err == nil {
+		t.Fatal("DeleteBranchIfMatches deleted a ref that changed after verification")
+	}
+	got, err := g.Rev("retire-me")
+	if err != nil || got != newOID {
+		t.Fatalf("changed branch = %q, %v; want preserved %q", got, err, newOID)
+	}
+	if err := g.DeleteBranchIfMatches("retire-me", newOID); err != nil {
+		t.Fatalf("DeleteBranchIfMatches exact OID: %v", err)
+	}
+	if exists, err := g.BranchExists("retire-me"); err != nil || exists {
+		t.Fatalf("branch exists = %v, error = %v; want deleted", exists, err)
+	}
+}
+
+func TestDeleteBranchIfMatchesRejectsNonCanonicalExpectedOID(t *testing.T) {
+	repo := initTestRepo(t)
+	g := NewGit(repo)
+	head, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "branch", "retire-me", head)
+	for _, expected := range []string{"retire-me", head[:12], "not-a-hex-object-id"} {
+		if err := g.DeleteBranchIfMatches("retire-me", expected); err == nil {
+			t.Fatalf("DeleteBranchIfMatches accepted expected OID %q", expected)
+		}
+		if exists, err := g.BranchExists("retire-me"); err != nil || !exists {
+			t.Fatalf("branch after expected OID %q: exists=%v err=%v", expected, exists, err)
+		}
+	}
+}
+
 func TestFetchBranch(t *testing.T) {
 	// Create a "remote" repo
 	remoteDir := t.TempDir()

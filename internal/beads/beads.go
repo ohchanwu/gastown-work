@@ -2027,13 +2027,21 @@ func normalizeBugTitle(title string) string {
 
 // Update updates an existing issue.
 func (b *Beads) Update(id string, opts UpdateOptions) error {
+	return b.UpdateContext(context.Background(), id, opts)
+}
+
+// UpdateContext updates an issue and honors caller cancellation.
+func (b *Beads) UpdateContext(ctx context.Context, id string, opts UpdateOptions) error {
 	if !b.noRoute {
 		if target := b.forIssueID(id); target != b {
-			return target.Update(id, opts)
+			return target.UpdateContext(ctx, id, opts)
 		}
 	}
 
 	if b.store != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return b.storeUpdate(id, opts)
 	}
 
@@ -2074,7 +2082,7 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		}
 	}
 
-	_, err := b.runWithStdin(stdinData, args...)
+	_, err := b.runWithStdinContext(ctx, stdinData, args...)
 	return err
 }
 

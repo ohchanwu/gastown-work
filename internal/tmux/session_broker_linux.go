@@ -21,6 +21,7 @@ const (
 	linuxSessionBrokerFD             = int(linuxCustodyBrokerFD)
 	sessionBrokerDefaultDeadline     = 2 * time.Minute
 	sessionBrokerWorkerStopTimeout   = 2 * time.Second
+	sessionBrokerClientPollInterval  = 50 * time.Millisecond
 	sessionBrokerMaxWorkers          = 8
 	sessionBrokerDeniedExitCode      = 126
 	sessionBrokerBusyExitCode        = 75
@@ -209,6 +210,12 @@ func ServeSessionBroker(ctx context.Context, executable string, fd int, validate
 	return serveSessionBroker(ctx, executable, fd, validate, sessionBrokerMaxWorkers)
 }
 
+// ServeSessionBrokerWithExecutor additionally handles selected validated
+// commands inside the trusted broker process.
+func ServeSessionBrokerWithExecutor(ctx context.Context, executable string, fd int, validate SessionBrokerValidator, execute SessionBrokerExecutor) error {
+	return serveSessionBrokerWithExecutor(ctx, executable, fd, validate, execute, sessionBrokerMaxWorkers)
+}
+
 func serveSessionBrokerWithPinnedTmux(
 	ctx context.Context,
 	executable string,
@@ -217,8 +224,9 @@ func serveSessionBrokerWithPinnedTmux(
 	fd int,
 	validate SessionBrokerValidator,
 	detach SessionBrokerDetachPolicy,
+	execute SessionBrokerExecutor,
 ) error {
-	return serveSessionBrokerWithTools(ctx, executable, tmuxExecutable, controlCgroup, fd, validate, detach, sessionBrokerMaxWorkers)
+	return serveSessionBrokerWithTools(ctx, executable, tmuxExecutable, controlCgroup, fd, validate, detach, execute, sessionBrokerMaxWorkers)
 }
 
 func serveSessionBroker(
@@ -228,7 +236,18 @@ func serveSessionBroker(
 	validate SessionBrokerValidator,
 	maxWorkers int,
 ) error {
-	return serveSessionBrokerWithTools(ctx, executable, nil, nil, fd, validate, nil, maxWorkers)
+	return serveSessionBrokerWithExecutor(ctx, executable, fd, validate, nil, maxWorkers)
+}
+
+func serveSessionBrokerWithExecutor(
+	ctx context.Context,
+	executable string,
+	fd int,
+	validate SessionBrokerValidator,
+	execute SessionBrokerExecutor,
+	maxWorkers int,
+) error {
+	return serveSessionBrokerWithTools(ctx, executable, nil, nil, fd, validate, nil, execute, maxWorkers)
 }
 
 func serveSessionBrokerWithTools(
@@ -239,6 +258,7 @@ func serveSessionBrokerWithTools(
 	fd int,
 	validate SessionBrokerValidator,
 	detach SessionBrokerDetachPolicy,
+	execute SessionBrokerExecutor,
 	maxWorkers int,
 ) error {
 	defer unix.Close(fd)
@@ -293,7 +313,7 @@ func serveSessionBrokerWithTools(
 			go func() {
 				defer workerGroup.Done()
 				defer func() { <-workers }()
-				handleSessionBrokerRequest(ctx, pinnedExecutable, tmuxExecutable, controlCgroup, validate, detach, request, descriptors)
+				handleSessionBrokerRequest(ctx, pinnedExecutable, tmuxExecutable, controlCgroup, validate, detach, execute, request, descriptors)
 			}()
 		default:
 			rejectSessionBrokerRequest(descriptors, sessionBrokerBusyExitCode, "session broker is busy")
@@ -387,6 +407,7 @@ func handleSessionBrokerRequest(
 	controlCgroup *os.File,
 	validate SessionBrokerValidator,
 	detach SessionBrokerDetachPolicy,
+	execute SessionBrokerExecutor,
 	request sessionBrokerRequest,
 	descriptors []int,
 ) {
@@ -403,12 +424,29 @@ func handleSessionBrokerRequest(
 		return
 	}
 
+	detached := detach != nil && detach(request.Args)
 	requestParent := serverContext
-	if detach != nil && detach(request.Args) {
+	if detached {
 		requestParent = context.Background()
 	}
 	requestContext, cancel := context.WithTimeout(requestParent, time.Duration(request.DeadlineMS)*time.Millisecond)
 	defer cancel()
+	if !detached {
+		stopDisconnectMonitor := monitorSessionBrokerClientDisconnect(requestContext, descriptors[3], cancel)
+		defer stopDisconnectMonitor()
+	}
+	if execute != nil {
+		handled, executeErr := execute(requestContext, request.Args, stdin, stdout, stderr)
+		if handled {
+			exitCode := 0
+			if executeErr != nil {
+				exitCode = 1
+				_, _ = fmt.Fprintln(stderr, executeErr)
+			}
+			writeSessionBrokerCompletion(descriptors[3], exitCode)
+			return
+		}
+	}
 	command := exec.CommandContext(requestContext, "/proc/self/fd/3", request.Args...)
 	command.ExtraFiles = []*os.File{executable}
 	command.Stdin = &sessionBrokerQuotaReader{reader: stdin, remaining: sessionBrokerMaxStdinBytes}
@@ -437,6 +475,32 @@ func handleSessionBrokerRequest(
 		writeSessionBrokerError(descriptors[2], fmt.Errorf("worker failed: %w", err))
 	}
 	writeSessionBrokerCompletion(descriptors[3], exitCode)
+}
+
+func monitorSessionBrokerClientDisconnect(ctx context.Context, completionFD int, cancel context.CancelFunc) func() {
+	monitorContext, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pollFDs := []unix.PollFd{{Fd: int32(completionFD), Events: unix.POLLERR | unix.POLLHUP}}
+		for {
+			if monitorContext.Err() != nil {
+				return
+			}
+			count, err := unix.Poll(pollFDs, int(sessionBrokerClientPollInterval/time.Millisecond))
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			if err != nil || count > 0 && pollFDs[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+				cancel()
+				return
+			}
+		}
+	}()
+	return func() {
+		stop()
+		<-done
+	}
 }
 
 func sessionBrokerWorkerProcessAttributes(controlCgroup *os.File) *syscall.SysProcAttr {

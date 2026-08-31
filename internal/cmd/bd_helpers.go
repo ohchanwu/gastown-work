@@ -70,6 +70,16 @@ func (b *bdCmd) WithGTRoot(root string) *bdCmd {
 	return b
 }
 
+// WithActor pins the provenance recorded by bd for this mutation.
+func (b *bdCmd) WithActor(actor string) *bdCmd {
+	b.env = filterEnvKey(b.env, "BD_ACTOR")
+	b.env = filterEnvKey(b.env, "BEADS_ACTOR")
+	if actor != "" {
+		b.env = append(b.env, "BD_ACTOR="+actor, "BEADS_ACTOR="+actor)
+	}
+	return b
+}
+
 // WithBeadsDir sets BEADS_DIR explicitly in the environment.
 // This prevents inherited BEADS_DIR from the parent process from causing
 // bd to write to the wrong database. The dir should be the resolved

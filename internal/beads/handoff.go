@@ -222,8 +222,10 @@ func (b *Beads) lockBead(beadID string) (func(), error) {
 		return nil, fmt.Errorf("creating locks directory: %w", err)
 	}
 	lockPath := filepath.Join(locksDir, beadID+".flock")
-	return lock.FlockAcquire(lockPath)
+	return acquireBeadLock(lockPath)
 }
+
+var acquireBeadLock = lock.FlockAcquire
 
 // AttachMolecule attaches a molecule to a pinned bead by updating its description.
 // The moleculeID is the root issue ID of the molecule to attach.

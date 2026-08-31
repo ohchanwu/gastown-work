@@ -152,7 +152,7 @@ func buildSchedulerDispatchPlan(townRoot string, batchOverride int, cleanup bool
 
 // dispatchScheduledWork is the main dispatch loop for the capacity scheduler.
 // Called by both `gt scheduler run` and the daemon heartbeat.
-func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun bool) (int, error) {
+func dispatchScheduledWork(ctx context.Context, townRoot, actor string, batchOverride int, dryRun bool) (int, error) {
 	if dryRun {
 		dispatchPlan, err := buildSchedulerDispatchPlan(townRoot, batchOverride, false)
 		if err != nil {
@@ -217,7 +217,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 			return validatePendingBeadForDispatch(townRoot, b, true)
 		},
 		Execute: func(b capacity.PendingBead) error {
-			result, err := dispatchSingleBead(b, townRoot, actor)
+			result, err := dispatchSingleBead(ctx, b, townRoot, actor)
 			if err != nil {
 				return err
 			}
@@ -683,7 +683,7 @@ func readySlingContextsFromAssessments(assessments []scheduledContextAssessment)
 // dispatchSingleBead dispatches one scheduled bead via executeSling.
 // Context fields are already parsed (from PendingBead.Context).
 // Returns the SlingResult (including PolecatName) on success.
-func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResult, error) {
+func dispatchSingleBead(ctx context.Context, b capacity.PendingBead, townRoot, _ string) (*SlingResult, error) {
 	if b.Context == nil {
 		return nil, fmt.Errorf("missing sling context for %s", b.ID)
 	}
@@ -698,6 +698,7 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 		targetBeadsDir = resolved
 	}
 	params := SlingParams{
+		Context:          ctx,
 		BeadID:           dp.BeadID,
 		RigName:          dp.RigName,
 		FormulaName:      dp.FormulaName,

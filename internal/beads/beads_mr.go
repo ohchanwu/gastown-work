@@ -43,16 +43,11 @@ func (b *Beads) FindMRForBranchAndSHA(branch, commitSHA string) (*Issue, error) 
 		if !strings.HasPrefix(issue.Description, branchPrefix) {
 			continue
 		}
-		// Branch matches — check commit SHA.
-		// If the MR has no commit_sha field (legacy), fall back to branch-only
-		// match for backward compatibility.
+		// Exact custody requires a non-empty commit SHA; legacy branch-only
+		// records must not suppress creation of the current submission.
 		fields := ParseMRFields(issue)
-		if fields != nil && fields.CommitSHA != "" && commitSHA != "" {
-			if fields.CommitSHA != commitSHA {
-				// Same branch but different SHA — this is a stale MR.
-				// Don't return it; caller will create a new MR and supersede.
-				continue
-			}
+		if fields == nil || fields.CommitSHA == "" || commitSHA == "" || fields.CommitSHA != commitSHA {
+			continue
 		}
 		return issue, nil
 	}

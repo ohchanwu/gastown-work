@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -152,7 +153,7 @@ func runEpicScheduleByID(epicID string, opts epicScheduleOpts) error {
 // runEpicSlingByID immediately dispatches all open children of an epic.
 // Used when max_polecats=-1 (direct dispatch mode). Each child gets its own
 // polecat via executeSling(). Respects --max-concurrent throttling.
-func runEpicSlingByID(epicID string, opts epicScheduleOpts) error {
+func runEpicSlingByID(ctx context.Context, epicID string, opts epicScheduleOpts) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return err
@@ -240,6 +241,7 @@ func runEpicSlingByID(epicID string, opts epicScheduleOpts) error {
 
 		fmt.Printf("\n[%d/%d] Dispatching %s → %s...\n", i+1, len(candidates), c.ID, c.RigName)
 		_, err := executeSling(SlingParams{
+			Context:       ctx,
 			BeadID:        c.ID,
 			RigName:       c.RigName,
 			FormulaName:   formula,

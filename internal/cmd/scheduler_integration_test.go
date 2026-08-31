@@ -1535,7 +1535,7 @@ func TestSchedulerActualDispatchRoutesPollutedEnvToTargetRig(t *testing.T) {
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", beads.DatabaseNameFromMetadata(filepath.Join(hqPath, ".beads")))
 	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(hqPath, ".wrong-dolt-data"))
 
-	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
+	dispatched, err := dispatchScheduledWork(context.Background(), hqPath, "test", 1, false)
 	if err != nil {
 		t.Fatalf("dispatchScheduledWork: %v", err)
 	}
@@ -1598,7 +1598,7 @@ func TestSchedulerFormulaDispatchRoutesPollutedEnvToTargetRig(t *testing.T) {
 	t.Setenv("BD_DB", filepath.Join(hqPath, "wrong.bd"))
 	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(hqPath, ".wrong-dolt-data"))
 
-	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
+	dispatched, err := dispatchScheduledWork(context.Background(), hqPath, "test", 1, false)
 	if err != nil {
 		t.Fatalf("dispatchScheduledWork: %v", err)
 	}
@@ -1650,7 +1650,7 @@ func TestSchedulerDispatchFailureRecordedInContextSourceDB(t *testing.T) {
 		return nil, fmt.Errorf("forced spawn failure")
 	}
 
-	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
+	dispatched, err := dispatchScheduledWork(context.Background(), hqPath, "test", 1, false)
 	if err != nil {
 		t.Fatalf("dispatchScheduledWork: %v", err)
 	}

@@ -372,7 +372,7 @@ func runSchedulerRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	_, err = dispatchScheduledWork(townRoot, detectActor(), schedulerRunBatch, schedulerRunDryRun)
+	_, err = dispatchScheduledWork(cmd.Context(), townRoot, detectActor(), schedulerRunBatch, schedulerRunDryRun)
 	return err
 }
 

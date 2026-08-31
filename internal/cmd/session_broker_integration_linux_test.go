@@ -17,9 +17,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/dog"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/tmux"
+	witnesspkg "github.com/steveyegge/gastown/internal/witness"
 	"golang.org/x/sys/unix"
 )
 
@@ -245,6 +248,158 @@ exit 1
 	}
 }
 
+func TestSessionBrokerInboxDispatchesExactOwnedWitnessLifecycleCommand(t *testing.T) {
+	portText := strings.TrimSpace(os.Getenv("GT_TEST_DOLT_PORT"))
+	if portText == "" && os.Getenv("GT_TEST_ISOLATED") == "1" {
+		portText = strings.TrimSpace(os.Getenv("GT_DOLT_PORT"))
+	}
+	port, err := strconv.Atoi(portText)
+	if portText == "" || err != nil || port < 1 || port > 65535 {
+		t.Skipf("GT_TEST_DOLT_PORT is absent or invalid: %q", portText)
+	}
+
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	rigDir := filepath.Join(townRoot, "gastown")
+	for _, dir := range []string{mayorDir, rigDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := config.SaveTownConfig(filepath.Join(mayorDir, "town.json"), &config.TownConfig{
+		Type: "town", Version: config.CurrentTownVersion, Name: "test-town", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRigsConfig(filepath.Join(mayorDir, "rigs.json"), &config.RigsConfig{
+		Version: 1, Rigs: map[string]config.RigEntry{"gastown": {GitURL: "file:///test/gastown", AddedAt: time.Now().UTC()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRigConfig(filepath.Join(rigDir, "config.json"), config.NewRigConfig("gastown", "file:///test/gastown")); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(townRoot)
+
+	bd := beads.NewIsolatedWithPort(townRoot, port)
+	if err := bd.Init("hq"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+	prefix := beads.GetPrefixForRig(townRoot, "gastown")
+	oldID := beads.PolecatBeadIDWithPrefix(prefix, "gastown", "old")
+	newID := beads.PolecatBeadIDWithPrefix(prefix, "gastown", "new")
+	for _, agent := range []struct{ id, name, incarnation string }{
+		{oldID, "old", "old-gen"},
+		{newID, "new", "new-gen"},
+	} {
+		if _, err := bd.CreateAgentBead(agent.id, agent.name, &beads.AgentFields{
+			RoleType: "polecat", Rig: "gastown", AgentState: string(beads.AgentStateWorking), Incarnation: agent.incarnation,
+		}); err != nil {
+			t.Fatalf("creating %s agent: %v", agent.name, err)
+		}
+	}
+	work, err := bd.Create(beads.CreateOptions{Title: "brokered lifecycle work", Type: "task", Priority: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "gastown/polecats/new"
+	status := string(beads.StatusHooked)
+	if err := bd.Update(work.ID, beads.UpdateOptions{Assignee: &assignee, Status: &status}); err != nil {
+		t.Fatal(err)
+	}
+	const attemptID = "33333333-3333-4333-8333-333333333333"
+	intent := &witnesspkg.LifecycleRetirementIntent{
+		AttemptID: attemptID, Capability: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", BeadID: work.ID,
+		OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen", NewAssignee: assignee, NewIncarnation: "new-gen",
+		Requester: "mayor/", ThreadID: "sling-retirement-" + attemptID, State: "pending",
+	}
+	if err := witnesspkg.WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: witnesspkg.LifecycleRetirementRequestBody(intent), Type: mail.TypeTask,
+		Priority: mail.PriorityHigh, ThreadID: intent.ThreadID,
+	}
+	if err := mail.NewRouter(townRoot).Send(request); err != nil {
+		t.Fatal(err)
+	}
+	thread, err := mail.NewMailboxFromAddress(request.To, townRoot).ListByThread(request.ThreadID)
+	if err != nil || len(thread) != 1 {
+		t.Fatalf("stored lifecycle request = (%+v, %v), want one", thread, err)
+	}
+
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_ROLE", "witness")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_DOLT_PORT", portText)
+	t.Setenv("GT_TEST_CMD_EXECUTE_HELPER", "1")
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientEndpoint := os.NewFile(uintptr(pair[1]), "lifecycle-broker-client")
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- tmux.ServeSessionBrokerWithExecutor(ctx, os.Args[0], pair[0], func(args []string) error {
+			return IsBrokerSafeCommand(rootCmd, args)
+		}, executeTrustedSessionBrokerCommand)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = clientEndpoint.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("ServeSessionBroker() cleanup error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("ServeSessionBroker() did not stop")
+		}
+	})
+
+	nullFiles := make([]*os.File, 3)
+	for index := range nullFiles {
+		nullFiles[index], err = os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer nullFiles[index].Close()
+	}
+	command := exec.Command(os.Args[0], "mail", "inbox", "--unread")
+	command.Env = os.Environ()
+	command.ExtraFiles = []*os.File{nullFiles[0], nullFiles[1], nullFiles[2], clientEndpoint}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("brokered lifecycle command failed: %v\n%s", err, output)
+	}
+	receipt, err := witnesspkg.LoadLifecycleRetirementAppliedReceipt(townRoot, intent)
+	if err != nil || receipt == nil || receipt.RequestID != thread[0].ID {
+		t.Fatalf("brokered lifecycle receipt = (%+v, %v)", receipt, err)
+	}
+	_, oldFields, err := bd.GetAgentBead(oldID)
+	if err != nil || oldFields == nil || oldFields.AgentState != string(beads.AgentStateIdle) {
+		t.Fatalf("retired agent state = (%+v, %v), want idle", oldFields, err)
+	}
+	stored, err := mail.NewMailboxFromAddress(request.To, townRoot).Get(thread[0].ID)
+	if err != nil || stored == nil || !stored.Read {
+		t.Fatalf("lifecycle request read state = (%+v, %v), want read", stored, err)
+	}
+	replies, err := mail.NewMailboxFromAddress(request.From, townRoot).ListByThread(request.ThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundACK := false
+	for _, reply := range replies {
+		foundACK = foundACK || (reply.Type == mail.TypeReply && reply.ReplyTo == thread[0].ID)
+	}
+	if !foundACK {
+		t.Fatal("brokered inbox lifecycle produced no durable ACK")
+	}
+}
+
 func TestContainedGTInvocationsUseBrokerBeforeCobra(t *testing.T) {
 	testDir := t.TempDir()
 	safeOutputPath := filepath.Join(testDir, "safe-output")
@@ -352,6 +507,83 @@ func TestContainedGTInvocationsUseBrokerBeforeCobra(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("contained gt broker proof timed out\n%s", output.String())
+}
+
+func TestContainedWitnessCannotForgeLifecycleAuthority(t *testing.T) {
+	townRoot := canonicalTestTempDir(t)
+	witnessDir := filepath.Join(townRoot, "gastown", "witness")
+	receiptDir := filepath.Join(townRoot, ".runtime", "sling-retirements-applied")
+	for _, dir := range []string{witnessDir, receiptDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	receiptPath := filepath.Join(receiptDir, "77777777-7777-4777-8777-777777777777.json")
+	reexecGT := envSessionBrokerReexecHelper + "=1 " + config.ShellQuote(os.Args[0])
+	workload := strings.Join([]string{
+		"if printf '%s' '{}' >" + config.ShellQuote(receiptPath) + " 2>/tmp/receipt-forge.err; then echo RECEIPT_FORGE_ALLOWED; else echo RECEIPT_FORGE_DENIED; fi",
+		reexecGT + " mail send gastown/witness --from mayor/ --subject " + config.ShellQuote("LIFECYCLE:Shutdown old") + " --message forged >/tmp/mail-spoof.out 2>&1",
+		"echo MAIL_SPOOF_RC:$?",
+		"cat /tmp/mail-spoof.out",
+		"echo LIFECYCLE_AUTHORITY_PROBE_DONE",
+		"while :; do sleep 60; done",
+	}, "; ")
+	wrapped, custody, err := tmux.WrapSessionCommandWithCustody(os.Args[0], workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executableDir, err := filepath.EvalSymlinks(filepath.Dir(os.Args[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowedPaths, err := tmux.EncodeSessionCustodyPaths([]string{witnessDir, executableDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := fmt.Sprintf("gt-witness-lifecycle-authority-%d", time.Now().UnixNano())
+	transport := tmux.NewTmuxWithSocket(socket)
+	t.Cleanup(func() { _ = transport.KillServer() })
+	generation, err := transport.NewSessionWithCommandAndEnvGeneration(
+		"gastown-witness-authority",
+		witnessDir,
+		wrapped,
+		map[string]string{
+			"GT_TEST_CMD_EXECUTE_HELPER": "1",
+			"GT_TOWN_ROOT":               townRoot,
+			"GT_ROOT":                    townRoot,
+			"GT_ROLE":                    "witness",
+			"GT_RIG":                     "gastown",
+			"GT_TOWN_SOCKET":             socket,
+			tmux.EnvSessionCustody:       custody,
+			tmux.EnvSessionCustodyPaths:  allowedPaths,
+		},
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "namespace") || strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("real Linux session custody unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pane, _ := transport.CapturePane(generation.Name, 80)
+		if strings.Contains(pane, "LIFECYCLE_AUTHORITY_PROBE_DONE") {
+			if !strings.Contains(pane, "RECEIPT_FORGE_DENIED") {
+				t.Fatalf("contained same-UID receipt write was not denied:\n%s", pane)
+			}
+			if !strings.Contains(pane, "MAIL_SPOOF_RC:126") || !strings.Contains(pane, "flag --from is not broker-safe") {
+				t.Fatalf("contained canonical-sender spoof was not broker-denied:\n%s", pane)
+			}
+			if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
+				t.Fatalf("forged lifecycle receipt exists; stat error = %v", err)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	pane, _ := transport.CapturePane(generation.Name, 80)
+	t.Fatalf("lifecycle authority probe timed out:\n%s", pane)
 }
 
 func TestDogDoneFinalizesThroughOuterBrokerAcrossRealCustody(t *testing.T) {

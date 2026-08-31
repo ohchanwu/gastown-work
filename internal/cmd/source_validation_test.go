@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -151,7 +153,7 @@ func TestRunMqSubmitWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 	assertBDLogNotContains(t, log, currentBeadsDir, "show bd-source --json")
 }
 
-func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
+func TestRunDoneAbortsBeforeSubmissionWhenCompletionOwnerWriteFails(t *testing.T) {
 	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
 	setupRoutedSubmitCommandTown(t, workDir)
 	setupRoutedSubmitGitRepo(t, workDir, false)
@@ -171,17 +173,372 @@ func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 	doneIssue = "bd-source"
 	doneCleanupStatus = "unpushed"
 	doneSkipVerify = true
-	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID, expectedIncarnation string) error { return nil }
-	if err := runDone(nil, nil); err != nil {
-		t.Fatalf("runDone: %v", err)
+	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID, expectedIncarnation, completionAttempt string) error {
+		return nil
+	}
+	if err := runDone(nil, nil); err == nil || !strings.Contains(err.Error(), "done-intent") {
+		t.Fatalf("runDone completion-owner error = %v", err)
 	}
 
 	log := readSubmitSourceBDLog(t, logPath)
-	assertBDLogContains(t, log, ownerBeadsDir, "show bd-source --json")
-	assertBDLogContains(t, log, currentBeadsDir, "create --json")
-	assertBDLogContains(t, log, ownerBeadsDir, "comments add bd-source")
-	assertBDLogContains(t, log, currentBeadsDir, "show gt-mr --json")
+	assertBDLogNotContains(t, log, ownerBeadsDir, "show bd-source --json")
 	assertBDLogNotContains(t, log, currentBeadsDir, "show bd-source --json")
+	assertBDLogNotContains(t, log, currentBeadsDir, "create --json")
+}
+
+func TestRunDoneLateOwnerFailurePreservesRecoveryMarkersAndSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	setupRoutedSubmitGitRepo(t, workDir, false)
+	_, labelsPath := installLateCompletionFailureBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetDoneFlagsForTest(t)
+	townRoot := routedSourceTestTownRoot(workDir)
+	nudgeLog := filepath.Join(t.TempDir(), "nudge.log")
+	t.Setenv("GT_TEST_NUDGE_LOG", nudgeLog)
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_ROLE", "gastown/polecats/refuge")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_POLECAT", "refuge")
+	t.Setenv("BD_ACTOR", "gastown/polecats/refuge")
+	t.Setenv(polecat.EnvAgentIncarnation, "fixture-generation")
+	t.Chdir(workDir)
+	fakeKiller := &fakeDoneSessionKiller{}
+	oldKiller := newDoneSessionKiller
+	newDoneSessionKiller = func() doneSessionKiller { return fakeKiller }
+	t.Cleanup(func() { newDoneSessionKiller = oldKiller })
+
+	doneIssue = "bd-source"
+	doneCleanupStatus = "unpushed"
+	doneSkipVerify = true
+	err := runDone(nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "injected final completion failure") {
+		t.Fatalf("runDone late completion error = %v", err)
+	}
+	if fakeKiller.calls != 0 {
+		t.Fatalf("retirement calls after failed final owner write = %d", fakeKiller.calls)
+	}
+	if data, readErr := os.ReadFile(nudgeLog); readErr == nil {
+		for _, successSignal := range []string{"MERGE_READY", "POLECAT_DONE"} {
+			if strings.Contains(string(data), successSignal) {
+				t.Fatalf("success nudge %q emitted after failed final owner write: %s", successSignal, data)
+			}
+		}
+	}
+	labels, readErr := os.ReadFile(labelsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, marker := range []string{"done-intent:", "done-cp:"} {
+		if !strings.Contains(string(labels), marker) {
+			t.Fatalf("recovery marker %q lost after failed final owner write: %s", marker, labels)
+		}
+	}
+}
+
+func TestRunDoneLateRoleResolverFailurePreservesRecoveryMarkersAndSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	setupRoutedSubmitGitRepo(t, workDir, false)
+	_, labelsPath := installLateCompletionFailureBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	resetDoneFlagsForTest(t)
+	townRoot := routedSourceTestTownRoot(workDir)
+	nudgeLog := filepath.Join(t.TempDir(), "nudge.log")
+	t.Setenv("GT_TEST_NUDGE_LOG", nudgeLog)
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_ROLE", "gastown/polecats/refuge")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_POLECAT", "refuge")
+	t.Setenv("BD_ACTOR", "gastown/polecats/refuge")
+	t.Setenv(polecat.EnvAgentIncarnation, "fixture-generation")
+	t.Chdir(workDir)
+	fakeKiller := &fakeDoneSessionKiller{}
+	oldKiller := newDoneSessionKiller
+	newDoneSessionKiller = func() doneSessionKiller { return fakeKiller }
+	oldResolver := resolveDoneAgentRoleFn
+	resolveDoneAgentRoleFn = func(string, string) (RoleInfo, error) {
+		_ = os.Unsetenv("GT_ROLE")
+		_ = os.Unsetenv("GT_RIG")
+		return RoleInfo{}, errors.New("injected late role resolution failure")
+	}
+	t.Cleanup(func() {
+		newDoneSessionKiller = oldKiller
+		resolveDoneAgentRoleFn = oldResolver
+	})
+
+	doneIssue = "bd-source"
+	doneCleanupStatus = "unpushed"
+	doneSkipVerify = true
+	err := runDone(nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "injected late role resolution failure") {
+		t.Fatalf("runDone late resolver error = %v", err)
+	}
+	if fakeKiller.calls != 0 {
+		t.Fatalf("retirement calls after late resolver failure = %d", fakeKiller.calls)
+	}
+	if data, readErr := os.ReadFile(nudgeLog); readErr == nil {
+		for _, successSignal := range []string{"MERGE_READY", "POLECAT_DONE"} {
+			if strings.Contains(string(data), successSignal) {
+				t.Fatalf("success nudge %q emitted after late resolver failure: %s", successSignal, data)
+			}
+		}
+	}
+	labels, readErr := os.ReadFile(labelsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, marker := range []string{"done-intent:", "done-cp:"} {
+		if !strings.Contains(string(labels), marker) {
+			t.Fatalf("recovery marker %q lost after late resolver failure: %s", marker, labels)
+		}
+	}
+}
+
+func TestRunDoneFailedSubmissionPreservesOwnedRecoveryWithoutSuccess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	for _, tt := range []struct {
+		name      string
+		failSetup func(t *testing.T, workDir string)
+	}{
+		{
+			name: "push failure",
+			failSetup: func(t *testing.T, workDir string) {
+				runGitForMQSubmitTest(t, workDir, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "missing.git"))
+			},
+		},
+		{
+			name: "MR failure",
+			failSetup: func(t *testing.T, _ string) {
+				t.Setenv("GT_TEST_FAIL_MR_CREATE", "1")
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+			setupRoutedSubmitCommandTown(t, workDir)
+			setupRoutedSubmitGitRepo(t, workDir, false)
+			descriptionPath, labelsPath := installLateCompletionFailureBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+			resetDoneFlagsForTest(t)
+			tt.failSetup(t, workDir)
+			townRoot := routedSourceTestTownRoot(workDir)
+			nudgeLog := filepath.Join(t.TempDir(), "nudge.log")
+			t.Setenv("GT_TEST_NUDGE_LOG", nudgeLog)
+			t.Setenv("GT_TOWN_ROOT", townRoot)
+			t.Setenv("GT_ROOT", townRoot)
+			t.Setenv("GT_ROLE", "gastown/polecats/refuge")
+			t.Setenv("GT_RIG", "gastown")
+			t.Setenv("GT_POLECAT", "refuge")
+			t.Setenv("BD_ACTOR", "gastown/polecats/refuge")
+			t.Setenv(polecat.EnvAgentIncarnation, "fixture-generation")
+			t.Chdir(workDir)
+			fakeKiller := &fakeDoneSessionKiller{}
+			oldKiller := newDoneSessionKiller
+			newDoneSessionKiller = func() doneSessionKiller { return fakeKiller }
+			t.Cleanup(func() { newDoneSessionKiller = oldKiller })
+
+			doneIssue = "bd-source"
+			doneCleanupStatus = "unpushed"
+			doneSkipVerify = true
+			err := runDone(nil, nil)
+			if err == nil || !strings.Contains(err.Error(), "completion attempt") {
+				t.Fatalf("runDone owned failed submission error = %v", err)
+			}
+			if fakeKiller.calls != 0 {
+				t.Fatalf("retirement calls after failed submission = %d", fakeKiller.calls)
+			}
+			if data, readErr := os.ReadFile(nudgeLog); readErr == nil {
+				for _, successSignal := range []string{"MERGE_READY", "POLECAT_DONE"} {
+					if strings.Contains(string(data), successSignal) {
+						t.Fatalf("success nudge %q emitted after failed submission: %s", successSignal, data)
+					}
+				}
+			}
+			description, readErr := os.ReadFile(descriptionPath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			for _, retained := range []string{"agent_state: completing", "completion_attempt:", "hook_bead: bd-source"} {
+				if !strings.Contains(string(description), retained) {
+					t.Fatalf("owned recovery field %q lost after failed submission: %s", retained, description)
+				}
+			}
+			labels, readErr := os.ReadFile(labelsPath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			for _, marker := range []string{"done-intent:", "done-cp:"} {
+				if !strings.Contains(string(labels), marker) {
+					t.Fatalf("recovery marker %q lost after failed submission: %s", marker, labels)
+				}
+			}
+		})
+	}
+}
+
+func TestRunDoneRetriesActiveMROwnerWriteOnCheckpointFlow(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	branch := setupRoutedSubmitGitRepo(t, workDir, true)
+	currentOID := gitOutput(t, workDir, "rev-parse", "HEAD")
+	descriptionPath, labelsPath := installLateCompletionFailureBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	labels := fmt.Sprintf("gt:agent\ndone-cp:pushed:%s@%s:1\ndone-cp:mr-created:gt-mr:2\n", branch, currentOID)
+	if err := os.WriteFile(labelsPath, []byte(labels), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	createMarker := filepath.Join(t.TempDir(), "mr-created")
+	resetDoneFlagsForTest(t)
+	t.Setenv("GT_TEST_FAIL_ACTIVE_MR_ONCE", "1")
+	t.Setenv("GT_TEST_ACTIVE_MR_FAIL_FILE", filepath.Join(t.TempDir(), "active-mr-failed"))
+	t.Setenv("GT_TEST_MR_COMMIT_SHA", currentOID)
+	t.Setenv("GT_TEST_MR_CREATE_FILE", createMarker)
+	t.Setenv("GT_TEST_ALLOW_FINAL_COMPLETION", "1")
+	t.Setenv("GT_TOWN_ROOT", routedSourceTestTownRoot(workDir))
+	t.Setenv("GT_ROOT", routedSourceTestTownRoot(workDir))
+	t.Setenv("GT_ROLE", "gastown/polecats/refuge")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_POLECAT", "refuge")
+	t.Setenv("BD_ACTOR", "gastown/polecats/refuge")
+	t.Setenv(polecat.EnvAgentIncarnation, "fixture-generation")
+	t.Chdir(workDir)
+	doneIssue = "bd-source"
+	doneCleanupStatus = "unpushed"
+	doneSkipVerify = true
+	if err := runDone(nil, nil); err == nil || !strings.Contains(err.Error(), "active_mr") {
+		t.Fatalf("first run active_mr error = %v", err)
+	}
+	if err := runDone(nil, nil); err != nil {
+		t.Fatalf("checkpoint retry after active_mr recovery: %v", err)
+	}
+	description, err := os.ReadFile(descriptionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(description), "active_mr: gt-mr") {
+		t.Fatalf("active_mr owner write did not persist after retry: %s", description)
+	}
+	if _, err := os.Stat(createMarker); !os.IsNotExist(err) {
+		t.Fatalf("checkpoint resume unexpectedly created an MR: %v", err)
+	}
+}
+
+func TestRunDoneDiscardsStaleSameBranchMRCheckpointAtNewHead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+	setupRoutedSubmitCommandTown(t, workDir)
+	branch := setupRoutedSubmitGitRepo(t, workDir, true)
+	oldOID := gitOutput(t, workDir, "rev-parse", "HEAD")
+	writeMQSubmitTestFile(t, workDir, "file.txt", "feature-new-head\n")
+	runGitForMQSubmitTest(t, workDir, "commit", "-am", "new head")
+	descriptionPath, labelsPath := installLateCompletionFailureBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+	labels := fmt.Sprintf("gt:agent\ndone-cp:pushed:%s@%s:1\ndone-cp:mr-created:gt-mr:2\n", branch, oldOID)
+	if err := os.WriteFile(labelsPath, []byte(labels), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	createMarker := filepath.Join(t.TempDir(), "mr-created")
+	t.Setenv("GT_TEST_MR_COMMIT_SHA", oldOID)
+	t.Setenv("GT_TEST_MR_CREATE_FILE", createMarker)
+	t.Setenv("GT_TEST_LEGACY_MR", "1")
+	t.Setenv("GT_TEST_ALLOW_FINAL_COMPLETION", "1")
+	t.Setenv("GT_TOWN_ROOT", routedSourceTestTownRoot(workDir))
+	t.Setenv("GT_ROOT", routedSourceTestTownRoot(workDir))
+	t.Setenv("GT_ROLE", "gastown/polecats/refuge")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_POLECAT", "refuge")
+	t.Setenv("BD_ACTOR", "gastown/polecats/refuge")
+	t.Setenv(polecat.EnvAgentIncarnation, "fixture-generation")
+	t.Chdir(workDir)
+	resetDoneFlagsForTest(t)
+	doneIssue, doneCleanupStatus, doneSkipVerify = "bd-source", "unpushed", true
+	if err := runDone(nil, nil); err != nil {
+		t.Fatalf("runDone stale checkpoint recovery: %v", err)
+	}
+	if _, err := os.Stat(createMarker); err != nil {
+		t.Fatalf("stale same-branch MR checkpoint was reused instead of creating for new HEAD: %v", err)
+	}
+	if data, err := os.ReadFile(descriptionPath); err != nil || !strings.Contains(string(data), "active_mr: gt-mr") || strings.Contains(string(data), "active_mr: gt-legacy") {
+		t.Fatalf("active MR missing after stale checkpoint recovery: %s (%v)", data, err)
+	}
+}
+
+func TestUpdateAgentStateCompletionOwnerRejectsEmptyResolvedAgentBead(t *testing.T) {
+	oldResolver := resolveDoneAgentRoleFn
+	resolveDoneAgentRoleFn = func(string, string) (RoleInfo, error) {
+		return RoleInfo{Role: RolePolecat}, nil
+	}
+	t.Cleanup(func() { resolveDoneAgentRoleFn = oldResolver })
+
+	err := updateAgentStateOnDoneIfCompletionOwner("/missing/worktree", "/missing/town", ExitCompleted, "gt-work", "generation-1", "attempt-1")
+	if err == nil || !strings.Contains(err.Error(), "agent bead ID") {
+		t.Fatalf("empty completion-owner agent bead error = %v", err)
+	}
+}
+
+func TestCompletionOwnerLifecycleWriteFailuresPreserveRecovery(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	for _, tt := range []struct {
+		name    string
+		failEnv string
+		wantErr string
+	}{
+		{name: "hook clear", failEnv: "GT_TEST_FAIL_HOOK_CLEAR", wantErr: "clearing hook_bead"},
+		{name: "cleanup status", failEnv: "GT_TEST_FAIL_CLEANUP_STATUS", wantErr: "updating cleanup_status"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			workDir, currentBeadsDir, ownerBeadsDir := setupRoutedSourceTestTown(t)
+			descriptionPath, labelsPath := installLateCompletionFailureBDRecorder(t, currentBeadsDir, ownerBeadsDir)
+			description := "role_type: polecat\nrig: gastown\nagent_state: completing\nincarnation: fixture-generation\ncompletion_attempt: attempt-1\nhook_bead: bd-source\ncleanup_status: clean\n"
+			if err := os.WriteFile(descriptionPath, []byte(description), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(labelsPath, []byte("gt:agent\ndone-intent:COMPLETED:1\ndone-cp:pushed:branch@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			resetDoneFlagsForTest(t)
+			t.Setenv(tt.failEnv, "1")
+			t.Setenv("GT_ROLE", "gastown/polecats/refuge")
+			t.Setenv("GT_RIG", "gastown")
+			t.Setenv("GT_POLECAT", "refuge")
+			doneCleanupStatus = "has_stash"
+			err := updateAgentStateOnDoneIfCompletionOwner(workDir, routedSourceTestTownRoot(workDir), ExitCompleted, "bd-source", "fixture-generation", "attempt-1")
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("completion lifecycle write error = %v, want %q", err, tt.wantErr)
+			}
+			gotDescription, err := os.ReadFile(descriptionPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, retained := range []string{"agent_state: completing", "completion_attempt: attempt-1"} {
+				if !strings.Contains(string(gotDescription), retained) {
+					t.Fatalf("recovery field %q lost: %s", retained, gotDescription)
+				}
+			}
+			labels, err := os.ReadFile(labelsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, marker := range []string{"done-intent:", "done-cp:"} {
+				if !strings.Contains(string(labels), marker) {
+					t.Fatalf("recovery marker %q lost: %s", marker, labels)
+				}
+			}
+		})
+	}
 }
 
 func setupRoutedSourceTestTown(t *testing.T) (workDir, currentBeadsDir, ownerBeadsDir string) {
@@ -331,7 +688,7 @@ if [ "$1" = "show" ] && [ "$2" = "gt-mr" ]; then
 fi
 if [ "$1" = "show" ] && [ "$2" = "gt-gastown-polecat-refuge" ]; then
   echo '[{"id":"gt-gastown-polecat-refuge","title":"Polecat refuge","status":"open","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\\nrig: gastown\\nagent_state: working\\nincarnation: fixture-generation\\nhook_bead: bd-source\\ncleanup_status: clean"}]'
-  exit 0
+	exit 0
 fi
 if [ "$1" = "update" ] && [ "$2" = "gt-gastown-polecat-refuge" ]; then
   cat >/dev/null
@@ -366,6 +723,118 @@ exit 1
 	beads.ResetBdAllowStaleCacheForTest()
 	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
 	return logPath
+}
+
+func installLateCompletionFailureBDRecorder(t *testing.T, currentBeadsDir, ownerBeadsDir string) (string, string) {
+	t.Helper()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	descriptionPath := filepath.Join(stateDir, "agent.description")
+	labelsPath := filepath.Join(stateDir, "agent.labels")
+	description := "role_type: polecat\nrig: gastown\nagent_state: working\nincarnation: fixture-generation\nhook_bead: bd-source\ncleanup_status: clean\n"
+	if err := os.WriteFile(descriptionPath, []byte(description), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(labelsPath, []byte("gt:agent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf(`#!/bin/sh
+while [ "$1" = "--allow-stale" ]; do shift; done
+if [ "$1" = "version" ]; then echo "bd stub"; exit 0; fi
+
+json_string_file() {
+  awk 'BEGIN { printf "\"" } { gsub(/\\/, "\\\\"); gsub(/\"/, "\\\""); if (NR > 1) printf "\\n"; printf "%%s", $0 } END { print "\"" }' "$1"
+}
+json_labels_file() {
+  awk 'BEGIN { printf "[" } { gsub(/\\/, "\\\\"); gsub(/\"/, "\\\""); if (NR > 1) printf ","; printf "\"%%s\"", $0 } END { print "]" }' "$1"
+}
+
+if [ "$1" = "show" ] && [ "$2" = "gt-gastown-polecat-refuge" ]; then
+  printf '[{"id":"gt-gastown-polecat-refuge","title":"Polecat refuge","status":"open","issue_type":"agent","labels":'
+  json_labels_file %q
+  printf ',"description":'
+  json_string_file %q
+  printf '}]\n'
+  exit 0
+fi
+if [ "$1" = "show" ] && [ "$2" = "bd-source" ]; then
+  if [ "$BEADS_DIR" = %q ]; then
+    printf '%%s\n' '[{"id":"bd-source","title":"current mirror","status":"open","priority":1,"issue_type":"task","description":"convoy_id: hq-cv-test\nmerge_strategy: mr"}]'
+    exit 0
+  fi
+  if [ "$BEADS_DIR" = %q ]; then
+    printf '%%s\n' '[{"id":"bd-source","title":"owner source","status":"open","priority":1,"issue_type":"task","description":"convoy_id: hq-cv-test\nmerge_strategy: mr"}]'
+    exit 0
+  fi
+fi
+if [ "$1" = "show" ] && [ "$2" = "gt-mr" ]; then
+  printf '%%s\n' '[{"id":"gt-mr","title":"Merge: bd-source","status":"open","priority":1,"issue_type":"task","labels":["gt:merge-request"],"description":"branch: feature/routed-submit\ntarget: main\nsource_issue: bd-source\nrig: gastown\ncommit_sha: '"${GT_TEST_MR_COMMIT_SHA:-}"'"}]'
+  exit 0
+fi
+if [ "$1" = "show" ] && [ "$2" = "--json" ] && [ "$3" = "gt-legacy" ]; then
+	printf '%%s\n' '[{"id":"gt-legacy","title":"Legacy merge: bd-source","status":"open","priority":1,"issue_type":"task","labels":["gt:merge-request"],"description":"branch: feature/routed-submit\ntarget: main\nsource_issue: bd-source\nrig: gastown"}]'
+	exit 0
+fi
+if [ "$1" = "update" ] && [ "$2" = "gt-gastown-polecat-refuge" ]; then
+  body=""
+  for arg in "$@"; do
+    if [ "$arg" = "--body-file=-" ]; then
+      body=%q.tmp
+      cat > "$body"
+	  if [ "$GT_TEST_FAIL_HOOK_CLEAR" = "1" ] && grep -q '^hook_bead: null$' "$body"; then
+		rm -f "$body"; echo 'injected hook clear failure' >&2; exit 1
+	  fi
+	      if [ "$GT_TEST_FAIL_CLEANUP_STATUS" = "1" ] && grep -q '^cleanup_status: has_stash$' "$body"; then
+		rm -f "$body"; echo 'injected cleanup status failure' >&2; exit 1
+	      fi
+	      if [ "$GT_TEST_FAIL_ACTIVE_MR_ONCE" = "1" ] && grep -q '^active_mr:' "$body" && [ ! -f "$GT_TEST_ACTIVE_MR_FAIL_FILE" ]; then
+	        touch "$GT_TEST_ACTIVE_MR_FAIL_FILE"
+	        rm -f "$body"; echo 'injected active_mr failure' >&2; exit 1
+	      fi
+	      if [ "${GT_TEST_ALLOW_FINAL_COMPLETION:-0}" != "1" ] && grep -Eq '^agent_state: (done|stuck)$' "$body"; then
+        rm -f "$body"
+        echo 'injected final completion failure' >&2
+        exit 1
+      fi
+      mv "$body" %q
+    fi
+  done
+  for arg in "$@"; do
+    case "$arg" in
+      --add-label=*) printf '%%s\n' "${arg#--add-label=}" >> %q ;;
+      --remove-label=*) grep -Fvx "${arg#--remove-label=}" %q > %q.tmp || true; mv %q.tmp %q ;;
+    esac
+  done
+  exit 0
+fi
+if [ "$1" = "list" ]; then
+	if [ "$GT_TEST_LEGACY_MR" = "1" ]; then
+		printf '%%s\n' '[{"id":"gt-legacy","title":"Legacy merge: bd-source","status":"open","priority":1,"issue_type":"task","labels":["gt:merge-request"],"description":"branch: feature/routed-submit\ntarget: main\nsource_issue: bd-source\nrig: gastown"}]'
+	else
+		echo '[]'
+	fi
+	exit 0
+fi
+if [ "$1" = "sql" ]; then echo '[]'; exit 0; fi
+if [ "$1" = "create" ]; then
+	if [ "$GT_TEST_FAIL_MR_CREATE" = "1" ]; then echo 'injected MR creation failure' >&2; exit 1; fi
+	if [ -n "${GT_TEST_MR_CREATE_FILE:-}" ]; then touch "$GT_TEST_MR_CREATE_FILE"; fi
+  echo '{"id":"gt-mr","title":"Merge: bd-source","status":"open","priority":1,"issue_type":"task","labels":["gt:merge-request"]}'
+  exit 0
+fi
+if [ "$1" = "comments" ] || [ "$1" = "close" ]; then cat >/dev/null; exit 0; fi
+echo "unexpected bd command: $*" >&2
+exit 1
+`, labelsPath, descriptionPath, currentBeadsDir, ownerBeadsDir,
+		descriptionPath, descriptionPath, labelsPath, labelsPath, labelsPath, labelsPath, labelsPath)
+	path := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+	return descriptionPath, labelsPath
 }
 
 func readSubmitSourceBDLog(t *testing.T, logPath string) string {

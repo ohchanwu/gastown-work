@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,7 +63,7 @@ func TestDispatchScheduledWorkReportsHeldLock(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = lock.Unlock() })
 
-	_, err = dispatchScheduledWork(townRoot, "test", 1, false)
+	_, err = dispatchScheduledWork(context.Background(), townRoot, "test", 1, false)
 	if err == nil {
 		t.Fatal("dispatchScheduledWork succeeded with held scheduler lock")
 	}

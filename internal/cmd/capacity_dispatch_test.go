@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -74,7 +75,7 @@ func TestDispatchSingleBeadRawReviewOnlyHookFailureClearsMetadata(t *testing.T) 
 		return errors.New("forced hook failure")
 	}
 
-	_, err := dispatchSingleBead(capacity.PendingBead{
+	_, err := dispatchSingleBead(context.Background(), capacity.PendingBead{
 		ID:         "gt-context",
 		WorkBeadID: "gt-rawrollback",
 		TargetRig:  "gastown",

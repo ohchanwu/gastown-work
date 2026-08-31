@@ -1,9 +1,11 @@
 package tmux
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -29,6 +31,11 @@ type SessionBrokerValidator func(args []string) error
 // SessionBrokerDetachPolicy marks an already-validated request whose worker
 // must outlive shutdown of the contained session that requested it.
 type SessionBrokerDetachPolicy func(args []string) bool
+
+// SessionBrokerExecutor handles an already-validated command inside the
+// trusted broker process. Returning handled=false preserves the normal pinned
+// worker execution path.
+type SessionBrokerExecutor func(context.Context, []string, io.Reader, io.Writer, io.Writer) (handled bool, err error)
 
 func encodeSessionBrokerRequest(request sessionBrokerRequest) ([]byte, error) {
 	if err := validateSessionBrokerRequest(request); err != nil {

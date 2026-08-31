@@ -1,6 +1,7 @@
 package polecat
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -102,7 +103,7 @@ func TestStopSessionCustodyPollerFailureDoesNotKillSession(t *testing.T) {
 		return nudge.PollerGeneration{}, nil
 	}
 	stopErr := errors.New("poller ownership changed")
-	m.stopPollerGeneration = func(string, string, nudge.PollerGeneration) error { return stopErr }
+	m.stopPollerGeneration = func(context.Context, string, string, nudge.PollerGeneration) error { return stopErr }
 	custody, err := m.CaptureSessionCustody("nitro")
 	if err != nil {
 		t.Fatalf("capture custody: %v", err)

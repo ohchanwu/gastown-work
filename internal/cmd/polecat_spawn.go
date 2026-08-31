@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -33,10 +34,56 @@ type SpawnedPolecatInfo struct {
 	Pane        string // Tmux pane ID (empty until StartSession is called)
 	BaseBranch  string // Effective base branch (e.g., "main", "integration/epic-id")
 	Branch      string // Git branch name (for cleanup on rollback)
+	BranchOID   string // Exact branch object ID captured for rollback CAS
+	Incarnation string // Exact worker generation captured for rollback CAS
+	assignment  *slingAssignmentReceipt
 
 	// Internal fields for deferred session start
 	account string
 	agent   string
+}
+
+var resolveSpawnedPolecatBranchOID = func(rigPath, branch string) (string, error) {
+	return git.NewGit(rigPath).Rev(branch)
+}
+
+func captureSpawnedPolecatBranchReceipt(info *SpawnedPolecatInfo, rigPath, kind string) (*SpawnedPolecatInfo, error) {
+	branchOID, err := resolveSpawnedPolecatBranchOID(rigPath, info.Branch)
+	if err != nil {
+		return info, fmt.Errorf("capturing %s polecat branch receipt: %w", kind, err)
+	}
+	info.BranchOID = branchOID
+	return info, nil
+}
+
+type polecatStartupStateCommit struct {
+	receipt  *polecat.StartupStateReceipt
+	capture  func(string) (polecat.StartupStateReceipt, error)
+	setAgent func(string) error
+	setWork  func(string) error
+	restore  func(polecat.StartupStateReceipt) error
+}
+
+func (c *polecatStartupStateCommit) onStarted(incarnation string) error {
+	receipt, err := c.capture(incarnation)
+	if err != nil {
+		return err
+	}
+	c.receipt = &receipt
+	if err := c.setAgent(incarnation); err != nil {
+		return err
+	}
+	return c.setWork(incarnation)
+}
+
+func (c *polecatStartupStateCommit) onStartFailed(incarnation string) error {
+	if c.receipt == nil {
+		return nil
+	}
+	if c.receipt.Incarnation != incarnation {
+		return fmt.Errorf("startup compensation incarnation changed: got %s, want %s", incarnation, c.receipt.Incarnation)
+	}
+	return c.restore(*c.receipt)
 }
 
 // AgentID returns the agent identifier (e.g., "gastown/polecats/Toast")
@@ -259,7 +306,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 				effectiveBranch = opts.ResumeBranch
 			}
 
-			return &SpawnedPolecatInfo{
+			return captureSpawnedPolecatBranchReceipt(&SpawnedPolecatInfo{
 				RigName:     rigName,
 				PolecatName: polecatName,
 				ClonePath:   polecatObj.ClonePath,
@@ -267,9 +314,10 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 				Pane:        "",
 				BaseBranch:  effectiveBranch,
 				Branch:      polecatObj.Branch,
+				Incarnation: polecatObj.Incarnation,
 				account:     opts.Account,
 				agent:       opts.Agent,
-			}, nil
+			}, r.Path, "reused")
 		}
 	}
 
@@ -370,7 +418,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		effectiveBranch = opts.ResumeBranch
 	}
 
-	return &SpawnedPolecatInfo{
+	return captureSpawnedPolecatBranchReceipt(&SpawnedPolecatInfo{
 		RigName:     rigName,
 		PolecatName: polecatName,
 		ClonePath:   polecatObj.ClonePath,
@@ -378,9 +426,10 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		Pane:        "", // Empty until StartSession is called
 		BaseBranch:  effectiveBranch,
 		Branch:      polecatObj.Branch,
+		Incarnation: polecatObj.Incarnation,
 		account:     opts.Account,
 		agent:       opts.Agent,
-	}, nil
+	}, r.Path, "spawned")
 }
 
 // StartSession starts the tmux session for a spawned polecat.
@@ -388,6 +437,23 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 // sees its work when gt prime runs on session start.
 // Returns the pane ID after session start.
 func (s *SpawnedPolecatInfo) StartSession() (string, error) {
+	return s.startSession(false)
+}
+
+// StartSessionCallerLocked starts the session while the sling transaction
+// holds this polecat's lifecycle lock.
+func (s *SpawnedPolecatInfo) StartSessionCallerLocked() (string, error) {
+	return s.startSession(true)
+}
+
+var startSpawnedPolecatSessionFn = func(s *SpawnedPolecatInfo, callerLocked bool) (string, error) {
+	if callerLocked {
+		return s.StartSessionCallerLocked()
+	}
+	return s.StartSession()
+}
+
+func (s *SpawnedPolecatInfo) startSession(callerLocked bool) (string, error) {
 	if s.SessionStarted() {
 		return s.Pane, nil
 	}
@@ -422,22 +488,41 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	t := tmux.NewTmux()
 	polecatSessMgr := polecat.NewSessionManager(t, r)
 	polecatMgr := polecat.NewManager(r, git.NewGit(r.Path), t)
-
-	fmt.Printf("Starting session for %s/%s...\n", s.RigName, s.PolecatName)
-	startOpts := polecat.SessionStartOptions{
-		RuntimeConfigDir: claudeConfigDir,
-		Agent:            s.agent,
-		OnStarted: func(incarnation string) error {
+	startupState := &polecatStartupStateCommit{
+		capture: func(incarnation string) (polecat.StartupStateReceipt, error) {
+			return polecatMgr.CaptureStartupStateIfIncarnation(s.PolecatName, incarnation)
+		},
+		setAgent: func(incarnation string) error {
 			if err := polecatMgr.SetAgentStateWithRetryIfIncarnation(s.PolecatName, incarnation, "working"); err != nil {
 				return fmt.Errorf("setting exact agent state: %w", err)
 			}
+			return nil
+		},
+		setWork: func(incarnation string) error {
 			if err := polecatMgr.SetStateIfIncarnation(s.PolecatName, incarnation, polecat.StateWorking); err != nil {
 				return fmt.Errorf("setting exact work state: %w", err)
 			}
 			return nil
 		},
+		restore: func(receipt polecat.StartupStateReceipt) error {
+			return polecatMgr.RestoreStartupStateIfIncarnation(s.PolecatName, receipt)
+		},
 	}
-	if err := polecatSessMgr.Start(s.PolecatName, startOpts); err != nil {
+
+	fmt.Printf("Starting session for %s/%s...\n", s.RigName, s.PolecatName)
+	startOpts := polecat.SessionStartOptions{
+		RuntimeConfigDir: claudeConfigDir,
+		Agent:            s.agent,
+		Incarnation:      s.Incarnation,
+		OnStarted:        startupState.onStarted,
+		OnStartFailed:    startupState.onStartFailed,
+	}
+	if callerLocked {
+		err = polecatSessMgr.StartContextCallerLocked(context.Background(), s.PolecatName, startOpts)
+	} else {
+		err = polecatSessMgr.Start(s.PolecatName, startOpts)
+	}
+	if err != nil {
 		return "", fmt.Errorf("starting session: %w", err)
 	}
 

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,9 +56,18 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 
 	// Load the inbox once. Count() and ListUnread() both call List(), so using
 	// them here doubles the bd/Dolt reads on the hot patrol path.
-	messages, total, unread, err := loadInboxSnapshot(mailbox, mailInboxUnread, mailInboxAll)
+	messages, total, unread, err := loadInboxSnapshotContext(cmd.Context(), mailbox, mailInboxUnread, mailInboxAll)
 	if err != nil {
 		return fmt.Errorf("listing messages: %w", err)
+	}
+	if err := dispatchPortableWitnessLifecycleMessagesContext(cmd.Context(), address, mailbox, messages); err != nil {
+		return fmt.Errorf("dispatching lifecycle messages: %w", err)
+	}
+	if mailInboxUnread {
+		messages = filterUnreadMessages(messages)
+		unread = len(messages)
+	} else {
+		_, unread = countInboxMessages(messages)
 	}
 
 	// JSON output
@@ -115,10 +125,25 @@ type inboxLister interface {
 	ListAll() ([]*mail.Message, error)
 }
 
+type inboxContextLister interface {
+	ListContext(context.Context) ([]*mail.Message, error)
+	ListAllContext(context.Context) ([]*mail.Message, error)
+}
+
 func loadInboxSnapshot(mailbox inboxLister, unreadOnly, includeClosedWork bool) ([]*mail.Message, int, int, error) {
+	return loadInboxSnapshotContext(context.Background(), mailbox, unreadOnly, includeClosedWork)
+}
+
+func loadInboxSnapshotContext(ctx context.Context, mailbox inboxLister, unreadOnly, includeClosedWork bool) ([]*mail.Message, int, int, error) {
 	var allMessages []*mail.Message
 	var err error
-	if includeClosedWork {
+	if contextual, ok := mailbox.(inboxContextLister); ok {
+		if includeClosedWork {
+			allMessages, err = contextual.ListAllContext(ctx)
+		} else {
+			allMessages, err = contextual.ListContext(ctx)
+		}
+	} else if includeClosedWork {
 		allMessages, err = mailbox.ListAll()
 	} else {
 		allMessages, err = mailbox.List()

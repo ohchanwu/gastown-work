@@ -297,6 +297,72 @@ func TestSessionBrokerCancellationKillsWorkerProcessGroup(t *testing.T) {
 	t.Fatalf("broker worker child PID %d survived cancellation", childPID)
 }
 
+func TestSessionBrokerClientDisconnectCancelsInProcessRequest(t *testing.T) {
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	completionReader, completionWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []*os.File{stdinReader, stdinWriter, stdoutReader, stdoutWriter, stderrReader, stderrWriter, completionReader, completionWriter} {
+		defer file.Close()
+	}
+	duplicate := func(file *os.File) int {
+		fd, err := unix.Dup(int(file.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fd
+	}
+
+	started := make(chan struct{})
+	canceled := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleSessionBrokerRequest(
+			context.Background(), nil, nil, nil,
+			func([]string) error { return nil }, nil,
+			func(ctx context.Context, _ []string, _ io.Reader, _, _ io.Writer) (bool, error) {
+				close(started)
+				<-ctx.Done()
+				canceled <- ctx.Err()
+				return true, ctx.Err()
+			},
+			sessionBrokerRequest{DeadlineMS: 5_000, Args: []string{"mail", "inbox"}},
+			[]int{duplicate(stdinReader), duplicate(stdoutWriter), duplicate(stderrWriter), duplicate(completionWriter)},
+		)
+	}()
+
+	<-started
+	if err := completionReader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("disconnect cancellation = %v, want context.Canceled", err)
+		}
+	case <-time.After(750 * time.Millisecond):
+		t.Fatal("client disconnect did not cancel broker request")
+	}
+	select {
+	case <-done:
+	case <-time.After(750 * time.Millisecond):
+		t.Fatal("broker request did not return after client disconnect")
+	}
+}
+
 func TestSessionBrokerRequestRejectsMalformedFrames(t *testing.T) {
 	valid, err := encodeSessionBrokerRequest(sessionBrokerRequest{
 		Version:    sessionBrokerProtocolVersion,

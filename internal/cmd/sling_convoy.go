@@ -16,6 +16,9 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
+var slingTrackedConvoyFn = isTrackedByConvoy
+var slingCreateAutoConvoyFn = createAutoConvoy
+
 // slingGenerateShortID generates a short random ID (5 lowercase chars).
 func slingGenerateShortID() string {
 	b := make([]byte, 3)

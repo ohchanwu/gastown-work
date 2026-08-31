@@ -1,6 +1,8 @@
 package witness
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2989,5 +2992,846 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 	// Should NOT take the archive path.
 	if strings.Contains(z.Action, "work-already-merged") {
 		t.Errorf("action = %q, should not archive when work is not merged", z.Action)
+	}
+}
+
+func TestHandleLifecycleShutdownRequiresReassignmentIncarnations(t *testing.T) {
+	missing := HandleLifecycleShutdown(t.TempDir(), "gastown", &mail.Message{
+		ID: "msg-1", Subject: "LIFECYCLE:Shutdown toast", Body: "Reason: work_reassigned",
+	})
+	if missing.Error == nil || missing.Handled {
+		t.Fatalf("missing incarnation result = %+v", missing)
+	}
+	bound := HandleLifecycleShutdown(t.TempDir(), "gastown", &mail.Message{
+		ID: "msg-2", Subject: "LIFECYCLE:Shutdown toast",
+		Body: "Reason: work_reassigned\nAttemptID: 11111111-1111-4111-8111-111111111111\nBead: gt-work\nOldAssignee: gastown/polecats/toast\nOldIncarnation: old-gen\nNewAssignee: gastown/polecats/new\nNewIncarnation: new-gen",
+	})
+	if bound.Error == nil || bound.Handled {
+		t.Fatalf("unverified generation-bound result = %+v, want fail closed", bound)
+	}
+}
+
+func TestHandleLifecycleShutdownRejectsForgedSenderDespiteCanonicalIntent(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "33333333-3333-4333-8333-333333333333", Capability: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-33333333-3333-4333-8333-333333333333", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-forged", From: "gastown/polecats/attacker", To: "gastown/witness",
+		Subject: "LIFECYCLE:Shutdown old", Body: LifecycleRetirementRequestBody(intent),
+		Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	oldApply := applyReassignmentShutdownFn
+	applyReassignmentShutdownFn = func(context.Context, string, string, string, string, string, string, string, string) error {
+		t.Fatal("forged sender reached lifecycle mutation")
+		return nil
+	}
+	t.Cleanup(func() { applyReassignmentShutdownFn = oldApply })
+	if result := HandleLifecycleShutdown(townRoot, "gastown", request); result.Error == nil || result.Handled {
+		t.Fatalf("forged lifecycle result = %+v, want fail closed", result)
+	}
+}
+
+func TestValidateLifecycleRetirementRequestBindsPortableAuthorityToDelivery(t *testing.T) {
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "13131313-1313-4313-8313-131313131313", Capability: "14141414-1414-4414-8414-141414141414",
+		DeliveryID: "15151515-1515-4515-8515-151515151515", BeadID: "gt-work",
+		OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-13131313-1313-4313-8313-131313131313", State: "pending",
+		WitnessAuthority: &LifecycleWitnessAuthority{
+			Session: tmux.SessionGeneration{Name: "gt-witness", SessionID: "$1", PaneID: "%1", Nonce: "old", ServerPID: 1, ServerIdentity: "old-server", Transport: tmux.SessionTransport{Bound: true, SocketPath: "/tmp/old.sock"}},
+			Pane:    tmux.PaneProcessGeneration{PID: 2, Identity: "old-pane"},
+		},
+	}
+	request := &mail.Message{
+		ID: "msg-bound-authority", From: "mayor/", To: "gastown/witness",
+		Subject: "LIFECYCLE:Shutdown old", Body: LifecycleRetirementRequestBody(intent),
+		Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	intent.WitnessAuthority.Session.Nonce = "replacement"
+	intent.WitnessAuthority.Session.ServerIdentity = "replacement-server"
+	intent.WitnessAuthority.Pane.Identity = "replacement-pane"
+	if err := ValidateLifecycleRetirementRequest(intent, "gastown", "old", request); !errors.Is(err, ErrLifecycleRequestRejected) {
+		t.Fatalf("rewritten portable authority validation = %v, want lifecycle rejection", err)
+	}
+}
+
+func TestHandleLifecycleShutdownClassifiesMissingIntentAsRejected(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-missing-intent", From: "mayor/", To: "gastown/witness",
+		Subject: "LIFECYCLE:Shutdown old", Body: "Reason: work_reassigned\nAttemptID: 22222222-2222-4222-8222-222222222222",
+		Type: mail.TypeTask, ThreadID: "sling-retirement-22222222-2222-4222-8222-222222222222",
+	}
+	result := HandleLifecycleShutdown(townRoot, "gastown", request)
+	if !errors.Is(result.Error, ErrLifecycleRequestRejected) {
+		t.Fatalf("missing lifecycle intent error = %v, want lifecycle rejection", result.Error)
+	}
+}
+
+func allowLifecycleRetirementAuthorityForTest(t *testing.T) {
+	t.Helper()
+	oldSupported, oldWorker, oldPortable := lifecycleRetirementBrokerSupportedFn, lifecycleRetirementBrokerWorkerFn, lifecycleRetirementPortableAuthorityRequiredFn
+	lifecycleRetirementBrokerSupportedFn = func() bool { return true }
+	lifecycleRetirementBrokerWorkerFn = func() bool { return true }
+	lifecycleRetirementPortableAuthorityRequiredFn = func() bool { return false }
+	t.Cleanup(func() {
+		lifecycleRetirementBrokerSupportedFn, lifecycleRetirementBrokerWorkerFn, lifecycleRetirementPortableAuthorityRequiredFn = oldSupported, oldWorker, oldPortable
+	})
+}
+
+func TestLoadLifecycleRetirementAppliedReceiptRejectsNonBrokerForgery(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "77777777-7777-4777-8777-777777777777", Capability: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-77777777-7777-4777-8777-777777777777", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	forged := &LifecycleRetirementAppliedReceipt{
+		AttemptID: intent.AttemptID, RequestID: "forged-request", ReceiptID: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+		IntentHash: lifecycleRetirementIntentHash(intent), Authority: lifecycleRetirementBrokerAuthority,
+	}
+	path, err := lifecycleRetirementPath(townRoot, "sling-retirements-applied", intent.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := LoadLifecycleRetirementAppliedReceipt(townRoot, intent)
+	if err == nil || receipt != nil {
+		t.Fatalf("same-UID forged receipt = (%+v, %v), want fail closed", receipt, err)
+	}
+	if !errors.Is(err, ErrLifecycleRequestRejected) {
+		t.Fatalf("same-UID forged receipt error = %v, want lifecycle rejection", err)
+	}
+}
+
+func TestLifecycleRetirementAppliedReceiptMACRejectsTampering(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "66666666-6666-4666-8666-666666666666", Capability: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-66666666-6666-4666-8666-666666666666", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := StoreLifecycleRetirementAppliedReceipt(townRoot, intent, "msg-authentic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.RequestID = "msg-forged"
+	path, err := lifecycleRetirementPath(townRoot, "sling-retirements-applied", intent.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadLifecycleRetirementAppliedReceipt(townRoot, intent)
+	if err == nil || got != nil {
+		t.Fatalf("tampered broker receipt = (%+v, %v), want fail closed", got, err)
+	}
+	if !errors.Is(err, ErrLifecycleRequestRejected) {
+		t.Fatalf("tampered broker receipt error = %v, want lifecycle rejection", err)
+	}
+}
+
+func TestLoadLifecycleRetirementIntentClassifiesMalformedRecordAsRejected(t *testing.T) {
+	townRoot := t.TempDir()
+	attemptID := "55555555-5555-4555-8555-555555555555"
+	path, err := lifecycleRetirementPath(townRoot, "sling-retirements", attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadLifecycleRetirementIntent(townRoot, attemptID); !errors.Is(err, ErrLifecycleRequestRejected) {
+		t.Fatalf("malformed lifecycle intent error = %v, want lifecycle rejection", err)
+	}
+}
+
+func TestLifecycleRetirementReceiptReplaysLegacyBrokerAuthority(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "abababab-abab-4bab-8bab-abababababab", Capability: "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-abababab-abab-4bab-8bab-abababababab", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := PrepareLifecycleRetirementReceipt(townRoot, intent, "msg-parent-version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.Authority = lifecycleRetirementLegacyBrokerAuthority
+	receipt.MAC = lifecycleRetirementReceiptMAC(intent, receipt)
+	if err := writeLifecycleRetirementReceipt(townRoot, receipt); err != nil {
+		t.Fatalf("write parent-version receipt: %v", err)
+	}
+	got, err := LoadLifecycleRetirementReceipt(townRoot, intent)
+	if err != nil || got == nil || got.Authority != lifecycleRetirementLegacyBrokerAuthority || got.RequestID != receipt.RequestID {
+		t.Fatalf("legacy receipt replay = (%+v, %v)", got, err)
+	}
+}
+
+func TestHandleLifecycleShutdownRequiresBrokerAuthorityBeforeMutation(t *testing.T) {
+	t.Setenv(tmux.EnvSessionBrokerWorker, "")
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "88888888-8888-4888-8888-888888888888", Capability: "99999999-9999-4999-8999-999999999999",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-88888888-8888-4888-8888-888888888888", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-unbrokered", From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: LifecycleRetirementRequestBody(intent), Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	oldApply := applyReassignmentShutdownFn
+	applyCalls := 0
+	applyReassignmentShutdownFn = func(context.Context, string, string, string, string, string, string, string, string) error {
+		applyCalls++
+		return nil
+	}
+	t.Cleanup(func() { applyReassignmentShutdownFn = oldApply })
+	result := HandleLifecycleShutdown(townRoot, "gastown", request)
+	if result.Error == nil || result.Handled {
+		t.Fatalf("unbrokered lifecycle result = %+v, want fail closed", result)
+	}
+	if applyCalls != 0 {
+		t.Fatalf("unbrokered lifecycle invoked shutdown %d times", applyCalls)
+	}
+}
+
+func TestHandleLifecycleShutdownPersistsPendingReceiptBeforeMutation(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "12121212-1212-4212-8212-121212121212", Capability: "34343434-3434-4434-8434-343434343434",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-12121212-1212-4212-8212-121212121212", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-pending-first", From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: LifecycleRetirementRequestBody(intent), Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	oldApply := applyReassignmentShutdownFn
+	wantErr := errors.New("crash after side effect")
+	applyReassignmentShutdownFn = func(context.Context, string, string, string, string, string, string, string, string) error {
+		receipt, err := LoadLifecycleRetirementReceipt(townRoot, intent)
+		if err != nil || receipt == nil || receipt.State != "pending" || receipt.RequestID != request.ID {
+			t.Fatalf("receipt before lifecycle mutation = (%+v, %v), want pending", receipt, err)
+		}
+		return wantErr
+	}
+	t.Cleanup(func() { applyReassignmentShutdownFn = oldApply })
+	result := HandleLifecycleShutdownBrokered(townRoot, "gastown", request)
+	if !errors.Is(result.Error, wantErr) || result.Handled {
+		t.Fatalf("crash-window lifecycle result = %+v", result)
+	}
+	receipt, err := LoadLifecycleRetirementReceipt(townRoot, intent)
+	if err != nil || receipt == nil || receipt.State != "pending" {
+		t.Fatalf("durable crash-window receipt = (%+v, %v), want pending", receipt, err)
+	}
+}
+
+func TestHandleLifecycleShutdownCancellationLeavesPendingWithoutACK(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "90909090-9090-4090-8090-909090909090", Capability: "91919191-9191-4191-8191-919191919191",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-90909090-9090-4090-8090-909090909090", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-cancelled", From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: LifecycleRetirementRequestBody(intent), Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	oldApply, oldSend := applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn
+	applyReassignmentShutdownFn = func(ctx context.Context, _ string, _ string, _ string, _ string, _ string, _ string, _ string, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ackCalls := 0
+	sendLifecycleRetirementAcceptanceFn = func(context.Context, string, *mail.Message) error {
+		ackCalls++
+		return nil
+	}
+	t.Cleanup(func() {
+		applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn = oldApply, oldSend
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	result := HandleLifecycleShutdownBrokeredContext(ctx, townRoot, "gastown", request)
+	if !errors.Is(result.Error, context.DeadlineExceeded) || result.Handled {
+		t.Fatalf("cancelled lifecycle result = %+v", result)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("cancelled lifecycle worker did not release promptly")
+	}
+	if ackCalls != 0 {
+		t.Fatalf("cancelled lifecycle stored ACK: calls=%d", ackCalls)
+	}
+	receipt, err := LoadLifecycleRetirementReceipt(townRoot, intent)
+	if err != nil || receipt == nil || receipt.State != "pending" {
+		t.Fatalf("cancelled lifecycle receipt = (%+v, %v), want pending", receipt, err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if ackCalls != 0 {
+		t.Fatalf("cancelled lifecycle stored a late ACK: calls=%d", ackCalls)
+	}
+}
+
+func TestHandleLifecycleShutdownReconcilesPendingAppliedEffectWithoutReapplying(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "56565656-5656-4656-8656-565656565656", Capability: "78787878-7878-4878-8878-787878787878",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-56565656-5656-4656-8656-565656565656", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-reconcile-applied", From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: LifecycleRetirementRequestBody(intent), Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	if _, err := PrepareLifecycleRetirementReceipt(townRoot, intent, request.ID); err != nil {
+		t.Fatal(err)
+	}
+	oldApplied, oldApply, oldSend := reassignmentShutdownAppliedFn, applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn
+	reassignmentShutdownAppliedFn = func(context.Context, string, string, string, string) (bool, error) { return true, nil }
+	applyReassignmentShutdownFn = func(context.Context, string, string, string, string, string, string, string, string) error {
+		t.Fatal("reconciled lifecycle effect was applied twice")
+		return nil
+	}
+	sendLifecycleRetirementAcceptanceFn = func(context.Context, string, *mail.Message) error { return nil }
+	t.Cleanup(func() {
+		reassignmentShutdownAppliedFn, applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn = oldApplied, oldApply, oldSend
+	})
+	result := HandleLifecycleShutdownBrokered(townRoot, "gastown", request)
+	if result.Error != nil || !result.Handled {
+		t.Fatalf("pending applied reconciliation = %+v", result)
+	}
+	receipt, err := LoadLifecycleRetirementAppliedReceipt(townRoot, intent)
+	if err != nil || receipt == nil || receipt.State != "applied" {
+		t.Fatalf("applied receipt after reconciliation = (%+v, %v)", receipt, err)
+	}
+}
+
+func TestHandleLifecycleShutdownMigratesLegacyAppliedReceiptAfterCrash(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "58585858-5858-4858-8858-585858585858", Capability: "79797979-7979-4979-8979-797979797979",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-58585858-5858-4858-8858-585858585858", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-legacy-applied", From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: LifecycleRetirementRequestBody(intent), Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	legacy := struct {
+		AttemptID  string `json:"attempt_id"`
+		RequestID  string `json:"request_id"`
+		ReceiptID  string `json:"receipt_id"`
+		IntentHash string `json:"intent_hash"`
+		Authority  string `json:"authority"`
+	}{
+		AttemptID: intent.AttemptID, RequestID: request.ID, ReceiptID: "68686868-6868-4868-8868-686868686868",
+		IntentHash: lifecycleRetirementIntentHash(intent), Authority: lifecycleRetirementLegacyBrokerAuthority,
+	}
+	path, err := lifecycleRetirementPath(townRoot, "sling-retirements-applied", intent.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldApplied, oldApply, oldSend := reassignmentShutdownAppliedFn, applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn
+	reassignmentShutdownAppliedFn = func(context.Context, string, string, string, string) (bool, error) { return true, nil }
+	applyReassignmentShutdownFn = func(context.Context, string, string, string, string, string, string, string, string) error {
+		t.Fatal("legacy applied retirement was executed twice")
+		return nil
+	}
+	sendLifecycleRetirementAcceptanceFn = func(context.Context, string, *mail.Message) error { return nil }
+	t.Cleanup(func() {
+		reassignmentShutdownAppliedFn, applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn = oldApplied, oldApply, oldSend
+	})
+
+	result := HandleLifecycleShutdownBrokered(townRoot, "gastown", request)
+	if result.Error != nil || !result.Handled {
+		t.Fatalf("legacy applied replay = %+v", result)
+	}
+	receipt, err := LoadLifecycleRetirementAppliedReceipt(townRoot, intent)
+	if err != nil || receipt == nil || receipt.State != "applied" || receipt.MAC == "" || receipt.Authority != lifecycleRetirementBrokerAuthority {
+		t.Fatalf("migrated lifecycle receipt = (%+v, %v)", receipt, err)
+	}
+}
+
+func TestHandleLifecycleShutdownDoesNotTrustFullyValidHostForgedAppliedReceipt(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "45454545-4545-4545-8545-454545454545", Capability: "67676767-6767-4767-8767-676767676767",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-45454545-4545-4545-8545-454545454545", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-host-forgery", From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: LifecycleRetirementRequestBody(intent), Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	if _, err := StoreLifecycleRetirementAppliedReceipt(townRoot, intent, request.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	oldApplied, oldApply, oldSend := reassignmentShutdownAppliedFn, applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn
+	reassignmentShutdownAppliedFn = func(context.Context, string, string, string, string) (bool, error) { return false, nil }
+	applyCalls := 0
+	applyReassignmentShutdownFn = func(context.Context, string, string, string, string, string, string, string, string) error {
+		applyCalls++
+		return nil
+	}
+	sendLifecycleRetirementAcceptanceFn = func(context.Context, string, *mail.Message) error { return nil }
+	t.Cleanup(func() {
+		reassignmentShutdownAppliedFn, applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn = oldApplied, oldApply, oldSend
+	})
+
+	result := HandleLifecycleShutdownBrokered(townRoot, "gastown", request)
+	if result.Error != nil || !result.Handled {
+		t.Fatalf("fully valid host-forgery result = %+v", result)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("retirement effect calls = %d, want 1 despite forged applied receipt", applyCalls)
+	}
+}
+
+func TestHandleLifecycleShutdownReplaysAppliedReceiptAfterACKFailure(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intent := &LifecycleRetirementIntent{
+		AttemptID: "44444444-4444-4444-8444-444444444444", Capability: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+		BeadID: "gt-work", OldAssignee: "gastown/polecats/old", OldIncarnation: "old-gen",
+		NewAssignee: "gastown/polecats/new", NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-44444444-4444-4444-8444-444444444444", State: "pending",
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		ID: "msg-replay", From: "mayor/", To: "gastown/witness",
+		Subject: "LIFECYCLE:Shutdown old", Body: LifecycleRetirementRequestBody(intent),
+		Type: mail.TypeTask, ThreadID: intent.ThreadID,
+	}
+	oldApplied, oldApply, oldSend := reassignmentShutdownAppliedFn, applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn
+	reassignmentShutdownAppliedFn = func(context.Context, string, string, string, string) (bool, error) { return true, nil }
+	applyCalls := 0
+	applyReassignmentShutdownFn = func(context.Context, string, string, string, string, string, string, string, string) error {
+		applyCalls++
+		return nil
+	}
+	sendCalls := 0
+	sendLifecycleRetirementAcceptanceFn = func(context.Context, string, *mail.Message) error {
+		sendCalls++
+		if sendCalls == 1 {
+			return errors.New("lost ACK storage")
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		reassignmentShutdownAppliedFn, applyReassignmentShutdownFn, sendLifecycleRetirementAcceptanceFn = oldApplied, oldApply, oldSend
+	})
+	if first := HandleLifecycleShutdownBrokered(townRoot, "gastown", request); first.Error == nil || first.Handled {
+		t.Fatalf("first lifecycle result = %+v, want ACK failure", first)
+	}
+	if receipt, err := LoadLifecycleRetirementAppliedReceipt(townRoot, intent); err != nil || receipt == nil {
+		t.Fatalf("receipt after ACK failure = (%+v, %v)", receipt, err)
+	}
+	if replay := HandleLifecycleShutdownBrokered(townRoot, "gastown", request); replay.Error != nil || !replay.Handled {
+		t.Fatalf("replayed lifecycle result = %+v", replay)
+	}
+	if applyCalls != 1 || sendCalls != 2 {
+		t.Fatalf("replay calls = apply %d, send %d; want 1, 2", applyCalls, sendCalls)
+	}
+}
+
+func TestHandleLifecycleShutdownAcceptsExactCustodyAndRepliesInThread(t *testing.T) {
+	allowLifecycleRetirementAuthorityForTest(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("real bd fixture is not supported on Windows")
+	}
+	portText := strings.TrimSpace(os.Getenv("GT_TEST_DOLT_PORT"))
+	if portText == "" && os.Getenv("GT_TEST_ISOLATED") == "1" {
+		portText = strings.TrimSpace(os.Getenv("GT_DOLT_PORT"))
+	}
+	port, err := strconv.Atoi(portText)
+	if portText == "" || err != nil || port < 1 || port > 65535 {
+		t.Skipf("GT_TEST_DOLT_PORT is absent or invalid: %q", portText)
+	}
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"version":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bd := beads.NewIsolatedWithPort(townRoot, port)
+	if err := bd.Init("hq"); err != nil {
+		t.Fatalf("bd init: %v", err)
+	}
+	t.Setenv("GT_DOLT_PORT", portText)
+	t.Setenv("BEADS_DOLT_PORT", portText)
+	t.Setenv("BEADS_DOLT_SERVER_PORT", portText)
+	t.Setenv("BEADS_DOLT_AUTO_START", "0")
+	prefix := beads.GetPrefixForRig(townRoot, "gastown")
+	oldID := beads.PolecatBeadIDWithPrefix(prefix, "gastown", "old")
+	newID := beads.PolecatBeadIDWithPrefix(prefix, "gastown", "new")
+	for _, agent := range []struct {
+		id, name, incarnation string
+	}{
+		{id: oldID, name: "old", incarnation: "old-gen"},
+		{id: newID, name: "new", incarnation: "new-gen"},
+	} {
+		if _, err := bd.CreateAgentBead(agent.id, agent.name, &beads.AgentFields{
+			RoleType: "polecat", Rig: "gastown", AgentState: string(beads.AgentStateWorking), Incarnation: agent.incarnation,
+		}); err != nil {
+			t.Fatalf("create %s agent: %v", agent.name, err)
+		}
+	}
+	_, fields, err := beads.New(townRoot).GetAgentBead(newID)
+	if err != nil || fields == nil || fields.Incarnation != "new-gen" {
+		t.Fatalf("replacement fixture is not visible through production routing: fields=%+v err=%v", fields, err)
+	}
+	work, err := bd.Create(beads.CreateOptions{Title: "work", Type: "task", Priority: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAssignee := "gastown/polecats/old"
+	if err := bd.Update(work.ID, beads.UpdateOptions{Assignee: &oldAssignee}); err != nil {
+		t.Fatal(err)
+	}
+	newAssignee := "gastown/polecats/new"
+	const attemptID = "99999999-9999-4999-8999-999999999999"
+	intent := &LifecycleRetirementIntent{
+		AttemptID: attemptID, Capability: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", BeadID: work.ID,
+		OldAssignee: oldAssignee, OldIncarnation: "old-gen",
+		NewAssignee: newAssignee, NewIncarnation: "new-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-" + attemptID, State: "pending",
+	}
+	if err := PrepareLifecycleReassignmentDatabaseReceipt(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	hooked := string(beads.StatusHooked)
+	if err := bd.Update(work.ID, beads.UpdateOptions{Assignee: &newAssignee, Status: &hooked}); err != nil {
+		t.Fatal(err)
+	}
+	intent.DeliveryID = "22222222-2222-4222-8222-222222222222"
+	if err := BindLifecycleReassignmentDatabaseDelivery(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, intent); err != nil {
+		t.Fatal(err)
+	}
+	request := &mail.Message{
+		From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: LifecycleRetirementRequestBody(intent),
+		Type: mail.TypeTask, Priority: mail.PriorityHigh, ThreadID: "sling-retirement-" + attemptID,
+	}
+	if err := mail.NewRouter(townRoot).Send(request); err != nil {
+		t.Fatal(err)
+	}
+	thread, err := mail.NewMailboxFromAddress(request.To, townRoot).ListByThread(request.ThreadID)
+	if err != nil || len(thread) != 1 {
+		t.Fatalf("stored request = (%+v, %v), want one", thread, err)
+	}
+	oldApply := applyReassignmentShutdownFn
+	applyCalls := 0
+	applyReassignmentShutdownFn = func(_ context.Context, workDir, rigName, polecatName, beadID, oldAssignee, oldIncarnation, replacementAssignee, replacementIncarnation string) error {
+		applyCalls++
+		return applyReassignmentShutdown(workDir, rigName, polecatName, beadID, oldAssignee, oldIncarnation, replacementAssignee, replacementIncarnation)
+	}
+	t.Cleanup(func() { applyReassignmentShutdownFn = oldApply })
+	database := beads.DatabaseNameFromMetadata(filepath.Join(townRoot, ".beads"))
+	db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(127.0.0.1:%s)/%s", portText, database))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	exactBinding := lifecycleReassignmentBinding(intent)
+	forgedBinding := exactBinding
+	forgedBinding.AuthorityMAC = strings.Repeat("0", len(exactBinding.AuthorityMAC))
+	forgedPayload, _ := json.Marshal(forgedBinding)
+	if _, err := db.Exec(`UPDATE gt_internal_sling_receipts SET payload = ? WHERE receipt_key = ?`, string(forgedPayload), "retirement:"+intent.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if forged := HandleLifecycleShutdownBrokered(townRoot, "gastown", thread[0]); !errors.Is(forged.Error, ErrLifecycleRequestRejected) || forged.Handled || applyCalls != 0 {
+		t.Fatalf("same-UID database receipt rewrite = %+v apply calls %d, want rejection", forged, applyCalls)
+	}
+	exactPayload, _ := json.Marshal(exactBinding)
+	if _, err := db.Exec(`UPDATE gt_internal_sling_receipts SET payload = ? WHERE receipt_key = ?`, string(exactPayload), "retirement:"+intent.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	result := HandleLifecycleShutdownBrokered(townRoot, "gastown", thread[0])
+	if result.Error != nil || !result.Handled {
+		t.Fatalf("lifecycle result = %+v", result)
+	}
+	if replay := HandleLifecycleShutdownBrokered(townRoot, "gastown", thread[0]); replay.Error != nil || !replay.Handled {
+		t.Fatalf("lifecycle replay = %+v", replay)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("retirement action calls after replay = %d, want 1", applyCalls)
+	}
+	_, oldFields, err := bd.GetAgentBead(oldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldFields == nil || oldFields.Incarnation != "old-gen" || oldFields.AgentState != string(beads.AgentStateIdle) {
+		t.Fatalf("old generation state = %+v, want exact old-gen idle", oldFields)
+	}
+	replies, err := mail.NewMailboxFromAddress(request.From, townRoot).ListByThread(request.ThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accepted *mail.Message
+	for _, reply := range replies {
+		if reply.Type == mail.TypeReply && reply.ReplyTo == thread[0].ID {
+			accepted = reply
+		}
+	}
+	if accepted == nil || protocolBodyValue(accepted.Body, "Result") != "accepted" ||
+		protocolBodyValue(accepted.Body, "AttemptID") != attemptID || protocolBodyValue(accepted.Body, "AppliedReceipt") == "" || accepted.ThreadID != request.ThreadID {
+		t.Fatalf("acceptance reply = %+v, want exact same-thread ACK", accepted)
+	}
+	applied, err := LoadLifecycleRetirementAppliedReceipt(townRoot, intent)
+	if err != nil || applied == nil || applied.RequestID != thread[0].ID || applied.ReceiptID != protocolBodyValue(accepted.Body, "AppliedReceipt") {
+		t.Fatalf("applied receipt = (%+v, %v), want ACK-bound durable receipt", applied, err)
+	}
+
+	sameAssignee := "gastown/polecats/old"
+	if err := bd.Update(work.ID, beads.UpdateOptions{Assignee: &sameAssignee}); err != nil {
+		t.Fatal(err)
+	}
+	const sameAttemptID = "22222222-2222-4222-8222-222222222222"
+	sameIntent := &LifecycleRetirementIntent{
+		AttemptID: sameAttemptID, Capability: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", BeadID: work.ID,
+		OldAssignee: sameAssignee, OldIncarnation: "old-gen",
+		NewAssignee: sameAssignee, NewIncarnation: "replacement-gen", Requester: "mayor/",
+		ThreadID: "sling-retirement-" + sameAttemptID, State: "pending",
+	}
+	if err := PrepareLifecycleReassignmentDatabaseReceipt(townRoot, sameIntent); err != nil {
+		t.Fatal(err)
+	}
+	replacementDescription := beads.FormatAgentDescription("old", &beads.AgentFields{
+		RoleType: "polecat", Rig: "gastown", AgentState: string(beads.AgentStateWorking), Incarnation: "replacement-gen",
+	})
+	if err := bd.Update(oldID, beads.UpdateOptions{Description: &replacementDescription}); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := LifecycleRetirementApplied(townRoot, intent); err != nil || !applied {
+		t.Fatalf("retirement after exact slot reuse = (%v, %v), want terminal", applied, err)
+	}
+	sameIntent.DeliveryID = "33333333-3333-4333-8333-333333333333"
+	if err := BindLifecycleReassignmentDatabaseDelivery(townRoot, sameIntent); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteLifecycleRetirementIntent(townRoot, sameIntent); err != nil {
+		t.Fatal(err)
+	}
+	sameNameRequest := &mail.Message{
+		From: "mayor/", To: "gastown/witness", Subject: "LIFECYCLE:Shutdown old",
+		Body: LifecycleRetirementRequestBody(sameIntent),
+		Type: mail.TypeTask, Priority: mail.PriorityHigh, ThreadID: "sling-retirement-" + sameAttemptID,
+	}
+	if err := mail.NewRouter(townRoot).Send(sameNameRequest); err != nil {
+		t.Fatal(err)
+	}
+	sameThread, err := mail.NewMailboxFromAddress(sameNameRequest.To, townRoot).ListByThread(sameNameRequest.ThreadID)
+	if err != nil || len(sameThread) != 1 {
+		t.Fatalf("same-name request = (%+v, %v), want one", sameThread, err)
+	}
+	if result := HandleLifecycleShutdownBrokered(townRoot, "gastown", sameThread[0]); result.Error != nil || !result.Handled {
+		t.Fatalf("same-name lifecycle result = %+v", result)
+	}
+	_, replacementFields, err := bd.GetAgentBead(oldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacementFields == nil || replacementFields.Incarnation != "replacement-gen" || replacementFields.AgentState != string(beads.AgentStateWorking) {
+		t.Fatalf("same-name replacement generation was mutated: %+v", replacementFields)
+	}
+}
+
+func TestApplyReassignmentShutdownAllowsCrossRigReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("real bd fixture is not supported on Windows")
+	}
+	portText := strings.TrimSpace(os.Getenv("GT_TEST_DOLT_PORT"))
+	if portText == "" && os.Getenv("GT_TEST_ISOLATED") == "1" {
+		portText = strings.TrimSpace(os.Getenv("GT_DOLT_PORT"))
+	}
+	port, err := strconv.Atoi(portText)
+	if portText == "" || err != nil || port < 1 || port > 65535 {
+		t.Skipf("GT_TEST_DOLT_PORT is absent or invalid: %q", portText)
+	}
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	townBD := beads.NewIsolatedWithPort(townRoot, port)
+	if err := townBD.Init("hq"); err != nil {
+		t.Fatalf("town bd init: %v", err)
+	}
+	betaDir := filepath.Join(townRoot, "beta")
+	if err := os.MkdirAll(betaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(townRoot, ".beads"), filepath.Join(betaDir, ".beads")); err != nil {
+		t.Fatalf("link beta beads fixture: %v", err)
+	}
+	routes := "{\"prefix\":\"hq-\",\"path\":\".\"}\n" +
+		"{\"prefix\":\"gt-\",\"path\":\".\"}\n" +
+		"{\"prefix\":\"bt-\",\"path\":\"beta\"}\n"
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_DOLT_PORT", portText)
+
+	oldID := beads.PolecatBeadIDWithPrefix("gt", "gastown", "old")
+	if _, err := townBD.CreateAgentBead(oldID, "old", &beads.AgentFields{
+		RoleType: "polecat", Rig: "gastown", AgentState: string(beads.AgentStateWorking), Incarnation: "old-gen",
+	}); err != nil {
+		t.Fatalf("create retiring agent: %v", err)
+	}
+	newID := beads.PolecatBeadIDWithPrefix("bt", "beta", "new")
+	if _, err := townBD.CreateAgentBead(newID, "new", &beads.AgentFields{
+		RoleType: "polecat", Rig: "beta", AgentState: string(beads.AgentStateWorking), Incarnation: "new-gen",
+	}); err != nil {
+		t.Fatalf("create replacement agent: %v", err)
+	}
+	work, err := townBD.Create(beads.CreateOptions{Title: "cross-rig work", Type: "task", Priority: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAssignee := "beta/polecats/new"
+	if err := townBD.Update(work.ID, beads.UpdateOptions{Assignee: &newAssignee}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := applyReassignmentShutdown(townRoot, "gastown", "old", work.ID,
+		"gastown/polecats/old", "old-gen", newAssignee, "new-gen"); err != nil {
+		t.Fatalf("cross-rig reassignment shutdown: %v", err)
+	}
+	_, oldFields, err := townBD.GetAgentBead(oldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldFields == nil || oldFields.AgentState != string(beads.AgentStateIdle) {
+		t.Fatalf("retiring agent state = %+v, want idle", oldFields)
+	}
+	_, newFields, err := townBD.GetAgentBead(newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newFields == nil || newFields.Incarnation != "new-gen" || newFields.AgentState != string(beads.AgentStateWorking) {
+		t.Fatalf("replacement agent was mutated: %+v", newFields)
 	}
 }

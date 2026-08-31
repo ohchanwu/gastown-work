@@ -1273,10 +1273,11 @@ func sendHandoffMail(subject, message string) (string, error) {
 	}
 
 	// Detect agent identity for self-mail
-	agentID, _, _, err := resolveSelfTarget()
+	agentID, _, _, err := resolveSelfTargetFn()
 	if err != nil {
 		return "", fmt.Errorf("detecting agent identity: %w", err)
 	}
+	lifecycleTarget := agentID
 
 	// Normalize identity to match mailbox query format
 	agentID = mail.AddressToIdentity(agentID)
@@ -1287,73 +1288,76 @@ func sendHandoffMail(subject, message string) (string, error) {
 		return "", fmt.Errorf("cannot detect town root")
 	}
 
-	// Build labels for mail metadata (matches mail router format)
-	labels := fmt.Sprintf("from:%s", agentID)
+	var beadID string
+	err = withPolecatAssignmentFence(lifecycleTarget, townRoot, func() error {
+		// Build labels for mail metadata (matches mail router format)
+		labels := fmt.Sprintf("from:%s", agentID)
 
-	// Close stale hooked mail beads from previous sessions before creating a new one.
-	// Without this, each handoff cycle accumulates beads in status=hooked. (GH#3859)
-	townB := beads.New(filepath.Join(townRoot, ".beads"))
-	if n, closeErr := townB.CloseStaleHookedMailBeads(agentID); closeErr != nil {
-		style.PrintWarning("couldn't close previous hooked mail bead(s): %v", closeErr)
-	} else if n > 0 {
-		fmt.Printf("%s Closed %d stale hooked mail bead(s)\n", style.Dim.Render("🧹"), n)
-	}
-
-	// Create mail bead directly using bd create with --silent to get the ID
-	// Mail goes to town-level beads (hq- prefix)
-	// Flags go first, then -- to end flag parsing, then the positional subject.
-	// This prevents subjects like "--help" from being parsed as flags.
-	args := []string{
-		"create",
-		"--assignee", agentID,
-		"-d", message,
-		"--priority", "1", // high — handoffs should float above normal mail
-		"--labels", labels + ",gt:message",
-		"--actor", agentID,
-		// NOT ephemeral: handoff mail must be in issues table so gt hook can find it.
-		// Ephemeral wisps are invisible to hook queries and may be reaped before successor reads.
-		"--silent", // Output only the bead ID
-		"--", subject,
-	}
-
-	cmd := BdCmd(args...).
-		WithAutoCommit().
-		Dir(townRoot).
-		Build()
-	cmd.Env = append(cmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
-
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return "", fmt.Errorf("creating handoff mail: %s", errMsg)
+		// Close stale hooked mail beads from previous sessions before creating a new one.
+		// Without this, each handoff cycle accumulates beads in status=hooked. (GH#3859)
+		townB := beads.New(filepath.Join(townRoot, ".beads"))
+		if n, closeErr := townB.CloseStaleHookedMailBeads(agentID); closeErr != nil {
+			style.PrintWarning("couldn't close previous hooked mail bead(s): %v", closeErr)
+		} else if n > 0 {
+			fmt.Printf("%s Closed %d stale hooked mail bead(s)\n", style.Dim.Render("🧹"), n)
 		}
-		return "", fmt.Errorf("creating handoff mail: %w", err)
-	}
 
-	beadID := strings.TrimSpace(stdout.String())
-	if beadID == "" {
-		return "", fmt.Errorf("bd create did not return bead ID")
-	}
+		// Create mail bead directly using bd create with --silent to get the ID
+		// Mail goes to town-level beads (hq- prefix)
+		// Flags go first, then -- to end flag parsing, then the positional subject.
+		// This prevents subjects like "--help" from being parsed as flags.
+		args := []string{
+			"create",
+			"--assignee", agentID,
+			"-d", message,
+			"--priority", "1", // high — handoffs should float above normal mail
+			"--labels", labels + ",gt:message",
+			"--actor", agentID,
+			// NOT ephemeral: handoff mail must be in issues table so gt hook can find it.
+			// Ephemeral wisps are invisible to hook queries and may be reaped before successor reads.
+			"--silent", // Output only the bead ID
+			"--", subject,
+		}
 
-	// Auto-hook the created mail bead
-	hookCmd := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
-		WithAutoCommit().
-		Dir(townRoot).
-		Build()
-	hookCmd.Env = append(hookCmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
-	hookCmd.Stderr = os.Stderr
+		cmd := BdCmd(args...).
+			WithAutoCommit().
+			Dir(townRoot).
+			Build()
+		cmd.Env = append(cmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
 
-	if err := withPolecatAssignmentFence(agentID, townRoot, hookCmd.Run); err != nil {
-		// Non-fatal: mail was created, just couldn't hook
-		style.PrintWarning("created mail %s but failed to auto-hook: %v", beadID, err)
-		return beadID, nil
-	}
+		var stdout, stderr strings.Builder
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
 
-	return beadID, nil
+		if err := cmd.Run(); err != nil {
+			errMsg := strings.TrimSpace(stderr.String())
+			if errMsg != "" {
+				return fmt.Errorf("creating handoff mail: %s", errMsg)
+			}
+			return fmt.Errorf("creating handoff mail: %w", err)
+		}
+
+		beadID = strings.TrimSpace(stdout.String())
+		if beadID == "" {
+			return fmt.Errorf("bd create did not return bead ID")
+		}
+
+		// Auto-hook the created mail bead
+		hookCmd := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
+			WithAutoCommit().
+			Dir(townRoot).
+			Build()
+		hookCmd.Env = append(hookCmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
+		hookCmd.Stderr = os.Stderr
+
+		if err := hookCmd.Run(); err != nil {
+			// Non-fatal: mail was created, just couldn't hook
+			style.PrintWarning("created mail %s but failed to auto-hook: %v", beadID, err)
+			return nil
+		}
+		return nil
+	})
+	return beadID, err
 }
 
 // warnHandoffGitStatus checks the current workspace for uncommitted or unpushed
@@ -1430,34 +1434,41 @@ func looksLikeBeadID(s string) bool {
 
 // hookBeadForHandoff attaches a bead to the current agent's hook.
 func hookBeadForHandoff(beadID string) error {
-	// Verify the bead exists first
-	verifyCmd := exec.Command("bd", "show", beadID, "--json")
-	if err := verifyCmd.Run(); err != nil {
-		return fmt.Errorf("bead '%s' not found", beadID)
-	}
-
 	// Determine agent identity
-	agentID, _, _, err := resolveSelfTarget()
+	agentID, _, _, err := resolveSelfTargetFn()
 	if err != nil {
 		return fmt.Errorf("detecting agent identity: %w", err)
 	}
 
-	fmt.Printf("%s Hooking %s...\n", style.Bold.Render("🪝"), beadID)
+	townRoot := detectTownRootFromCwd()
+	if townRoot == "" {
+		return fmt.Errorf("cannot detect town root")
+	}
+	return withPolecatAssignmentFence(agentID, townRoot, func() error {
+		// Verification is part of the transaction so retirement cannot begin
+		// between proof and the pin mutation.
+		verifyCmd := exec.Command("bd", "show", beadID, "--json")
+		if err := verifyCmd.Run(); err != nil {
+			return fmt.Errorf("bead '%s' not found", beadID)
+		}
 
-	if handoffDryRun {
-		fmt.Printf("Would run: bd update %s --status=pinned --assignee=%s\n", beadID, agentID)
+		fmt.Printf("%s Hooking %s...\n", style.Bold.Render("🪝"), beadID)
+
+		if handoffDryRun {
+			fmt.Printf("Would run: bd update %s --status=pinned --assignee=%s\n", beadID, agentID)
+			return nil
+		}
+
+		// Pin the bead using bd update (discovery-based approach)
+		pinCmd := exec.Command("bd", "update", beadID, "--status=pinned", "--assignee="+agentID)
+		pinCmd.Stderr = os.Stderr
+		if err := pinCmd.Run(); err != nil {
+			return fmt.Errorf("pinning bead: %w", err)
+		}
+
+		fmt.Printf("%s Work attached to hook (pinned bead)\n", style.Bold.Render("✓"))
 		return nil
-	}
-
-	// Pin the bead using bd update (discovery-based approach)
-	pinCmd := exec.Command("bd", "update", beadID, "--status=pinned", "--assignee="+agentID)
-	pinCmd.Stderr = os.Stderr
-	if err := pinCmd.Run(); err != nil {
-		return fmt.Errorf("pinning bead: %w", err)
-	}
-
-	fmt.Printf("%s Work attached to hook (pinned bead)\n", style.Bold.Render("✓"))
-	return nil
+	})
 }
 
 // collectHandoffState gathers current state for handoff context.
@@ -1640,6 +1651,12 @@ func cleanupMoleculeOnHandoff() {
 	if err != nil || handoffBead == nil {
 		return
 	}
+	if resumed, _, err := resumeMoleculeCleanupIfPresent(b, handoffBead.ID, "squash", "handoff"); err != nil {
+		fmt.Fprintf(os.Stderr, "handoff: warning: resume molecule cleanup failed: %v\n", err)
+		return
+	} else if resumed {
+		return
+	}
 
 	// Check for attached molecule on the handoff bead
 	attachment := beads.ParseAttachmentFields(handoffBead)
@@ -1649,29 +1666,9 @@ func cleanupMoleculeOnHandoff() {
 
 	molID := attachment.AttachedMolecule
 
-	// Close descendant steps (the leaked wisps)
-	if n := closeDescendants(b, molID); n > 0 {
-		fmt.Fprintf(os.Stderr, "handoff: closed %d molecule step(s) for %s\n", n, molID)
-	}
-
-	// Detach molecule with audit trail
-	if _, err := b.DetachMoleculeWithAudit(handoffBead.ID, beads.DetachOptions{
-		Operation: "squash",
-		Reason:    "handoff: session cycling",
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "handoff: warning: detach molecule audit failed: %v\n", err)
-	}
-
-	// Close all descendant wisps first, then the molecule root.
-	// Without this, handoff leaks orphan wisps into the DB.
-	// Best-effort in handoff path — log but proceed.
-	if _, err := forceCloseDescendants(b, molID); err != nil {
-		style.PrintWarning("handoff: could not close descendants of %s: %v", molID, err)
-	}
-
-	// Force-close the molecule root wisp
-	if err := b.ForceCloseWithReason("handoff", molID); err != nil {
-		fmt.Fprintf(os.Stderr, "handoff: warning: couldn't close molecule %s: %v\n", molID, err)
+	pinned := &beadInfo{Status: handoffBead.Status, Assignee: handoffBead.Assignee, Description: handoffBead.Description}
+	if _, err := detachAndCleanupMoleculesFn(b, handoffBead.ID, pinned, "squash", agentID, "handoff: session cycling", "handoff", []string{molID}); err != nil {
+		fmt.Fprintf(os.Stderr, "handoff: warning: molecule cleanup failed: %v\n", err)
 	}
 }
 

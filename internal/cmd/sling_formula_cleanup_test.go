@@ -110,7 +110,7 @@ func TestRunSlingFormulaExistingHookedDogStartsDelayedSession(t *testing.T) {
 		t.Fatal("existing hooked formula no-op block not found")
 	}
 	existingBlock := body[existingIdx:]
-	stepIdx := strings.Index(existingBlock, "\n\t// Step 1:")
+	stepIdx := strings.Index(existingBlock, "// Step 1:")
 	if stepIdx == -1 {
 		t.Fatal("could not isolate existing hooked formula block")
 	}

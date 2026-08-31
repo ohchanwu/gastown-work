@@ -310,7 +310,11 @@ func (r *Router) resolveBeadsDir() string {
 }
 
 func (r *Router) ensureCustomTypes(beadsDir string) error {
-	if err := beads.EnsureCustomTypes(beadsDir); err != nil {
+	return r.ensureCustomTypesContext(context.Background(), beadsDir)
+}
+
+func (r *Router) ensureCustomTypesContext(ctx context.Context, beadsDir string) error {
+	if err := beads.EnsureCustomTypesContext(ctx, beadsDir); err != nil {
 		return fmt.Errorf("ensuring custom types: %w", err)
 	}
 	return nil
@@ -1002,6 +1006,19 @@ func (r *Router) Send(msg *Message) error {
 	return r.sendToSingle(msg)
 }
 
+// SendDirectContext stores one direct message with caller cancellation.
+func (r *Router) SendDirectContext(ctx context.Context, msg *Message) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if isListAddress(msg.To) || isQueueAddress(msg.To) || isAnnounceAddress(msg.To) ||
+		isChannelAddress(msg.To) || isGroupAddress(msg.To) {
+		return fmt.Errorf("recipient %q is not a direct mail address", msg.To)
+	}
+	msg.mailWork = r.shouldEnrollMailWork(msg)
+	return r.sendToSingleContext(ctx, msg)
+}
+
 // sendToGroup resolves a @group address and sends individual messages to each member.
 func (r *Router) sendToGroup(msg *Message) error {
 	group := parseGroupAddress(msg.To)
@@ -1223,6 +1240,12 @@ func (r *Router) resolveCrewShorthand(identity string) string {
 
 // sendToSingle sends a message to a single recipient.
 func (r *Router) sendToSingle(msg *Message) error {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return r.sendToSingleContext(ctx, msg)
+}
+
+func (r *Router) sendToSingleContext(ctx context.Context, msg *Message) error {
 	// Ensure message has an ID for in-memory tracking (notifications, logging).
 	// We no longer pass --id to bd create; bd auto-generates the correct prefix.
 	if msg.ID == "" {
@@ -1287,11 +1310,12 @@ func (r *Router) sendToSingle(msg *Message) error {
 	args = append(args, "--", msg.Subject)
 
 	beadsDir := r.resolveBeadsDir()
-	if err := r.ensureCustomTypes(beadsDir); err != nil {
+	if err := r.ensureCustomTypesContext(ctx, beadsDir); err != nil {
 		return err
 	}
-	ctx, cancel := bdWriteCtx()
-	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	_, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	telemetry.RecordMailMessage(context.Background(), "send", telemetry.MailMessageInfo{
 		ID:       msg.ID,

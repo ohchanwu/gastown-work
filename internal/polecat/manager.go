@@ -286,26 +286,40 @@ func (m *Manager) AssignWorkIfCurrent(name string, assign func() error) (string,
 
 // ClaimCompletionIfCurrent establishes the gt done fence under the same
 // lifecycle lock used by assignment, startup, and retirement.
-func (m *Manager) ClaimCompletionIfCurrent(name, expectedIncarnation string) error {
+func (m *Manager) ClaimCompletionIfCurrent(name, expectedIncarnation, attempt string) (func(), error) {
+	lease, err := m.lockPolecatCompletion(name)
+	if err != nil {
+		return nil, err
+	}
+	release := func() { _ = lease.Unlock() }
 	fl, err := m.lockPolecat(name)
 	if err != nil {
-		return err
+		release()
+		return nil, err
 	}
 	defer func() { _ = fl.Unlock() }()
 	if !m.exists(name) {
-		return ErrPolecatNotFound
+		release()
+		return nil, ErrPolecatNotFound
 	}
 	_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
 	if err != nil {
-		return err
+		release()
+		return nil, err
 	}
 	if fields == nil || fields.Incarnation != strings.TrimSpace(expectedIncarnation) {
-		return fmt.Errorf("%w: completion receipt", ErrPolecatIncarnationChanged)
+		release()
+		return nil, fmt.Errorf("%w: completion receipt", ErrPolecatIncarnationChanged)
 	}
 	if fields.AgentState == string(beads.AgentStateRetiring) || fields.AgentState == string(beads.AgentStateNuked) {
-		return fmt.Errorf("%w: agent is %s", ErrPolecatIncarnationChanged, fields.AgentState)
+		release()
+		return nil, fmt.Errorf("%w: agent is %s", ErrPolecatIncarnationChanged, fields.AgentState)
 	}
-	return m.agentBeads().ClaimAgentCompletion(m.agentBeadID(name), expectedIncarnation)
+	if err := m.agentBeads().ClaimAgentCompletion(m.agentBeadID(name), expectedIncarnation, attempt); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 // lockPolecat acquires an exclusive file lock for a specific polecat.
@@ -321,6 +335,37 @@ func (m *Manager) lockPolecat(name string) (*flock.Flock, error) {
 	fl := flock.New(lockPath)
 	if err := fl.Lock(); err != nil {
 		return nil, fmt.Errorf("acquiring polecat lock for %s: %w", name, err)
+	}
+	return fl, nil
+}
+
+func (m *Manager) lockPolecatContext(ctx context.Context, name string) (*flock.Flock, error) {
+	lockDir := filepath.Join(m.rig.Path, ".runtime", "locks")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating lock dir: %w", err)
+	}
+	fl := flock.New(filepath.Join(lockDir, fmt.Sprintf("polecat-%s.lock", name)))
+	locked, err := fl.TryLockContext(ctx, 25*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring polecat lock for %s: %w", name, err)
+	}
+	if !locked {
+		return nil, ctx.Err()
+	}
+	return fl, nil
+}
+
+// lockPolecatCompletion is a process-lifetime lease shared by gt done and
+// journaled nuke. OS lock release makes a crashed attempt recoverable without a
+// guessed timeout while preventing a live attempt from racing retirement.
+func (m *Manager) lockPolecatCompletion(name string) (*flock.Flock, error) {
+	lockDir := filepath.Join(m.rig.Path, ".runtime", "locks")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating lock dir: %w", err)
+	}
+	fl := flock.New(filepath.Join(lockDir, fmt.Sprintf("polecat-%s-completion.lock", name)))
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("acquiring completion lease for %s: %w", name, err)
 	}
 	return fl, nil
 }
@@ -520,6 +565,71 @@ func (m *Manager) SetStateIfIncarnation(name, expectedIncarnation string, state 
 		return fmt.Errorf("%w: startup state receipt", ErrPolecatIncarnationChanged)
 	}
 	return m.SetState(name, state)
+}
+
+// StartupStateReceipt captures the durable state that StartSession changes
+// after the runtime is healthy so a later startup error can restore it exactly.
+type StartupStateReceipt struct {
+	Incarnation       string
+	AgentState        string
+	WorkIssueID       string
+	WorkStatus        string
+	WorkWrittenStatus string
+	WorkAssignee      string
+	WorkStateChange   bool
+}
+
+// CaptureStartupStateIfIncarnation records exact agent and assigned-work state.
+// SessionManager holds the lifecycle lock while this method runs.
+func (m *Manager) CaptureStartupStateIfIncarnation(name, expectedIncarnation string) (StartupStateReceipt, error) {
+	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
+	_, fields, err := m.agentBeads().GetAgentBead(m.agentBeadID(name))
+	if err != nil {
+		return StartupStateReceipt{}, err
+	}
+	if fields == nil || fields.Incarnation != expectedIncarnation ||
+		fields.AgentState == string(beads.AgentStateCompleting) ||
+		fields.AgentState == string(beads.AgentStateRetiring) ||
+		fields.AgentState == string(beads.AgentStateNuked) {
+		return StartupStateReceipt{}, fmt.Errorf("%w: startup state receipt", ErrPolecatIncarnationChanged)
+	}
+	receipt := StartupStateReceipt{Incarnation: expectedIncarnation, AgentState: fields.AgentState}
+	issue, err := m.beads.GetAssignedIssue(m.assigneeID(name))
+	if err != nil {
+		return StartupStateReceipt{}, fmt.Errorf("capturing assigned work state: %w", err)
+	}
+	if issue != nil {
+		receipt.WorkIssueID = issue.ID
+		receipt.WorkStatus = issue.Status
+		receipt.WorkAssignee = issue.Assignee
+		receipt.WorkStateChange = issue.Status != beads.StatusHooked
+		if receipt.WorkStateChange {
+			receipt.WorkWrittenStatus = string(beads.StatusInProgress)
+		}
+	}
+	return receipt, nil
+}
+
+// RestoreStartupStateIfIncarnation compensates the exact writes performed by
+// startup and refuses to overwrite a changed generation, assignee, or work state.
+func (m *Manager) RestoreStartupStateIfIncarnation(name string, receipt StartupStateReceipt) error {
+	var restoreErr error
+	if receipt.WorkStateChange {
+		if err := m.beads.CompareAndRestoreIssueStatusIfAssignee(
+			receipt.WorkIssueID, receipt.WorkWrittenStatus, receipt.WorkAssignee, receipt.WorkStatus,
+		); err != nil {
+			restoreErr = errors.Join(restoreErr, fmt.Errorf("restoring exact work state: %w", err))
+		}
+	}
+	working := string(beads.AgentStateWorking)
+	if err := m.agentBeads().CompareAndUpdateAgentDescriptionFields(
+		m.agentBeadID(name),
+		beads.AgentFieldExpectations{Incarnation: &receipt.Incarnation, AgentState: &working},
+		beads.AgentFieldUpdates{AgentState: &receipt.AgentState},
+	); err != nil {
+		restoreErr = errors.Join(restoreErr, fmt.Errorf("restoring exact agent state: %w", err))
+	}
+	return restoreErr
 }
 
 // assigneeID returns the beads assignee identifier for a polecat.
@@ -1311,7 +1421,23 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 		return err
 	}
 	defer func() { _ = fl.Unlock() }()
+	return m.RemoveWithOptionsLocalOnlyIfIncarnationLocked(name, expectedIncarnation, force, nuclear, selfNuke, beforeRemove, afterFence, afterRemove)
+}
 
+// RemoveWithOptionsLocalOnlyIfIncarnationLocked performs the exact-incarnation
+// removal while the caller already holds this polecat's lifecycle lock.
+// It exists for assignment rollback, which must remain inside that same fence.
+func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnationLocked(
+	name, expectedIncarnation string,
+	force, nuclear, selfNuke bool,
+	beforeRemove func(*Polecat) (*beads.AgentFields, error),
+	afterFence func() error,
+	afterRemove func() error,
+) error {
+	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
+	if expectedIncarnation == "" {
+		return fmt.Errorf("%w: missing expected incarnation", ErrPolecatIncarnationChanged)
+	}
 	current, err := m.loadFromBeads(name)
 	if err != nil {
 		return err
@@ -1363,6 +1489,11 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnationJournaled(
 	if expectedIncarnation == "" {
 		return fmt.Errorf("%w: missing expected incarnation", ErrPolecatIncarnationChanged)
 	}
+	completionLease, err := m.lockPolecatCompletion(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = completionLease.Unlock() }()
 	fl, err := m.lockPolecat(name)
 	if err != nil {
 		return err
@@ -1380,6 +1511,17 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnationJournaled(
 	var beforeRetire func() (*beads.AgentFields, error)
 	if resuming {
 		record = fields.RetirementRecord()
+		recordedClone, pathErr := canonicalPath(record.ClonePath)
+		if pathErr != nil {
+			return fmt.Errorf("canonicalize retirement clone path: %w", pathErr)
+		}
+		expectedClone, pathErr := canonicalPath(m.clonePath(name))
+		if pathErr != nil {
+			return fmt.Errorf("canonicalize manager clone path: %w", pathErr)
+		}
+		if recordedClone != expectedClone {
+			return fmt.Errorf("retirement clone path %q does not match manager slot %q", recordedClone, expectedClone)
+		}
 	} else {
 		current, loadErr := m.loadFromBeads(name)
 		if loadErr != nil {
@@ -1520,11 +1662,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 	}
 	filesystemCommitted := false
 	removeFilesystem := func() error {
-		if journal != nil && journal.beforeFilesystem != nil {
-			if err := journal.beforeFilesystem(journal.record); err != nil {
-				return err
-			}
-		} else if afterFence != nil {
+		if journal == nil && afterFence != nil {
 			if err := afterFence(); err != nil {
 				return err
 			}
@@ -1607,6 +1745,16 @@ func (m *Manager) removeWithOptionsLockedPolicy(
 					record.Phase = phase
 					journal.record = record
 					return nil
+				}
+				if retirementPhaseBefore(record.Phase, beads.AgentRetirementPhaseSessionStopped) {
+					if journal.beforeFilesystem != nil {
+						if err := journal.beforeFilesystem(record); err != nil {
+							return err
+						}
+					}
+					if err := advanceTo(beads.AgentRetirementPhaseSessionStopped); err != nil {
+						return err
+					}
 				}
 				if retirementPhaseBefore(record.Phase, beads.AgentRetirementPhaseLocalRemoved) {
 					if err := removeFilesystem(); err != nil {
@@ -3118,8 +3266,7 @@ func (m *Manager) SetState(name string, state State) error {
 	assignee := m.assigneeID(name)
 	issue, err := m.beads.GetAssignedIssue(assignee)
 	if err != nil {
-		// If beads is not available, treat as no-op (state can't be changed)
-		return nil
+		return fmt.Errorf("getting assigned issue for %s: %w", assignee, err)
 	}
 
 	switch state {
@@ -3129,7 +3276,7 @@ func (m *Manager) SetState(name string, state State) error {
 		// merge conflicts when gt done runs. The polecat should claim work via gt prime,
 		// not have sling change status during spawn (gt-zecmc).
 		if issue != nil && issue.Status != beads.StatusHooked {
-			status := "in_progress"
+			status := string(beads.StatusInProgress)
 			if err := m.beads.Update(issue.ID, beads.UpdateOptions{Status: &status}); err != nil {
 				return fmt.Errorf("setting issue status: %w", err)
 			}

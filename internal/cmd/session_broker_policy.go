@@ -85,6 +85,9 @@ var containedWitnessBrokerCapabilities = []containedWitnessBrokerCapability{
 	{path: []string{"status"}, guidance: []containedWitnessPrimeCommand{
 		{description: "Read town status", args: []string{"status", "--fast"}},
 	}},
+	// Lifecycle handling is intentionally absent from user guidance. The exact
+	// message ID is dispatched by the Witness mail loop and must match this rig.
+	{path: []string{"witness", "handle-lifecycle"}},
 	// Dog closeout is intentionally absent from user guidance. The only
 	// accepted form carries an exact snapshot captured inside the owned dog
 	// session, then runs through the trusted host worker.
@@ -165,6 +168,23 @@ func IsBrokerSafeCommand(root *cobra.Command, args []string) error {
 	}
 	if len(path) == 2 && path[0] == "dog" && path[1] == "done" {
 		return validateDogDoneBrokerRequest(args, os.Getenv("GT_ROLE"), os.Getenv("GT_DOG_NAME"))
+	}
+	if len(path) == 2 && path[0] == "witness" && path[1] == "handle-lifecycle" {
+		return validateWitnessLifecycleBrokerRequest(args, os.Getenv("GT_ROLE"), os.Getenv("GT_RIG"))
+	}
+	return nil
+}
+
+func validateWitnessLifecycleBrokerRequest(args []string, role, ownedRig string) error {
+	if role != "witness" || ownedRig == "" {
+		return errors.New("lifecycle broker request has no owned Witness rig")
+	}
+	if len(args) != 4 || args[0] != "witness" || args[1] != "handle-lifecycle" ||
+		args[2] == "" || args[3] == "" {
+		return errors.New("lifecycle broker request must carry one exact rig and message ID")
+	}
+	if args[2] != ownedRig {
+		return errors.New("lifecycle broker request does not match the owned Witness rig")
 	}
 	return nil
 }
@@ -318,6 +338,10 @@ func validateBrokerCommandArguments(command *cobra.Command, args []string) (retE
 			}
 		}
 		return fmt.Errorf("invalid broker argument policy %q", policy)
+	}
+	if command == mailSendCmd && os.Getenv("GT_ROLE") == "witness" &&
+		(len(positionals) != 1 || positionals[0] != "mayor/") {
+		return errors.New("contained Witness may send brokered mail only to mayor/")
 	}
 	if err := command.ValidateRequiredFlags(); err != nil {
 		return fmt.Errorf("validating broker required flags: %w", err)

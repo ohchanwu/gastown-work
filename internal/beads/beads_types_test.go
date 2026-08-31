@@ -1,11 +1,14 @@
 package beads
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
 )
@@ -427,6 +430,55 @@ func TestEnsureCustomTypes(t *testing.T) {
 			t.Errorf("expected cache hit, got: %v", err)
 		}
 	})
+}
+
+func TestEnsureCustomTypesContextCancelsBDInit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX blocking bd fixture")
+	}
+	ResetEnsuredDirs()
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := EnsureCustomTypesContext(ctx, beadsDir)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("EnsureCustomTypesContext error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("cancellation took %s, want under 2s", elapsed)
+	}
+	if _, err := os.Stat(filepath.Join(beadsDir, typesSentinel)); !os.IsNotExist(err) {
+		t.Fatalf("canceled ensure wrote sentinel: %v", err)
+	}
+}
+
+func TestEnsureCustomTypesContextCancelsWhileSerialized(t *testing.T) {
+	ResetEnsuredDirs()
+	ensuredMu.Lock()
+	defer ensuredMu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- EnsureCustomTypesContext(ctx, "blocked") }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("EnsureCustomTypesContext error = %v, want canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("EnsureCustomTypesContext ignored cancellation while waiting for lock")
+	}
 }
 
 func TestEnsureCustomTypesConfigYAML(t *testing.T) {

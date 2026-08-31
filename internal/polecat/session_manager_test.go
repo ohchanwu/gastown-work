@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/nudge"
@@ -167,6 +168,46 @@ func TestSessionName(t *testing.T) {
 	name := m.SessionName("Toast")
 	if name != "gt-Toast" {
 		t.Errorf("sessionName = %q, want gt-Toast", name)
+	}
+}
+
+func TestRetirementAppliedRequiresOldSessionAbsenceAndTerminalBead(t *testing.T) {
+	setupTestRegistryForSession(t)
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-retirement-applied-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = tm.KillServer() })
+	r := &rig.Rig{Name: "testrig", Path: t.TempDir()}
+	m := NewSessionManager(tm, r)
+	sessionName := m.SessionName("Toast")
+	if _, err := tm.NewSessionWithCommandAndEnvGeneration(sessionName, r.Path, "sleep 30", map[string]string{
+		EnvAgentIncarnation: "old-generation",
+	}); err != nil {
+		t.Fatalf("creating old session generation: %v", err)
+	}
+
+	terminalCalls := 0
+	terminal := func(context.Context) (bool, error) {
+		terminalCalls++
+		return true, nil
+	}
+	applied, err := m.RetirementAppliedContext(context.Background(), "Toast", "old-generation", terminal)
+	if err != nil || applied {
+		t.Fatalf("live old session retirement = (%v, %v), want false", applied, err)
+	}
+	if terminalCalls != 0 {
+		t.Fatalf("terminal bead checked while old session remained live: calls=%d", terminalCalls)
+	}
+	if err := tm.KillSession(sessionName); err != nil {
+		t.Fatalf("killing old session: %v", err)
+	}
+	applied, err = m.RetirementAppliedContext(context.Background(), "Toast", "old-generation", terminal)
+	if err != nil || !applied {
+		t.Fatalf("dead old session plus terminal bead = (%v, %v), want true", applied, err)
+	}
+	applied, err = m.RetirementAppliedContext(context.Background(), "Toast", "old-generation", func(context.Context) (bool, error) {
+		return false, nil
+	})
+	if err != nil || applied {
+		t.Fatalf("dead old session plus nonterminal bead = (%v, %v), want false", applied, err)
 	}
 }
 
@@ -331,7 +372,16 @@ func TestStartContext_CancellationDuringPostReadyFallback(t *testing.T) {
 	m.deliverStartupPrompt = func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error {
 		return nil
 	}
-	m.verifyStartupNudge = func(ctx context.Context, _ string, _ *config.RuntimeConfig, _ string, _ bool) error {
+	m.verifyStartupNudgeLocked = func(ctx context.Context, _ string, _ tmux.SessionGeneration, _ *config.RuntimeConfig, _ string, _ bool) error {
+		probe := flock.New(filepath.Join(rigPath, ".runtime", "locks", "polecat-Toast.lock"))
+		locked, lockErr := probe.TryLock()
+		if lockErr != nil {
+			t.Fatal(lockErr)
+		}
+		if locked {
+			_ = probe.Unlock()
+			t.Fatal("ordinary StartContext entered synchronous verification without its lifecycle lock")
+		}
 		close(verificationEntered)
 		<-ctx.Done()
 		return ctx.Err()
@@ -437,7 +487,7 @@ func TestStopSerializesWithPolecatLifecycleLock(t *testing.T) {
 	m.capturePollerGeneration = func(string, string) (nudge.PollerGeneration, error) {
 		return nudge.PollerGeneration{}, nil
 	}
-	m.stopPollerGeneration = func(string, string, nudge.PollerGeneration) error { return nil }
+	m.stopPollerGeneration = func(context.Context, string, string, nudge.PollerGeneration) error { return nil }
 	fl, err := m.lifecycle.lockPolecat("Toast")
 	if err != nil {
 		t.Fatal(err)
@@ -545,7 +595,7 @@ func TestStartContextOnStartedFailureCleansCreatedGeneration(t *testing.T) {
 	settings.DefaultAgent = "test-runtime"
 	settings.Agents = map[string]*config.RuntimeConfig{
 		"test-runtime": {
-			Provider: "generic", Command: "awk", PromptMode: "none",
+			Provider: "generic", Command: "awk", PromptMode: "arg",
 			Hooks: &config.RuntimeHooksConfig{Provider: "claude"},
 			Tmux:  &config.RuntimeTmuxConfig{ProcessNames: []string{"awk"}, ReadyPromptPrefix: "READY>"},
 		},
@@ -563,18 +613,279 @@ func TestStartContextOnStartedFailureCleansCreatedGeneration(t *testing.T) {
 	tm := tmux.NewTmux()
 	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}})
 	m.deliverStartupPrompt = func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error { return nil }
-	m.verifyStartupNudge = func(context.Context, string, *config.RuntimeConfig, string, bool) error { return nil }
+	verificationEntered := make(chan struct{})
+	verificationExited := make(chan struct{})
+	m.verifyStartupNudge = func(ctx context.Context, _ string, _ tmux.SessionGeneration, _ *config.RuntimeConfig, _ string, _ bool) error {
+		close(verificationEntered)
+		<-ctx.Done()
+		close(verificationExited)
+		return ctx.Err()
+	}
 	sentinel := errors.New("post-start CAS failed")
+	compensationCalled := false
 	err := m.StartContext(context.Background(), "Toast", SessionStartOptions{
 		WorkDir: workDir, Agent: "test-runtime", Incarnation: "fixture-generation",
-		Command:   `awk 'BEGIN { print "READY>"; fflush(); system("sleep 30") }'`,
-		OnStarted: func(string) error { return sentinel },
+		Command: `awk 'BEGIN { print "READY>"; fflush(); system("sleep 30") }'`,
+		OnStarted: func(string) error {
+			select {
+			case <-verificationEntered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("async startup verifier did not start")
+			}
+			return sentinel
+		},
+		OnStartFailed: func(incarnation string) error {
+			compensationCalled = true
+			if incarnation != "fixture-generation" {
+				t.Fatalf("compensation incarnation = %q", incarnation)
+			}
+			select {
+			case <-verificationExited:
+			default:
+				t.Fatal("startup compensation ran before verifier cancellation joined")
+			}
+			return nil
+		},
 	})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("StartContext error = %v, want post-start CAS failure", err)
 	}
+	if !compensationCalled {
+		t.Fatal("post-start failure did not run durable compensation")
+	}
 	if running, checkErr := tm.HasSession(m.SessionName("Toast")); checkErr != nil || running {
 		t.Fatalf("failed post-start CAS left session: running=%v err=%v", running, checkErr)
+	}
+}
+
+func TestStartContextCallerLockedDoesNotReacquireLifecycleLock(t *testing.T) {
+	requireTmux(t)
+	installMockBd(t)
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := config.NewTownSettings()
+	settings.DefaultAgent = "test-runtime"
+	settings.Agents = map[string]*config.RuntimeConfig{
+		"test-runtime": {
+			Provider: "generic", Command: "awk", PromptMode: "none",
+			Hooks: &config.RuntimeHooksConfig{Provider: "claude"},
+			Tmux:  &config.RuntimeTmuxConfig{ProcessNames: []string{"awk"}, ReadyPromptPrefix: "READY>"},
+		},
+	}
+	settings.Operational = &config.OperationalConfig{Session: &config.SessionThresholds{ClaudeStartTimeout: "20s"}}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatal(err)
+	}
+	reg := session.NewPrefixRegistry()
+	reg.Register("xz", "testrig")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+	tm := tmux.NewTmux()
+	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}})
+	m.deliverStartupPrompt = func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error { return nil }
+	sessionID := m.SessionName("Toast")
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(sessionID) })
+	fl, err := m.lifecycle.lockPolecat("Toast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fl.Unlock() }()
+	verificationCalled := false
+	m.verifyStartupNudgeLocked = func(context.Context, string, tmux.SessionGeneration, *config.RuntimeConfig, string, bool) error {
+		verificationCalled = true
+		probe := flock.New(filepath.Join(rigPath, ".runtime", "locks", "polecat-Toast.lock"))
+		locked, lockErr := probe.TryLock()
+		if lockErr != nil {
+			return lockErr
+		}
+		if locked {
+			_ = probe.Unlock()
+			return errors.New("caller-locked verifier ran without lifecycle custody")
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- m.StartContextCallerLocked(context.Background(), "Toast", SessionStartOptions{
+			WorkDir: workDir, Agent: "test-runtime", Incarnation: "fixture-generation",
+			Command: `awk 'BEGIN { print "READY>"; fflush(); system("sleep 30") }'`,
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("caller-locked session start recursively acquired the lifecycle lock")
+	}
+	if !verificationCalled {
+		t.Fatal("caller-locked StartContext did not exercise synchronous startup verification")
+	}
+}
+
+func TestVerifyStartupNudgeDeliveryRejectsSameNameReplacement(t *testing.T) {
+	requireTmux(t)
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	retries := 1
+	settings := config.NewTownSettings()
+	settings.Operational = &config.OperationalConfig{Session: &config.SessionThresholds{
+		StartupNudgeVerifyDelay: "500ms", StartupNudgeMaxRetries: &retries,
+	}}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatal(err)
+	}
+
+	tm := tmux.NewTmux()
+	sessionName := fmt.Sprintf("gt-test-startup-generation-%d", testSessionCounter.Add(1))
+	_ = tm.KillSession(sessionName)
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+	original, err := tm.NewSessionWithCommandAndEnvGeneration(sessionName, t.TempDir(), "sh", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath})
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "$"}}
+	marker := "ROUND8_STALE_STARTUP_NUDGE"
+	done := make(chan error, 1)
+	go func() {
+		done <- m.verifyStartupNudgeDeliveryForGeneration(context.Background(), "Toast", original, rc, marker, false)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if err := tm.KillSessionGeneration(original); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tm.NewSessionWithCommandAndEnvGeneration(sessionName, t.TempDir(), "sh", nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("generation-aware verifier error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("generation-aware verifier did not stop after replacement")
+	}
+	content, err := tm.CapturePane(sessionName, 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, marker) {
+		t.Fatalf("same-name replacement received stale startup nudge: %s", content)
+	}
+}
+
+func TestVerifyStartupNudgeDeliveryFencesGenerationCheckAndNudge(t *testing.T) {
+	requireTmux(t)
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	retries := 1
+	settings := config.NewTownSettings()
+	settings.Operational = &config.OperationalConfig{Session: &config.SessionThresholds{
+		StartupNudgeVerifyDelay: "1ms", StartupNudgeMaxRetries: &retries,
+	}}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatal(err)
+	}
+
+	polecatName := fmt.Sprintf("Toast-%d-%d", os.Getpid(), testSessionCounter.Add(1))
+	tm := tmux.NewTmux()
+	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath})
+	sessionName := m.SessionName(polecatName)
+	_ = tm.KillSession(sessionName)
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+	original, err := tm.NewSessionWithCommandAndEnvGeneration(sessionName, t.TempDir(), "sh", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentGeneration := original
+	var generationMu sync.RWMutex
+	m.startupGenerationCurrentFn = func(expected tmux.SessionGeneration) bool {
+		generationMu.RLock()
+		defer generationMu.RUnlock()
+		return expected.Equal(currentGeneration)
+	}
+	m.hasStartupSession = func(context.Context, string) (bool, error) { return true, nil }
+	m.isStartupIdle = func(context.Context, string, *config.RuntimeConfig) (bool, error) { return true, nil }
+
+	marker := "ROUND9_STALE_STARTUP_NUDGE"
+	nudgedReplacement := false
+	m.nudgeStartupSession = func(string, string) error {
+		generationMu.RLock()
+		nudgedReplacement = !original.Equal(currentGeneration)
+		generationMu.RUnlock()
+		return nil
+	}
+	contentionObserved := make(chan struct{})
+	replacementDone := make(chan error, 1)
+	m.beforeStartupGenerationUse = func(operation string) {
+		if operation != "nudge" {
+			return
+		}
+		m.beforeStartupGenerationUse = nil
+		go func() {
+			lockPath := filepath.Join(rigPath, ".runtime", "locks", fmt.Sprintf("polecat-%s.lock", polecatName))
+			fl := flock.New(lockPath)
+			locked, lockErr := fl.TryLock()
+			if lockErr != nil {
+				replacementDone <- lockErr
+				return
+			}
+			if locked {
+				_ = fl.Unlock()
+				replacementDone <- errors.New("replacement unexpectedly acquired lifecycle lock before contention")
+				return
+			}
+			close(contentionObserved)
+			if lockErr := fl.Lock(); lockErr != nil {
+				replacementDone <- lockErr
+				return
+			}
+			defer func() { _ = fl.Unlock() }()
+			if err := tm.KillSessionGeneration(original); err != nil {
+				replacementDone <- err
+				return
+			}
+			var err error
+			generationMu.Lock()
+			currentGeneration, err = tm.NewSessionWithCommandAndEnvGeneration(sessionName, t.TempDir(), "sh", nil)
+			generationMu.Unlock()
+			replacementDone <- err
+		}()
+		select {
+		case <-contentionObserved:
+		case <-time.After(2 * time.Second):
+			t.Fatal("replacement did not observe lifecycle lock contention")
+		}
+	}
+	m.afterStartupGenerationUse = func(operation string) {
+		if operation == "nudge" {
+			if err := <-replacementDone; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "$"}}
+	if err := m.verifyStartupNudgeDeliveryForGeneration(context.Background(), polecatName, original, rc, marker, false); err != nil {
+		t.Fatal(err)
+	}
+	if nudgedReplacement {
+		t.Fatal("same-name replacement received stale startup nudge")
 	}
 }
 
@@ -1142,7 +1453,7 @@ func TestVerifyStartupNudgeDelivery_CancellationInterruptsPolling(t *testing.T) 
 	ctx := &observedDoneContext{Context: baseCtx, entered: make(chan struct{})}
 	done := make(chan error, 1)
 	go func() {
-		done <- m.verifyStartupNudgeDelivery(ctx, "nonexistent-session", &config.RuntimeConfig{
+		done <- m.verifyStartupNudgeDeliveryForGeneration(ctx, "toast", tmux.SessionGeneration{Name: "nonexistent-session"}, &config.RuntimeConfig{
 			Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "READY"},
 		}, "check your hook", false)
 	}()
