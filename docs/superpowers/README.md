@@ -4,6 +4,9 @@ Active work: none.
 
 Completed work:
 
+- [Lifecycle integration and Codex startup tracker closeout](archive/260828-lifecycle-integration-and-codex-startup-tracker-closeout-plan.md)
+- [Lifecycle custody and truthful closeout repair](archive/260817-lifecycle-custody-and-truthful-closeout-repair-spec.md)
+- [Codex startup repair tracker reconciliation](archive/260828-codex-startup-repair-tracker-reconciliation-spec.md)
 - [Gastown lifecycle custody P1 fixes](archive/260829-gastown-lifecycle-custody-p1-fixes.md)
 - [Actionable mail work lifecycle specification](archive/260824-actionable-mail-work-lifecycle-spec.md)
 - [Actionable mail work lifecycle implementation](archive/260824-actionable-mail-work-lifecycle.md)
