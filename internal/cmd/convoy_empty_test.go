@@ -152,10 +152,11 @@ func TestFindStrandedConvoys_MixedConvoys(t *testing.T) {
 	}
 
 	binDir := t.TempDir()
-	townRoot := t.TempDir()
+	townRoot, _ := makeRoutingTownWorkspace(t)
+	chdirConvoyTest(t, townRoot)
 	beadsDir := filepath.Join(townRoot, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("mkdir .beads: %v", err)
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 	// Routes needed so isSlingableBead can resolve gt- prefix to a rig
 	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(`{"prefix":"gt-","path":"gastown/mayor/rig"}`+"\n"), 0644); err != nil {
@@ -182,20 +183,10 @@ case "$pos0" in
     exit 0
     ;;
   sql)
-    # bdDepListRawIDs: SELECT depends_on_id FROM dependencies WHERE issue_id = '<id>' AND type = 'tracks'
-    case "$*" in
-      *"issue_id = 'hq-empty-mix'"*)
-        echo '[]'
-        ;;
-      *"issue_id = 'hq-feed-mix'"*)
-        echo '[{"depends_on_id":"gt-ready1"}]'
-        ;;
-      *)
-        echo '[]'
-        ;;
-    esac
-    exit 0
-    ;;
+	# Shared relationship snapshot includes the source convoy for each edge.
+	echo '[{"issue_id":"hq-feed-mix","depends_on_id":"gt-ready1"}]'
+	exit 0
+	;;
   dep)
     # pos2 is the convoy ID (dep list <convoy-id> ...)
     case "$pos2" in
@@ -214,8 +205,12 @@ case "$pos0" in
   show)
     # Return issue details for any show query
     echo '[{"id":"gt-ready1","title":"Ready issue","status":"open","issue_type":"task","assignee":"","blocked_by":[],"blocked_by_count":0,"dependencies":[]}]'
-    exit 0
-    ;;
+	exit 0
+	;;
+  query)
+	echo '[]'
+	exit 0
+	;;
   *)
     exit 0
     ;;
@@ -296,10 +291,11 @@ func TestFindStrandedConvoys_StuckConvoy(t *testing.T) {
 	}
 
 	binDir := t.TempDir()
-	townRoot := t.TempDir()
+	townRoot, _ := makeRoutingTownWorkspace(t)
+	chdirConvoyTest(t, townRoot)
 	beadsDir := filepath.Join(townRoot, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("mkdir .beads: %v", err)
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(`{"prefix":"gt-","path":"gastown/mayor/rig"}`+"\n"), 0644); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -323,8 +319,8 @@ case "$pos0" in
     exit 0
     ;;
   sql)
-    # bdDepListRawIDs: return tracked bead IDs for hq-stuck1
-    echo '[{"depends_on_id":"gt-busy1"},{"depends_on_id":"gt-busy2"}]'
+	# bdDepListRawIDs: return tracked bead IDs for hq-stuck1
+	echo '[{"issue_id":"hq-stuck1","depends_on_id":"gt-busy1"},{"issue_id":"hq-stuck1","depends_on_id":"gt-busy2"}]'
     exit 0
     ;;
   dep)
@@ -335,8 +331,12 @@ case "$pos0" in
   show)
     # Both issues have blockers so isReadyIssue returns false
     echo '[{"id":"gt-busy1","title":"Blocked issue 1","status":"open","issue_type":"task","assignee":"","blocked_by":["gt-blocker1"],"blocked_by_count":1,"dependencies":[]},{"id":"gt-busy2","title":"Blocked issue 2","status":"open","issue_type":"task","assignee":"","blocked_by":["gt-blocker1"],"blocked_by_count":1,"dependencies":[]}]'
-    exit 0
-    ;;
+	exit 0
+	;;
+  query)
+	echo '[]'
+	exit 0
+	;;
   *)
     exit 0
     ;;

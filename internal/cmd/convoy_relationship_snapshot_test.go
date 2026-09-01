@@ -4,10 +4,60 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestLoadConvoyTrackedIDsUsesBoundedFallbackOnlyWhenSQLUnsupported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	depLog := filepath.Join(t.TempDir(), "dep-calls")
+	writeRoutingBdStub(t, `case "$*" in
+  "--allow-stale version") exit 0 ;;
+  sql*) printf 'unknown command sql\n' >&2; exit 1 ;;
+  "dep list hq-a --direction=down --type=tracks --json") printf 'call\n' >> "$GT_DEP_LOG"; printf '[{"id":"gt-a","dependency_type":"tracks"}]\n' ;;
+  "dep list hq-b --direction=down --type=tracks --json") printf 'call\n' >> "$GT_DEP_LOG"; printf '[{"id":"gt-b","dependency_type":"tracks"}]\n' ;;
+  *) printf 'unexpected bd args: %s\n' "$*" >&2; exit 1 ;;
+esac
+`)
+	t.Setenv("GT_DEP_LOG", depLog)
+
+	got, err := loadConvoyTrackedIDsContext(context.Background(), townRoot, []string{"hq-b", "hq-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got["hq-a"]) != "[gt-a]" || fmt.Sprint(got["hq-b"]) != "[gt-b]" {
+		t.Fatalf("fallback relationships = %#v", got)
+	}
+	data, err := os.ReadFile(depLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := strings.Count(string(data), "call\n"); calls != 2 {
+		t.Fatalf("bounded fallback calls = %d, want one per convoy", calls)
+	}
+}
+
+func TestParseConvoyTrackedRowsRejectsPartialAndSorts(t *testing.T) {
+	wanted := map[string]struct{}{"hq-a": {}}
+	got, err := parseConvoyTrackedRows([]byte(`[{"issue_id":"hq-a","depends_on_id":"gt-z"},{"issue_id":"hq-a","depends_on_id":"gt-a"}]`), wanted)
+	if err != nil || fmt.Sprint(got["hq-a"]) != "[gt-a gt-z]" {
+		t.Fatalf("sorted relationships = %#v, err=%v", got, err)
+	}
+	if _, err := parseConvoyTrackedRows([]byte(`[{"issue_id":"hq-a"}]`), wanted); err == nil {
+		t.Fatal("partial relationship row accepted")
+	}
+}
 
 func TestConvoyRelationshipSnapshotFiftyRecords(t *testing.T) {
 	convoys := make([]convoyListIssue, 50)

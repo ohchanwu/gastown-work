@@ -60,46 +60,45 @@ func TestCheckCompletedConvoysLiveSizeSkipsWorkerInventory(t *testing.T) {
 		t.Fatal(err)
 	}
 	workerLog := filepath.Join(t.TempDir(), "worker-scans")
+	dependencyLog := filepath.Join(t.TempDir(), "dependency-scans")
+	detailLog := filepath.Join(t.TempDir(), "detail-scans")
 	mutationLog := filepath.Join(t.TempDir(), "mutations")
+	var dependencyRows []map[string]string
+	for _, convoy := range convoys {
+		for _, target := range tracked[convoy.ID] {
+			dependencyRows = append(dependencyRows, map[string]string{"issue_id": convoy.ID, "depends_on_id": target})
+		}
+	}
+	dependencyJSON, err := json.Marshal(dependencyRows)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var script strings.Builder
 	fmt.Fprintf(&script, `case "$*" in
   "--allow-stale version") exit 0 ;;
   "list --label=gt:convoy --json --limit=0 --status=open --flat") printf '%%s\n' '%s' ;;
   "list --json --limit=0 --status=open --flat") printf '%%s\n' '[]' ;;
   "list --label=gt:agent --status=open --json --limit=0 --flat") printf 'scan\n' >> "$GT_WORKER_SCAN_LOG"; printf '%%s\n' '[]' ;;
-  sql*)
-    case "$2" in
-`, convoyJSON)
-	for _, convoy := range convoys {
-		rows := make([]map[string]string, 0, len(tracked[convoy.ID]))
-		for _, target := range tracked[convoy.ID] {
-			rows = append(rows, map[string]string{"depends_on_id": target})
-		}
-		rowsJSON, marshalErr := json.Marshal(rows)
-		if marshalErr != nil {
-			t.Fatal(marshalErr)
-		}
-		fmt.Fprintf(&script, "      *%s*) printf '%%s\\n' '%s' ;;\n", convoy.ID, rowsJSON)
-	}
-	script.WriteString(`      *) exit 1 ;;
-    esac
-    ;;
+  sql*) printf 'scan\n' >> "$GT_DEPENDENCY_SCAN_LOG"; printf '%%s\n' '%s' ;;
   show*)
+	printf 'scan\n' >> "$GT_DETAIL_SCAN_LOG"
     shift 2
     sep=
     printf '['
     for id do
-      printf '%s{"id":"%s","title":"Open task","status":"open","issue_type":"task"}' "$sep" "$id"
+      printf '%%s{"id":"%%s","title":"Open task","status":"open","issue_type":"task"}' "$sep" "$id"
       sep=,
     done
     printf ']\n'
     ;;
-  close*|update*|export*) printf '%s\n' "$*" >> "$GT_MUTATION_LOG"; exit 1 ;;
-  *) printf 'unexpected bd args: %s\n' "$*" >&2; exit 1 ;;
+  close*|update*|export*) printf '%%s\n' "$*" >> "$GT_MUTATION_LOG"; exit 1 ;;
+  *) printf 'unexpected bd args: %%s\n' "$*" >&2; exit 1 ;;
 esac
-`)
+`, convoyJSON, dependencyJSON)
 	writeRoutingBdStub(t, script.String())
 	t.Setenv("GT_WORKER_SCAN_LOG", workerLog)
+	t.Setenv("GT_DEPENDENCY_SCAN_LOG", dependencyLog)
+	t.Setenv("GT_DETAIL_SCAN_LOG", detailLog)
 	t.Setenv("GT_MUTATION_LOG", mutationLog)
 
 	start := time.Now()
@@ -121,5 +120,19 @@ esac
 	t.Logf("live-size completion: convoys=%d edges=%d targets=%d worker_scans=%d elapsed=%s", len(convoys), edge, len(uniqueTargets), scans, time.Since(start).Round(time.Millisecond))
 	if scans != 0 {
 		t.Fatalf("worker inventory process launches = %d, want 0", scans)
+	}
+	data, err = os.ReadFile(dependencyLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scans := strings.Count(string(data), "scan\n"); scans != 1 {
+		t.Fatalf("dependency snapshot process launches = %d, want 1", scans)
+	}
+	data, err = os.ReadFile(detailLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scans := strings.Count(string(data), "scan\n"); scans != 1 {
+		t.Fatalf("issue detail batch process launches = %d, want 1", scans)
 	}
 }

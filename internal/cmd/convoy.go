@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -757,6 +758,226 @@ func bdDepListRawIDsViaDoltContext(ctx context.Context, dir, issueID, direction,
 	}
 	legacyQuery, legacyArgs := rawDepSQLArgs(issueID, direction, depType, true)
 	return queryRawDepIDs(ctx, db, legacyQuery, legacyArgs)
+}
+
+var errDirectConvoyDependencyQueryUnsupported = errors.New("direct convoy dependency query unsupported")
+
+// loadConvoyTrackedIDsContext loads every convoy's tracks edges in one query.
+func loadConvoyTrackedIDsContext(ctx context.Context, townBeads string, convoyIDs []string) (map[string][]string, error) {
+	ids := make([]string, 0, len(convoyIDs))
+	wanted := make(map[string]struct{}, len(convoyIDs))
+	for _, id := range convoyIDs {
+		if !isValidBeadID(id) {
+			return nil, fmt.Errorf("invalid convoy ID: %q", id)
+		}
+		if _, ok := wanted[id]; ok {
+			continue
+		}
+		wanted[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return map[string][]string{}, nil
+	}
+
+	tracked, err := loadConvoyTrackedIDsViaDoltContext(ctx, townBeads, ids, wanted)
+	if err == nil {
+		return tracked, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if !errors.Is(err, errDirectConvoyDependencyQueryUnsupported) {
+		return nil, fmt.Errorf("querying convoy dependencies: %w", err)
+	}
+	return loadConvoyTrackedIDsViaCLIContext(ctx, townBeads, ids, wanted)
+}
+
+func loadConvoyTrackedIDsViaDoltContext(ctx context.Context, townBeads string, ids []string, wanted map[string]struct{}) (map[string][]string, error) {
+	beadsDir := beads.ResolveBeadsDir(townBeads)
+	cfg, ok := readBeadsRuntimeConfig(beadsDir)
+	if !ok || cfg.Database == "" || cfg.Port == 0 {
+		return nil, errDirectConvoyDependencyQueryUnsupported
+	}
+	host := cfg.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	dsn := fmt.Sprintf("root@tcp(%s)/%s?parseTime=true", net.JoinHostPort(host, strconv.Itoa(cfg.Port)), url.PathEscape(cfg.Database))
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	tracked, err := queryConvoyTrackedIDs(ctx, db, convoyTrackedSQL(ids, false), wanted)
+	if err == nil || !isUnsupportedDependencySchema(err) {
+		return tracked, err
+	}
+	tracked, err = queryConvoyTrackedIDs(ctx, db, convoyTrackedSQL(ids, true), wanted)
+	if err != nil && isUnsupportedDependencySchema(err) {
+		return nil, errDirectConvoyDependencyQueryUnsupported
+	}
+	return tracked, err
+}
+
+func loadConvoyTrackedIDsViaCLIContext(ctx context.Context, townBeads string, ids []string, wanted map[string]struct{}) (map[string][]string, error) {
+	for _, legacy := range []bool{false, true} {
+		out, err := runBdJSONWithOptionsContext(ctx, townBeads, false, true, "sql", convoyTrackedSQL(ids, legacy), "--json")
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if isUnsupportedBDQuery(err) {
+				break
+			}
+			if !isUnsupportedDependencySchema(err) {
+				return nil, fmt.Errorf("batch dependency query: %w", err)
+			}
+			continue
+		}
+		return parseConvoyTrackedRows(out, wanted)
+	}
+	return loadConvoyTrackedIDsViaBoundedCLIContext(ctx, townBeads, ids, wanted)
+}
+
+func loadConvoyTrackedIDsViaBoundedCLIContext(ctx context.Context, townBeads string, ids []string, wanted map[string]struct{}) (map[string][]string, error) {
+	convoys := make([]convoyListIssue, len(ids))
+	for i, id := range ids {
+		convoys[i].ID = id
+	}
+	results, timedOut := lookupConvoysBounded(ctx, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
+		trackedIDs, err := bdDepListTrackedContext(ctx, townBeads, convoy.ID)
+		if err == nil && len(trackedIDs) == 0 {
+			trackedIDs, err = bdShowTrackedDepsContext(ctx, townBeads, convoy.ID)
+		}
+		tracked := make([]trackedIssueInfo, len(trackedIDs))
+		for i, id := range trackedIDs {
+			tracked[i].ID = id
+		}
+		return tracked, err
+	})
+	if timedOut {
+		return nil, ctx.Err()
+	}
+	tracked := emptyConvoyTrackedIDs(wanted)
+	for _, result := range results {
+		if !result.done {
+			return nil, fmt.Errorf("fallback dependency query for %s was incomplete", result.convoy.ID)
+		}
+		if result.err != nil {
+			return nil, fmt.Errorf("fallback dependency query for %s: %w", result.convoy.ID, result.err)
+		}
+		for _, issue := range result.tracked {
+			if err := addConvoyTrackedID(tracked, wanted, result.convoy.ID, issue.ID); err != nil {
+				return nil, err
+			}
+		}
+	}
+	sortConvoyTrackedIDs(tracked)
+	return tracked, nil
+}
+
+func convoyTrackedSQL(ids []string, legacy bool) string {
+	quoted := make([]string, len(ids))
+	for i, id := range ids {
+		quoted[i] = "'" + id + "'"
+	}
+	target := "COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external)"
+	if legacy {
+		target = "depends_on_id"
+	}
+	return fmt.Sprintf("SELECT issue_id, %s AS depends_on_id FROM dependencies WHERE issue_id IN (%s) AND type = 'tracks'", target, strings.Join(quoted, ","))
+}
+
+func isUnsupportedDependencySchema(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unknown column") ||
+		strings.Contains(message, "doesn't exist") ||
+		strings.Contains(message, "does not exist")
+}
+
+func isUnsupportedBDQuery(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unknown command") ||
+		strings.Contains(message, "unknown subcommand") ||
+		strings.Contains(message, "not supported")
+}
+
+func queryConvoyTrackedIDs(ctx context.Context, db *sql.DB, query string, wanted map[string]struct{}) (map[string][]string, error) {
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tracked := emptyConvoyTrackedIDs(wanted)
+	for rows.Next() {
+		var rawConvoy, rawTracked sql.NullString
+		if err := rows.Scan(&rawConvoy, &rawTracked); err != nil {
+			return nil, err
+		}
+		if !rawConvoy.Valid || !rawTracked.Valid {
+			return nil, errors.New("dependency query returned a partial row")
+		}
+		if err := addConvoyTrackedID(tracked, wanted, rawConvoy.String, rawTracked.String); err != nil {
+			return nil, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sortConvoyTrackedIDs(tracked)
+	return tracked, nil
+}
+
+func parseConvoyTrackedRows(out []byte, wanted map[string]struct{}) (map[string][]string, error) {
+	var rows []map[string]*string
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return nil, err
+	}
+	tracked := emptyConvoyTrackedIDs(wanted)
+	for _, row := range rows {
+		convoyID, trackedID := row["issue_id"], row["depends_on_id"]
+		if convoyID == nil || trackedID == nil {
+			return nil, errors.New("dependency query returned a partial row")
+		}
+		if err := addConvoyTrackedID(tracked, wanted, *convoyID, *trackedID); err != nil {
+			return nil, err
+		}
+	}
+	sortConvoyTrackedIDs(tracked)
+	return tracked, nil
+}
+
+func emptyConvoyTrackedIDs(wanted map[string]struct{}) map[string][]string {
+	tracked := make(map[string][]string, len(wanted))
+	for id := range wanted {
+		tracked[id] = []string{}
+	}
+	return tracked
+}
+
+func addConvoyTrackedID(tracked map[string][]string, wanted map[string]struct{}, rawConvoy, rawTracked string) error {
+	convoyID := beads.ExtractIssueID(rawConvoy)
+	trackedID := beads.ExtractIssueID(rawTracked)
+	if _, ok := wanted[convoyID]; !ok || trackedID == "" {
+		return fmt.Errorf("dependency query returned malformed row for %q", convoyID)
+	}
+	for _, id := range tracked[convoyID] {
+		if id == trackedID {
+			return nil
+		}
+	}
+	tracked[convoyID] = append(tracked[convoyID], trackedID)
+	return nil
+}
+
+func sortConvoyTrackedIDs(tracked map[string][]string) {
+	for id := range tracked {
+		sort.Strings(tracked[id])
+	}
 }
 
 func rawDepSQLArgs(issueID, direction, depType string, legacy bool) (string, []any) {
@@ -1860,9 +2081,13 @@ func findStrandedConvoysContext(ctx context.Context, townRoot string) ([]strande
 	if err != nil {
 		return nil, convoyStrandedScanError(ctx)
 	}
-	cache := newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext)
+	cache := newConvoyIssueDetailsCacheContext(getConvoyIssueDetailsSnapshotContext)
+	snapshot, err := loadConvoyRelationshipSnapshotContext(ctx, townRoot, convoys, loadConvoyTrackedIDsContext, cache.get)
+	if err != nil {
+		return nil, convoyStrandedScanError(ctx)
+	}
 	results, timedOut := lookupConvoysBounded(ctx, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
-		return getTrackedIssuesCachedWithoutWorkers(ctx, townRoot, convoy.ID, cache)
+		return snapshot[convoy.ID], ctx.Err()
 	})
 	if timedOut {
 		return nil, convoyStrandedScanError(ctx)
@@ -2097,13 +2322,17 @@ func checkCompletedConvoys(ctx context.Context, townBeads string, dryRun, quiet 
 	if err != nil {
 		return convoyCheckSummary{}, fmt.Errorf("listing convoys: %w", err)
 	}
-	cache := newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext)
+	cache := newConvoyIssueDetailsCacheContext(getConvoyIssueDetailsSnapshotContext)
+	snapshot, err := loadConvoyRelationshipSnapshotContext(ctx, townBeads, convoys, loadConvoyTrackedIDsContext, cache.get)
+	if err != nil {
+		return convoyCheckSummary{}, fmt.Errorf("loading convoy relationships: %w", err)
+	}
 	summary := checkConvoys(
 		ctx,
 		convoys,
 		dryRun,
 		func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
-			return getTrackedIssuesCachedWithoutWorkers(ctx, townBeads, convoy.ID, cache)
+			return snapshot[convoy.ID], ctx.Err()
 		},
 		func(convoy convoyListIssue, tracked []trackedIssueInfo, dryRun bool) error {
 			_, err := closeConvoyIfCompleteWithOutputContext(ctx, townBeads, convoy.ID, convoy.Title, tracked, dryRun, !quiet)
@@ -3039,6 +3268,70 @@ func getTrackedIssuesCachedWithoutWorkers(ctx context.Context, townBeads, convoy
 	return tracked, nil
 }
 
+func loadConvoyRelationshipSnapshotContext(
+	ctx context.Context,
+	townBeads string,
+	convoys []convoyListIssue,
+	loadTracked func(context.Context, string, []string) (map[string][]string, error),
+	loadDetails func(context.Context, []string) map[string]*issueDetails,
+) (map[string][]trackedIssueInfo, error) {
+	convoyIDs := make([]string, len(convoys))
+	for i, convoy := range convoys {
+		convoyIDs[i] = convoy.ID
+	}
+	edges, err := loadTracked(ctx, townBeads, convoyIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	unique := make(map[string]struct{})
+	for _, convoy := range convoys {
+		trackedIDs, ok := edges[convoy.ID]
+		if !ok {
+			return nil, fmt.Errorf("dependency snapshot missing convoy %s", convoy.ID)
+		}
+		for _, id := range trackedIDs {
+			unique[id] = struct{}{}
+		}
+	}
+	issueIDs := make([]string, 0, len(unique))
+	for id := range unique {
+		issueIDs = append(issueIDs, id)
+	}
+	sort.Strings(issueIDs)
+	details := loadDetails(ctx, issueIDs)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	snapshot := make(map[string][]trackedIssueInfo, len(convoys))
+	for _, convoy := range convoys {
+		trackedIDs := append([]string(nil), edges[convoy.ID]...)
+		sort.Strings(trackedIDs)
+		tracked := make([]trackedIssueInfo, 0, len(trackedIDs))
+		for _, id := range trackedIDs {
+			dep := trackedDependency{ID: id, DependencyType: "tracks"}
+			if detail := details[id]; detail != nil {
+				applyFreshIssueDetails(&dep, detail)
+			} else {
+				dep.Status = trackedStatusUnknown
+			}
+			tracked = append(tracked, trackedIssueInfo{
+				ID:        dep.ID,
+				Title:     dep.Title,
+				Status:    dep.Status,
+				Type:      dep.DependencyType,
+				IssueType: dep.IssueType,
+				Blocked:   dep.Blocked,
+				Assignee:  dep.Assignee,
+				Labels:    dep.Labels,
+			})
+		}
+		snapshot[convoy.ID] = tracked
+	}
+	return snapshot, nil
+}
+
 // bdDepListTracked runs `bd dep list <convoyID> --direction=down --type=tracks --json`
 // and returns the tracked issue IDs (unwrapped from external: prefixes).
 // Uses --allow-stale for consistency with sling's other bd calls (verifyBeadExists,
@@ -3153,6 +3446,23 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 
 func getIssueDetailsBatchContext(ctx context.Context, issueIDs []string) map[string]*issueDetails {
 	return getIssueDetailsBatchWithClientContext(ctx, convoyIssueClient(), issueIDs)
+}
+
+// getConvoyIssueDetailsSnapshotContext performs one fresh routed batch without
+// retrying unresolved IDs; missing rows remain unknown in the command snapshot.
+func getConvoyIssueDetailsSnapshotContext(ctx context.Context, issueIDs []string) map[string]*issueDetails {
+	result := make(map[string]*issueDetails, len(issueIDs))
+	client := convoyIssueClient()
+	if client == nil || len(issueIDs) == 0 {
+		return result
+	}
+	issues, _ := client.ShowMultipleContext(ctx, issueIDs)
+	for id, issue := range issues {
+		if details := issueToDetails(issue); details != nil {
+			result[id] = details
+		}
+	}
+	return result
 }
 
 func getIssueDetailsBatchWithClientContext(ctx context.Context, client *beads.Beads, issueIDs []string) map[string]*issueDetails {
