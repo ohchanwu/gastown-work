@@ -3,9 +3,12 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -148,6 +151,68 @@ func summarizeDoltInventory(inventory []doltserver.LocalDoltServer) (actionable,
 
 func formatDoltInventoryLine(server doltserver.LocalDoltServer) string {
 	return fmt.Sprintf("PID %d port %d (%s)", server.PID, server.Port, server.Class)
+}
+
+func renderLocalDoltInventory(out io.Writer, supported bool, inventory func() ([]doltserver.LocalDoltServer, error)) error {
+	fmt.Fprintln(out, "\nLocal Dolt listeners:")
+	if !supported {
+		fmt.Fprintln(out, "  unsupported on this platform")
+		return nil
+	}
+	servers, err := inventory()
+	if err != nil {
+		fmt.Fprintln(out, "  local listener inventory failed")
+		return fmt.Errorf("local listener inventory failed: %w", err)
+	}
+	sort.Slice(servers, func(i, j int) bool {
+		if servers[i].Class != servers[j].Class {
+			return servers[i].Class < servers[j].Class
+		}
+		if servers[i].Port != servers[j].Port {
+			return servers[i].Port < servers[j].Port
+		}
+		return servers[i].PID < servers[j].PID
+	})
+	counts := map[doltserver.DoltServerClass]int{}
+	for _, server := range servers {
+		counts[server.Class]++
+		fmt.Fprintf(out, "  %s\n", formatDoltInventoryLine(server))
+	}
+	fmt.Fprintf(out, "  Totals: canonical=%d configured-port-imposter=%d owned-town-leak=%d owned-test-leak=%d unknown=%d\n",
+		counts[doltserver.DoltServerCanonical], counts[doltserver.DoltServerConfiguredPortImposter],
+		counts[doltserver.DoltServerOwnedTownLeak], counts[doltserver.DoltServerOwnedTestLeak], counts[doltserver.DoltServerUnknown])
+	if counts[doltserver.DoltServerOwnedTestLeak] > 0 {
+		fmt.Fprintln(out, "Preview exact test-leak cleanup: gt dolt cleanup-test-leaks")
+	}
+	return nil
+}
+
+func inspectDoltCleanupListeners(out io.Writer, inventory func() ([]doltserver.LocalDoltServer, error)) ([]doltserver.LocalDoltServer, error) {
+	servers, err := inventory()
+	if err != nil {
+		fmt.Fprintln(out, "local listener inventory failed")
+		return nil, fmt.Errorf("local listener inventory failed: %w", err)
+	}
+	return servers, nil
+}
+
+func renderDoltCleanupProcessScope(out io.Writer, inventory []doltserver.LocalDoltServer) {
+	fmt.Fprintln(out, "Process cleanup was not performed.")
+	testLeaks := 0
+	for _, server := range inventory {
+		if server.Class == doltserver.DoltServerOwnedTestLeak {
+			testLeaks++
+		}
+	}
+	if testLeaks > 0 {
+		fmt.Fprintf(out, "%d positively test-owned Dolt listener leak(s) found.\n", testLeaks)
+		fmt.Fprintln(out, "Preview exact test-leak cleanup: gt dolt cleanup-test-leaks")
+	}
+}
+
+func renderNoOrphanedTestDatabases(out io.Writer, inventory []doltserver.LocalDoltServer) {
+	fmt.Fprintln(out, "No orphaned test databases found.")
+	renderDoltCleanupProcessScope(out, inventory)
 }
 
 func writeTestLeakPreview(path string, selections []doltserver.TestLeakSelection) error {
@@ -596,7 +661,12 @@ func runDoltCleanupTestLeaks(cmd *cobra.Command, args []string) error {
 
 	receiptPath := filepath.Join(townRoot, ".runtime", "dolt-test-leaks-preview.json")
 	if !doltCleanupTestLeaksApply {
-		inventory := doltserver.InventoryLocalDoltServers(townRoot)
+		inventory, err := inspectDoltCleanupListeners(os.Stdout, func() ([]doltserver.LocalDoltServer, error) {
+			return doltserver.InventoryLocalDoltServersWithError(townRoot)
+		})
+		if err != nil {
+			return err
+		}
 		selected := doltserver.TestLeakSelections(inventory)
 		for _, server := range inventory {
 			if server.Class == doltserver.DoltServerOwnedTestLeak {
@@ -796,7 +866,9 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 					style.Bold.Render("SERVER IS READ-ONLY — contact the remote server admin"))
 			}
 		}
-		return nil
+		return renderLocalDoltInventory(os.Stdout, runtime.GOOS != "windows", func() ([]doltserver.LocalDoltServer, error) {
+			return doltserver.InventoryLocalDoltServersWithError(townRoot)
+		})
 	}
 
 	if running {
@@ -895,7 +967,9 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	return nil
+	return renderLocalDoltInventory(os.Stdout, runtime.GOOS != "windows", func() ([]doltserver.LocalDoltServer, error) {
+		return doltserver.InventoryLocalDoltServersWithError(townRoot)
+	})
 }
 
 type beadsRuntimeConfig struct {
@@ -1266,6 +1340,12 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
+	inventory, err := inspectDoltCleanupListeners(os.Stdout, func() ([]doltserver.LocalDoltServer, error) {
+		return doltserver.InventoryLocalDoltServersWithError(townRoot)
+	})
+	if err != nil {
+		return err
+	}
 
 	orphans, err := doltserver.FindOrphanedDatabases(townRoot)
 	if err != nil {
@@ -1273,7 +1353,7 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(orphans) == 0 {
-		fmt.Printf("%s No orphaned databases found in .dolt-data/\n", style.Bold.Render("✓"))
+		renderNoOrphanedTestDatabases(os.Stdout, inventory)
 		return nil
 	}
 
@@ -1285,6 +1365,7 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 
 	if doltCleanupDry {
 		fmt.Println("\nDry run: no changes made.")
+		renderDoltCleanupProcessScope(os.Stdout, inventory)
 		return nil
 	}
 
@@ -1357,6 +1438,7 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("\n%s Removed %d/%d orphaned database(s)\n",
 		style.Bold.Render("✓"), removed, len(orphans))
+	renderDoltCleanupProcessScope(os.Stdout, inventory)
 
 	return nil
 }

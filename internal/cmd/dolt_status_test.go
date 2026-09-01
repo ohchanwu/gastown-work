@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,73 @@ import (
 	gtconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 )
+
+func TestRenderLocalDoltInventoryReportsAllClassesWithoutCustodySecrets(t *testing.T) {
+	secretPath := "/private/test-owner/path"
+	secretToken := strings.Repeat("ab", 32)
+	inventory := []doltserver.LocalDoltServer{
+		{DoltListener: doltserver.DoltListener{PID: 50, Port: 4505}, Class: doltserver.DoltServerUnknown, OwnerPath: secretPath, ProcessToken: secretToken},
+		{DoltListener: doltserver.DoltListener{PID: 20, Port: 4502}, Class: doltserver.DoltServerOwnedTestLeak, OwnerPath: secretPath, ProcessToken: secretToken},
+		{DoltListener: doltserver.DoltListener{PID: 10, Port: 4501}, Class: doltserver.DoltServerCanonical, OwnerPath: secretPath, ProcessToken: secretToken},
+		{DoltListener: doltserver.DoltListener{PID: 40, Port: 4504}, Class: doltserver.DoltServerOwnedTownLeak, OwnerPath: secretPath, ProcessToken: secretToken},
+		{DoltListener: doltserver.DoltListener{PID: 30, Port: 4503}, Class: doltserver.DoltServerConfiguredPortImposter, OwnerPath: secretPath, ProcessToken: secretToken},
+	}
+	var out bytes.Buffer
+
+	err := renderLocalDoltInventory(&out, true, func() ([]doltserver.LocalDoltServer, error) {
+		return inventory, nil
+	})
+	if err != nil {
+		t.Fatalf("renderLocalDoltInventory: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Local Dolt listeners:",
+		"PID 10 port 4501 (canonical)",
+		"PID 30 port 4503 (configured-port-imposter)",
+		"PID 40 port 4504 (owned-town-leak)",
+		"PID 20 port 4502 (owned-test-leak)",
+		"PID 50 port 4505 (unknown)",
+		"Totals: canonical=1 configured-port-imposter=1 owned-town-leak=1 owned-test-leak=1 unknown=1",
+		"Preview exact test-leak cleanup: gt dolt cleanup-test-leaks",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("inventory output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, secretPath) || strings.Contains(got, secretToken) {
+		t.Fatalf("inventory output exposed private custody:\n%s", got)
+	}
+	if canonical, configured := strings.Index(got, "(canonical)"), strings.Index(got, "(configured-port-imposter)"); canonical < 0 || configured < canonical {
+		t.Fatalf("inventory output was not sorted by class:\n%s", got)
+	}
+}
+
+func TestRenderLocalDoltInventoryFailsClosedOnDiscoveryError(t *testing.T) {
+	want := errors.New("lsof unavailable")
+	var out bytes.Buffer
+	err := renderLocalDoltInventory(&out, true, func() ([]doltserver.LocalDoltServer, error) {
+		return nil, want
+	})
+	if !errors.Is(err, want) || !strings.Contains(out.String(), "local listener inventory failed") {
+		t.Fatalf("output = %q, error = %v, want explicit failure preserving %v", out.String(), err, want)
+	}
+}
+
+func TestRenderLocalDoltInventoryReportsUnsupportedWithoutClaimingClean(t *testing.T) {
+	var out bytes.Buffer
+	err := renderLocalDoltInventory(&out, false, func() ([]doltserver.LocalDoltServer, error) {
+		t.Fatal("unsupported platform called inventory")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("renderLocalDoltInventory: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "unsupported") || strings.Contains(got, "none") || strings.Contains(got, "clean") {
+		t.Fatalf("unsupported output made a false clean claim: %q", got)
+	}
+}
 
 func TestReadBeadsRuntimeConfigServerMetadata(t *testing.T) {
 	townRoot := t.TempDir()

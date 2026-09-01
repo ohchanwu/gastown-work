@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +10,52 @@ import (
 
 	"github.com/steveyegge/gastown/internal/doltserver"
 )
+
+func TestInspectDoltCleanupListenersFailsWithoutCleanClaim(t *testing.T) {
+	want := errors.New("listener discovery failed")
+	var out bytes.Buffer
+	inventory, err := inspectDoltCleanupListeners(&out, func() ([]doltserver.LocalDoltServer, error) {
+		return nil, want
+	})
+	if !errors.Is(err, want) || inventory != nil {
+		t.Fatalf("inventory = %v, error = %v, want nil and %v", inventory, err, want)
+	}
+	got := out.String()
+	if !strings.Contains(got, "local listener inventory failed") || strings.Contains(got, "No orphaned") || strings.Contains(got, "clean") {
+		t.Fatalf("inventory failure output made a false clean claim: %q", got)
+	}
+}
+
+func TestRenderNoOrphanedTestDatabasesStatesDatabaseOnlyScope(t *testing.T) {
+	var out bytes.Buffer
+	renderNoOrphanedTestDatabases(&out, nil)
+	got := out.String()
+	for _, want := range []string{"No orphaned test databases found.", "Process cleanup was not performed."} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("cleanup output missing %q: %q", want, got)
+		}
+	}
+}
+
+func TestRenderDoltCleanupProcessScopePointsToExactTestLeakPreview(t *testing.T) {
+	inventory := []doltserver.LocalDoltServer{
+		{Class: doltserver.DoltServerOwnedTestLeak},
+		{Class: doltserver.DoltServerOwnedTestLeak},
+		{Class: doltserver.DoltServerUnknown},
+	}
+	var out bytes.Buffer
+	renderDoltCleanupProcessScope(&out, inventory)
+	got := out.String()
+	for _, want := range []string{
+		"Process cleanup was not performed.",
+		"2 positively test-owned Dolt listener leak(s) found.",
+		"Preview exact test-leak cleanup: gt dolt cleanup-test-leaks",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("cleanup output missing %q: %q", want, got)
+		}
+	}
+}
 
 func TestSummarizeDoltInventoryUsesActionableClassification(t *testing.T) {
 	inventory := []doltserver.LocalDoltServer{
