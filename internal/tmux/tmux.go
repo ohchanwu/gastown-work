@@ -2993,18 +2993,22 @@ func (t *Tmux) ListSessions() ([]string, error) {
 
 	var sessions []string
 	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
+		line = normalizeSessionListLine(line)
 		if line == "" {
 			continue
-		}
-		// psmux ignores -F format and returns "name: N windows (created ...)"
-		// Extract just the session name before the colon.
-		if idx := strings.Index(line, ": "); idx > 0 {
-			line = line[:idx]
 		}
 		sessions = append(sessions, line)
 	}
 	return sessions, nil
+}
+
+func normalizeSessionListLine(line string) string {
+	line = strings.TrimSpace(line)
+	// psmux ignores -F format and returns "name: N windows (created ...)".
+	if idx := strings.Index(line, ": "); idx > 0 {
+		return line[:idx]
+	}
+	return line
 }
 
 // SessionSet provides O(1) session existence checks by caching session names.
@@ -3061,6 +3065,7 @@ func (t *Tmux) GetSessionSetContext(ctx context.Context) (*SessionSet, error) {
 			line = out
 			out = ""
 		}
+		line = normalizeSessionListLine(line)
 		if line != "" {
 			set.sessions[line] = struct{}{}
 		}

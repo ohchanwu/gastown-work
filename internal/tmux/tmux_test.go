@@ -2899,6 +2899,25 @@ func TestGetSessionSetContextCancels(t *testing.T) {
 	}
 }
 
+func TestGetSessionSetContextNormalizesPsmuxListOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	bin := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s\\n' 'gastown-capable: 1 windows (created today)'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envPinnedTmuxBinary, bin)
+
+	set, err := NewTmux().GetSessionSetContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !set.Has("gastown-capable") {
+		t.Fatal("decorated live psmux session was not normalized")
+	}
+}
+
 func TestCleanupOrphanedSessions(t *testing.T) {
 	// newTestTmux creates an isolated tmux server (unique socket per test).
 	// CleanupOrphanedSessions operates on the Tmux receiver which carries that
