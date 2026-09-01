@@ -231,14 +231,17 @@ func TestRunPatrolScanPhaseZeroIntervalSkipsProgressTicks(t *testing.T) {
 
 func TestPatrolScanZombieItemSerialization(t *testing.T) {
 	item := PatrolScanZombieItem{
-		Polecat:        "obsidian",
-		Classification: "agent-dead-in-session",
-		AgentState:     "working",
-		HookBead:       "gas-xyz",
-		CleanupStatus:  "has_uncommitted",
-		Action:         "restarted-dirty (cleanup_status=has_uncommitted, wisp=gas-wisp-123)",
-		WasActive:      true,
-		Error:          "restart failed: tmux error",
+		Polecat:           "obsidian",
+		Classification:    "agent-dead-in-session",
+		AgentState:        "working",
+		HookBead:          "gas-xyz",
+		CleanupStatus:     "has_uncommitted",
+		Action:            "restarted-dirty (cleanup_status=has_uncommitted, wisp=gas-wisp-123)",
+		WasActive:         true,
+		RecoveryVerdict:   "SAFE_TO_NUKE",
+		RecoveryBlockers:  []string{"none"},
+		MutationPerformed: true,
+		Error:             "restart failed: tmux error",
 	}
 
 	data, err := json.Marshal(item)
@@ -259,5 +262,8 @@ func TestPatrolScanZombieItemSerialization(t *testing.T) {
 	}
 	if parsed.Error != "restart failed: tmux error" {
 		t.Errorf("Error = %q, want %q", parsed.Error, "restart failed: tmux error")
+	}
+	if parsed.RecoveryVerdict != "SAFE_TO_NUKE" || !parsed.MutationPerformed {
+		t.Errorf("recovery receipt = (%q, %v)", parsed.RecoveryVerdict, parsed.MutationPerformed)
 	}
 }

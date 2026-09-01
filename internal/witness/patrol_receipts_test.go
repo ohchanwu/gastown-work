@@ -54,6 +54,28 @@ func TestBuildPatrolReceipt_ErrorIncludedInEvidence(t *testing.T) {
 	}
 }
 
+func TestBuildPatrolReceipt_RecoveryHoldEvidence(t *testing.T) {
+	t.Parallel()
+	receipt := BuildPatrolReceipt("gastown", ZombieResult{
+		PolecatName:       "nux",
+		Classification:    ZombieStuckInDone,
+		Action:            "preserved-recovery-hold",
+		RecoveryVerdict:   "NEEDS_RECOVERY",
+		RecoveryBlockers:  []string{"dirty-worktree"},
+		MutationPerformed: false,
+	})
+
+	if receipt.Evidence.RecoveryVerdict != "NEEDS_RECOVERY" {
+		t.Fatalf("RecoveryVerdict = %q", receipt.Evidence.RecoveryVerdict)
+	}
+	if len(receipt.Evidence.RecoveryBlockers) != 1 || receipt.Evidence.RecoveryBlockers[0] != "dirty-worktree" {
+		t.Fatalf("RecoveryBlockers = %v", receipt.Evidence.RecoveryBlockers)
+	}
+	if receipt.Evidence.MutationPerformed {
+		t.Fatal("preserved hold receipt reported a mutation")
+	}
+}
+
 func TestReceiptVerdictForZombie_AllStates(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

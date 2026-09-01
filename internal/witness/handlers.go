@@ -1853,15 +1853,156 @@ func (c ZombieClassification) ImpliesActiveWork() bool {
 
 // ZombieResult describes a detected zombie polecat and the action taken.
 type ZombieResult struct {
-	PolecatName    string
-	AgentState     string               // Real agent state from DB (e.g., "working", "idle")
-	Classification ZombieClassification // Why this polecat is classified as a zombie (gt-tsut)
-	HookBead       string
-	CleanupStatus  string // Observed cleanup_status (ZFC: report data, agent decides policy)
-	WasActive      bool   // true if evidence of recent work (active state or hooked bead)
-	Action         string // "restarted", "escalated", "cleanup-wisp-created", "auto-nuked" (explicit nuke only)
-	BeadRecovered  bool   // true if hooked bead was reset to open for re-dispatch
-	Error          error
+	PolecatName       string
+	AgentState        string               // Real agent state from DB (e.g., "working", "idle")
+	Classification    ZombieClassification // Why this polecat is classified as a zombie (gt-tsut)
+	HookBead          string
+	CleanupStatus     string // Observed cleanup_status (ZFC: report data, agent decides policy)
+	WasActive         bool   // true if evidence of recent work (active state or hooked bead)
+	Action            string // "restarted", "escalated", "cleanup-wisp-created", "auto-nuked" (explicit nuke only)
+	BeadRecovered     bool   // true if hooked bead was reset to open for re-dispatch
+	RecoveryVerdict   string
+	RecoveryBlockers  []string
+	MutationPerformed bool
+	Error             error
+}
+
+type zombieMutationGuardOps struct {
+	recovery        func() (polecat.WorkstateDisposition, error)
+	currentSnapshot func() (*agentBeadSnapshot, error)
+	currentSession  func() (tmux.SessionGeneration, bool, error)
+	stillZombie     func(*agentBeadSnapshot) (bool, error)
+	mutate          func(*ZombieResult, *agentBeadSnapshot) (bool, error)
+}
+
+// guardZombieMutation is the final fail-closed gate before Witness changes a
+// polecat lifecycle. The recovery decision is advisory until the same agent and
+// tmux generations are revalidated immediately before mutation.
+func guardZombieMutation(expectedIncarnation string, expectedSession tmux.SessionGeneration, expectedSessionAlive bool, zombie ZombieResult, ops zombieMutationGuardOps) (ZombieResult, bool) {
+	if strings.TrimSpace(expectedIncarnation) == "" {
+		zombie.Action = "preserved-custody-error"
+		zombie.Error = errors.New("missing initial incarnation")
+		return zombie, true
+	}
+
+	disposition, err := ops.recovery()
+	zombie.RecoveryVerdict = disposition.Verdict
+	zombie.RecoveryBlockers = append([]string(nil), disposition.Blockers...)
+	if err != nil {
+		zombie.Action = "preserved-recovery-check-error"
+		zombie.Error = fmt.Errorf("checking recovery disposition: %w", err)
+		return zombie, true
+	}
+	if strings.TrimSpace(disposition.Verdict) == "" {
+		zombie.Action = "preserved-recovery-check-error"
+		zombie.Error = errors.New("empty recovery verdict")
+		return zombie, true
+	}
+	if disposition.NeedsRecovery || !disposition.SafeToNuke {
+		zombie.Action = "preserved-recovery-hold"
+		return zombie, true
+	}
+
+	current, err := ops.currentSnapshot()
+	if err != nil || current == nil || current.Fields == nil {
+		zombie.Action = "preserved-custody-error"
+		if err == nil {
+			err = errors.New("current agent snapshot is incomplete")
+		}
+		zombie.Error = fmt.Errorf("revalidating agent generation: %w", err)
+		return zombie, true
+	}
+	if current.Fields.Incarnation != expectedIncarnation {
+		zombie.Action = "preserved-custody-drift"
+		zombie.Error = fmt.Errorf("agent incarnation changed from %q to %q", expectedIncarnation, current.Fields.Incarnation)
+		return zombie, true
+	}
+	zombie.AgentState = current.AgentState
+	zombie.HookBead = current.HookBead
+
+	stillZombie, err := ops.stillZombie(current)
+	if err != nil {
+		zombie.Action = "preserved-custody-error"
+		zombie.Error = fmt.Errorf("revalidating zombie classification: %w", err)
+		return zombie, true
+	}
+	if !stillZombie {
+		return ZombieResult{}, false
+	}
+
+	currentSession, currentSessionAlive, err := ops.currentSession()
+	if err != nil {
+		zombie.Action = "preserved-custody-error"
+		zombie.Error = fmt.Errorf("revalidating session generation: %w", err)
+		return zombie, true
+	}
+	if currentSessionAlive != expectedSessionAlive {
+		zombie.Action = "preserved-custody-drift"
+		zombie.Error = errors.New("session liveness changed")
+		return zombie, true
+	}
+	if expectedSessionAlive && !currentSession.Equal(expectedSession) {
+		zombie.Action = "preserved-custody-drift"
+		zombie.Error = errors.New("session generation changed")
+		return zombie, true
+	}
+
+	performed, err := ops.mutate(&zombie, current)
+	zombie.MutationPerformed = performed
+	if err != nil {
+		zombie.Error = err
+	}
+	return zombie, true
+}
+
+func guardedZombieMutation(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, snap *agentBeadSnapshot, zombie ZombieResult, stillZombie func(*agentBeadSnapshot) (bool, error), mutate func(*ZombieResult, *agentBeadSnapshot) (bool, error)) (ZombieResult, bool) {
+	expectedSession, expectedSessionAlive, err := captureZombieSession(t, sessionName)
+	if err != nil {
+		zombie.Action = "preserved-custody-error"
+		zombie.Error = fmt.Errorf("capturing initial session generation: %w", err)
+		return zombie, true
+	}
+	expectedIncarnation := ""
+	if snap != nil && snap.Fields != nil {
+		expectedIncarnation = snap.Fields.Incarnation
+	}
+	r := &rig.Rig{Name: rigName, Path: filepath.Join(townRoot, rigName)}
+	clonePath := filepath.Join(r.Path, "polecats", polecatName, rigName)
+	mgr := polecat.NewManager(r, git.NewGit(clonePath), t)
+	agentBeadID := beads.PolecatBeadIDWithPrefix(beads.GetPrefixForRig(townRoot, rigName), rigName, polecatName)
+
+	return guardZombieMutation(expectedIncarnation, expectedSession, expectedSessionAlive, zombie, zombieMutationGuardOps{
+		recovery: func() (polecat.WorkstateDisposition, error) {
+			current, err := mgr.Get(polecatName)
+			if err != nil {
+				return polecat.WorkstateDisposition{}, fmt.Errorf("reading polecat workstate: %w", err)
+			}
+			return mgr.WorkstateDispositionForPolecat(polecatName, current.State, current.Issue), nil
+		},
+		currentSnapshot: func() (*agentBeadSnapshot, error) {
+			return fetchAgentBeadSnapshotChecked(bd, workDir, agentBeadID)
+		},
+		currentSession: func() (tmux.SessionGeneration, bool, error) {
+			return captureZombieSession(t, sessionName)
+		},
+		stillZombie: stillZombie,
+		mutate:      mutate,
+	})
+}
+
+func captureZombieSession(t *tmux.Tmux, sessionName string) (tmux.SessionGeneration, bool, error) {
+	alive, err := t.HasSession(sessionName)
+	if err != nil {
+		return tmux.SessionGeneration{}, false, err
+	}
+	if !alive {
+		return tmux.SessionGeneration{}, false, nil
+	}
+	generation, err := t.CaptureSessionGeneration(sessionName)
+	if err != nil {
+		return tmux.SessionGeneration{}, false, err
+	}
+	return generation, true, nil
 }
 
 // DetectZombiePolecatsResult contains the results of a zombie detection sweep.
@@ -2058,16 +2199,18 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted-stuck-session (done-intent age=%v)", time.Since(doneIntent.Timestamp).Round(time.Second)),
 		}
-		// TOCTOU guard (gt-0pst): Re-check session liveness before restarting.
-		// The session could have exited normally between our initial check and here.
-		if alive, _ := t.HasSession(sessionName); !alive {
-			return ZombieResult{}, false
-		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
-			zombie.Error = err
-			zombie.Action = fmt.Sprintf("restart-stuck-session-failed: %v", err)
-		}
-		return zombie, true
+		return guardedZombieMutation(bd, workDir, townRoot, rigName, polecatName, sessionName, t, snap, zombie,
+			func(current *agentBeadSnapshot) (bool, error) {
+				intent := extractDoneIntent(current.Labels)
+				return intent != nil && time.Since(intent.Timestamp) > witCfg.DoneIntentStuckTimeoutD(), nil
+			},
+			func(current *ZombieResult, _ *agentBeadSnapshot) (bool, error) {
+				err := RestartPolecatSession(workDir, rigName, polecatName)
+				if err != nil {
+					current.Action = fmt.Sprintf("restart-stuck-session-failed: %v", err)
+				}
+				return true, err
+			})
 	}
 
 	// Tmux alive but agent process dead (gt-kj6r6).
@@ -2081,16 +2224,15 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         "restarted-agent-dead-session",
 		}
-		// TOCTOU guard (gt-0pst): Re-check session liveness before restarting.
-		// The session could have exited normally between our initial check and here.
-		if alive, _ := t.HasSession(sessionName); !alive {
-			return ZombieResult{}, false
-		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
-			zombie.Error = err
-			zombie.Action = fmt.Sprintf("restart-agent-dead-session-failed: %v", err)
-		}
-		return zombie, true
+		return guardedZombieMutation(bd, workDir, townRoot, rigName, polecatName, sessionName, t, snap, zombie,
+			func(*agentBeadSnapshot) (bool, error) { return !t.IsAgentAlive(sessionName), nil },
+			func(current *ZombieResult, _ *agentBeadSnapshot) (bool, error) {
+				err := RestartPolecatSession(workDir, rigName, polecatName)
+				if err != nil {
+					current.Action = fmt.Sprintf("restart-agent-dead-session-failed: %v", err)
+				}
+				return true, err
+			})
 	}
 
 	// Agent alive but hooked bead closed — occupying slot without work (gt-h1l6i).
@@ -2105,16 +2247,24 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         "restarted-bead-closed-polecat",
 		}
-		// TOCTOU guard (gt-0pst): Re-check session liveness before restarting.
-		// The session could have exited normally between our initial check and here.
-		if alive, _ := t.HasSession(sessionName); !alive {
-			return ZombieResult{}, false
-		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
-			zombie.Error = err
-			zombie.Action = fmt.Sprintf("restart-bead-closed-failed: %v", err)
-		}
-		return zombie, true
+		return guardedZombieMutation(bd, workDir, townRoot, rigName, polecatName, sessionName, t, snap, zombie,
+			func(current *agentBeadSnapshot) (bool, error) {
+				if current.HookBead == "" {
+					return false, nil
+				}
+				status, ok := getBeadStatus(bd, workDir, current.HookBead)
+				if !ok {
+					return false, errors.New("hooked bead lookup failed")
+				}
+				return status == "closed", nil
+			},
+			func(current *ZombieResult, _ *agentBeadSnapshot) (bool, error) {
+				err := RestartPolecatSession(workDir, rigName, polecatName)
+				if err != nil {
+					current.Action = fmt.Sprintf("restart-bead-closed-failed: %v", err)
+				}
+				return true, err
+			})
 	}
 
 	// GH#3055: gt done can successfully submit work and leave cleanup_status=clean,
@@ -2292,11 +2442,18 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted (done-intent age=%v, type=%s)", age.Round(time.Second), doneIntent.ExitType),
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
-			zombie.Error = err
-			zombie.Action = fmt.Sprintf("restart-failed (done-intent): %v", err)
-		}
-		return zombie, true
+		return guardedZombieMutation(bd, workDir, townRoot, rigName, polecatName, sessionName, t, snap, zombie,
+			func(current *agentBeadSnapshot) (bool, error) {
+				intent := extractDoneIntent(current.Labels)
+				return intent != nil && time.Since(intent.Timestamp) >= witCfg.DoneIntentRecentGraceD(), nil
+			},
+			func(current *ZombieResult, _ *agentBeadSnapshot) (bool, error) {
+				err := RestartPolecatSession(workDir, rigName, polecatName)
+				if err != nil {
+					current.Action = fmt.Sprintf("restart-failed (done-intent): %v", err)
+				}
+				return true, err
+			})
 	}
 
 	// Standard zombie detection: active state or hooked bead with dead session.
@@ -2356,10 +2513,30 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 	}
 
 	// gt-dsgp: Restart instead of nuking. For dirty state, escalate AND restart.
-	// gt-2gra: Use snapshot's cleanup status instead of calling getCleanupStatus.
-	cleanupStatus := snap.cleanupStatus()
-	handleZombieRestart(bd, workDir, rigName, polecatName, snapHook, cleanupStatus, &zombie)
-	return zombie, true
+	return guardedZombieMutation(bd, workDir, townRoot, rigName, polecatName, sessionName, t, snap, zombie,
+		func(current *agentBeadSnapshot) (bool, error) {
+			state := beads.AgentState(current.AgentState)
+			if !isZombieState(state, current.HookBead) || state == beads.AgentStateDone || state == beads.AgentStateNuked {
+				return false, nil
+			}
+			if state == beads.AgentStateSpawning && current.age() < SpawnGracePeriod {
+				return false, nil
+			}
+			if current.HookBead != "" {
+				status, ok := getBeadStatus(bd, workDir, current.HookBead)
+				if !ok {
+					return false, errors.New("hooked bead lookup failed")
+				}
+				if status == "closed" || status == "" {
+					return false, nil
+				}
+			}
+			return true, nil
+		},
+		func(current *ZombieResult, currentSnapshot *agentBeadSnapshot) (bool, error) {
+			handleZombieRestart(bd, workDir, rigName, polecatName, currentSnapshot.HookBead, currentSnapshot.cleanupStatus(), current)
+			return current.MutationPerformed, current.Error
+		})
 }
 
 // isZombieState returns true if the agent state or hook bead indicates a zombie.
@@ -2395,6 +2572,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	// Instead archive the polecat — its work is done.
 	if merged, err := verifyBranchAlreadyMerged(workDir, rigName, polecatName); err == nil && merged {
 		zombie.Action = "archived-work-already-merged (aa-apw)"
+		zombie.MutationPerformed = true
 		if nukeErr := NukePolecat(bd, workDir, rigName, polecatName); nukeErr != nil {
 			zombie.Error = fmt.Errorf("archive: %w", nukeErr)
 			zombie.Action = fmt.Sprintf("archive-failed-work-already-merged: %v", nukeErr)
@@ -2410,6 +2588,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 			zombie.Action = fmt.Sprintf("cleanup-deferred-acp (cleanup_status=%s, existing-wisp=%s)", cleanupStatus, existingWisp)
 			return
 		}
+		zombie.MutationPerformed = true
 		wispID, wispErr := createCleanupWisp(bd, workDir, polecatName, hookBead, "")
 		if wispErr != nil {
 			zombie.Error = wispErr
@@ -2437,6 +2616,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 		// No existing wisp — create one as the atomic interlock (gt-7vs1).
 		// Previous code checked then created, allowing two concurrent patrols to
 		// both see "no wisp" and create duplicates. Now we create first, then dedup.
+		zombie.MutationPerformed = true
 		wispID, wispErr := createCleanupWisp(bd, workDir, polecatName, hookBead, "")
 		if wispErr != nil {
 			zombie.Error = fmt.Errorf("cleanup wisp: %w", wispErr)
@@ -2474,6 +2654,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	}
 
 	// Restart regardless of cleanup state — the worktree is preserved.
+	zombie.MutationPerformed = true
 	if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
 		if zombie.Error == nil {
 			zombie.Error = fmt.Errorf("restart: %w", err)
@@ -2847,9 +3028,17 @@ type agentBeadSnapshot struct {
 // fetchAgentBeadSnapshot fetches all agent bead data in a single bd show call.
 // Returns nil if the bead doesn't exist or can't be queried.
 func fetchAgentBeadSnapshot(bd *BdCli, workDir, agentBeadID string) *agentBeadSnapshot {
+	snapshot, _ := fetchAgentBeadSnapshotChecked(bd, workDir, agentBeadID)
+	return snapshot
+}
+
+func fetchAgentBeadSnapshotChecked(bd *BdCli, workDir, agentBeadID string) (*agentBeadSnapshot, error) {
 	output, err := bd.Exec(workDir, "show", agentBeadID, "--json")
-	if err != nil || output == "" {
-		return nil
+	if err != nil {
+		return nil, err
+	}
+	if output == "" {
+		return nil, errors.New("empty agent bead response")
 	}
 
 	var issues []struct {
@@ -2860,8 +3049,11 @@ func fetchAgentBeadSnapshot(bd *BdCli, workDir, agentBeadID string) *agentBeadSn
 		ActiveMR    string   `json:"active_mr"`
 		Description string   `json:"description"`
 	}
-	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
-		return nil
+	if err := json.Unmarshal([]byte(output), &issues); err != nil {
+		return nil, fmt.Errorf("decoding agent bead: %w", err)
+	}
+	if len(issues) == 0 {
+		return nil, errors.New("agent bead not found")
 	}
 
 	return &agentBeadSnapshot{
@@ -2871,7 +3063,7 @@ func fetchAgentBeadSnapshot(bd *BdCli, workDir, agentBeadID string) *agentBeadSn
 		UpdatedAt:  issues[0].UpdatedAt,
 		ActiveMR:   issues[0].ActiveMR,
 		Fields:     beads.ParseAgentFields(issues[0].Description),
-	}
+	}, nil
 }
 
 // snapshotAge returns the time since the agent bead was last updated.

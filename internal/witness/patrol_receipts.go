@@ -12,11 +12,14 @@ const (
 
 // PatrolReceiptEvidence captures the primary evidence fields for a verdict.
 type PatrolReceiptEvidence struct {
-	AgentState     string               `json:"agent_state,omitempty"`
-	Classification ZombieClassification `json:"classification,omitempty"` // Typed zombie reason (gt-tsut)
-	HookBead       string               `json:"hook_bead,omitempty"`
-	BeadRecovered  bool                 `json:"bead_recovered"`
-	Error          string               `json:"error,omitempty"`
+	AgentState        string               `json:"agent_state,omitempty"`
+	Classification    ZombieClassification `json:"classification,omitempty"` // Typed zombie reason (gt-tsut)
+	HookBead          string               `json:"hook_bead,omitempty"`
+	BeadRecovered     bool                 `json:"bead_recovered"`
+	RecoveryVerdict   string               `json:"recovery_verdict,omitempty"`
+	RecoveryBlockers  []string             `json:"recovery_blockers,omitempty"`
+	MutationPerformed bool                 `json:"mutation_performed"`
+	Error             string               `json:"error,omitempty"`
 }
 
 // PatrolReceipt is a machine-readable witness patrol verdict with recommended action.
@@ -58,10 +61,13 @@ func BuildPatrolReceipt(rigName string, z ZombieResult) PatrolReceipt {
 		Verdict:           receiptVerdictForZombie(z),
 		RecommendedAction: action,
 		Evidence: PatrolReceiptEvidence{
-			AgentState:     z.AgentState,
-			Classification: z.Classification,
-			HookBead:       z.HookBead,
-			BeadRecovered:  z.BeadRecovered,
+			AgentState:        z.AgentState,
+			Classification:    z.Classification,
+			HookBead:          z.HookBead,
+			BeadRecovered:     z.BeadRecovered,
+			RecoveryVerdict:   z.RecoveryVerdict,
+			RecoveryBlockers:  append([]string(nil), z.RecoveryBlockers...),
+			MutationPerformed: z.MutationPerformed,
 		},
 	}
 

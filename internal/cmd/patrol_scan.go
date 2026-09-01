@@ -109,14 +109,17 @@ type PatrolScanZombieOutput struct {
 
 // PatrolScanZombieItem is a single zombie detection in scan output.
 type PatrolScanZombieItem struct {
-	Polecat        string `json:"polecat"`
-	Classification string `json:"classification"`
-	AgentState     string `json:"agent_state"`
-	HookBead       string `json:"hook_bead,omitempty"`
-	CleanupStatus  string `json:"cleanup_status,omitempty"`
-	Action         string `json:"action"`
-	WasActive      bool   `json:"was_active"`
-	Error          string `json:"error,omitempty"`
+	Polecat           string   `json:"polecat"`
+	Classification    string   `json:"classification"`
+	AgentState        string   `json:"agent_state"`
+	HookBead          string   `json:"hook_bead,omitempty"`
+	CleanupStatus     string   `json:"cleanup_status,omitempty"`
+	Action            string   `json:"action"`
+	WasActive         bool     `json:"was_active"`
+	RecoveryVerdict   string   `json:"recovery_verdict,omitempty"`
+	RecoveryBlockers  []string `json:"recovery_blockers,omitempty"`
+	MutationPerformed bool     `json:"mutation_performed"`
+	Error             string   `json:"error,omitempty"`
 }
 
 // PatrolScanStallOutput holds stall detection results.
@@ -428,13 +431,16 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 		}
 		for _, z := range zombieResult.Zombies {
 			item := PatrolScanZombieItem{
-				Polecat:        z.PolecatName,
-				Classification: string(z.Classification),
-				AgentState:     z.AgentState,
-				HookBead:       z.HookBead,
-				CleanupStatus:  z.CleanupStatus,
-				Action:         z.Action,
-				WasActive:      z.WasActive,
+				Polecat:           z.PolecatName,
+				Classification:    string(z.Classification),
+				AgentState:        z.AgentState,
+				HookBead:          z.HookBead,
+				CleanupStatus:     z.CleanupStatus,
+				Action:            z.Action,
+				WasActive:         z.WasActive,
+				RecoveryVerdict:   z.RecoveryVerdict,
+				RecoveryBlockers:  append([]string(nil), z.RecoveryBlockers...),
+				MutationPerformed: z.MutationPerformed,
 			}
 			if z.Error != nil {
 				item.Error = z.Error.Error()
@@ -520,6 +526,9 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 				}
 				fmt.Println()
 				fmt.Printf("    Action: %s\n", z.Action)
+				if z.RecoveryVerdict != "" {
+					fmt.Printf("    Recovery: %s  Blockers: %s  Mutation: %t\n", z.RecoveryVerdict, strings.Join(z.RecoveryBlockers, ", "), z.MutationPerformed)
+				}
 				if z.Error != nil {
 					fmt.Printf("    %s\n", style.Dim.Render(fmt.Sprintf("Error: %v", z.Error)))
 				}
