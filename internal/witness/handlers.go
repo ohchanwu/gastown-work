@@ -1578,7 +1578,7 @@ func extractPolecatFromJSON(output string) string {
 func RestartPolecatSession(workDir, rigName, polecatName string, t *tmux.Tmux, generation tmux.SessionGeneration, alive bool) (bool, error) {
 	address := fmt.Sprintf("%s/%s", rigName, polecatName)
 	return restartPolecatSessionGenerationWith(generation, alive, t.KillSessionGeneration, func() error {
-		return util.ExecRun(workDir, "gt", "session", "start", address)
+		return util.ExecRun(workDir, "gt", "session", "start", address, "--if-absent")
 	})
 }
 

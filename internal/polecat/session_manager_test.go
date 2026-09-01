@@ -171,6 +171,31 @@ func TestSessionName(t *testing.T) {
 	}
 }
 
+func TestSessionManagerStartIfAbsentPreservesExistingSession(t *testing.T) {
+	setupTestRegistryForSession(t)
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-start-if-absent-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = tm.KillServer() })
+	r := &rig.Rig{Name: "gastown", Path: t.TempDir()}
+	m := NewSessionManager(tm, r)
+	sessionName := m.SessionName("Toast")
+	replacement, err := tm.NewSessionWithCommandAndEnvGeneration(sessionName, r.Path, "sleep 30", nil)
+	if err != nil {
+		t.Fatalf("creating replacement session: %v", err)
+	}
+
+	err = m.Start("Toast", SessionStartOptions{IfAbsent: true})
+	if !errors.Is(err, ErrSessionRunning) {
+		t.Fatalf("Start() error = %v, want ErrSessionRunning", err)
+	}
+	current, err := tm.CaptureSessionGeneration(sessionName)
+	if err != nil {
+		t.Fatalf("capturing preserved session: %v", err)
+	}
+	if !current.Equal(replacement) {
+		t.Fatalf("existing session changed: current=%+v want=%+v", current, replacement)
+	}
+}
+
 func TestRetirementAppliedRequiresOldSessionAbsenceAndTerminalBead(t *testing.T) {
 	setupTestRegistryForSession(t)
 	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-retirement-applied-%d", time.Now().UnixNano()))

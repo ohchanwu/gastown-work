@@ -131,6 +131,10 @@ type SessionStartOptions struct {
 	// this exact session. Completion must present it before lifecycle writes.
 	Incarnation string
 
+	// IfAbsent refuses to replace any same-name session, even when its agent
+	// process is not detectable. This is for generation-guarded restart flows.
+	IfAbsent bool
+
 	// OnStarted commits generation-bound post-start state while the lifecycle
 	// lock is still held. An error cleans up only the exact created session.
 	OnStarted func(incarnation string) error
@@ -552,6 +556,16 @@ func (m *SessionManager) startContext(ctx context.Context, polecat string, opts 
 		}
 		defer func() { _ = fl.Unlock() }()
 	}
+	sessionID := m.SessionName(polecat)
+	if opts.IfAbsent {
+		running, err := m.tmux.HasSessionContext(ctx, sessionID)
+		if err != nil {
+			return fmt.Errorf("checking session: %w", err)
+		}
+		if running {
+			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		}
+	}
 	incarnation, err := lifecycle.resolvePolecatLaunchIncarnationLocked(polecat, opts.Incarnation)
 	if err != nil {
 		return fmt.Errorf("resolving polecat launch incarnation: %w", err)
@@ -573,8 +587,6 @@ func (m *SessionManager) startContext(ctx context.Context, polecat string, opts 
 		return 0
 	}
 
-	sessionID := m.SessionName(polecat)
-
 	// Check if session already exists.
 	// If an existing session's pane process has died, kill the stale session
 	// and proceed rather than returning ErrSessionRunning (gt-jn40ft).
@@ -595,6 +607,9 @@ func (m *SessionManager) startContext(ctx context.Context, polecat string, opts 
 		return fmt.Errorf("checking session: %w", err)
 	}
 	if running {
+		if opts.IfAbsent {
+			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		}
 		if m.tmux.IsAgentAlive(sessionID) {
 			m.startNudgePoller(townRoot, sessionID)
 			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)

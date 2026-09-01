@@ -25,6 +25,7 @@ import (
 // Session command flags
 var (
 	sessionIssue               string
+	sessionIfAbsent            bool
 	sessionForce               bool
 	sessionLines               int
 	sessionMessage             string
@@ -192,6 +193,7 @@ Examples:
 func init() {
 	// Start flags
 	sessionStartCmd.Flags().StringVar(&sessionIssue, "issue", "", "Issue ID to work on")
+	sessionStartCmd.Flags().BoolVar(&sessionIfAbsent, "if-absent", false, "Refuse to replace an existing session")
 
 	// Stop flags
 	sessionStopCmd.Flags().BoolVarP(&sessionForce, "force", "f", false, "Force immediate shutdown")
@@ -311,7 +313,8 @@ func runSessionStart(cmd *cobra.Command, args []string) error {
 	}
 
 	opts := polecat.SessionStartOptions{
-		Issue: sessionIssue,
+		Issue:    sessionIssue,
+		IfAbsent: sessionIfAbsent,
 	}
 
 	fmt.Printf("Starting session for %s/%s...\n", rigName, polecatName)

@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -409,10 +410,12 @@ func TestRestartPolecatSessionProductionComposition(t *testing.T) {
 	}
 
 	fakeBin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(fakeBin, "gt"), []byte("#!/bin/sh\nexit 23\n"), 0o755); err != nil {
+	argsPath := filepath.Join(t.TempDir(), "args")
+	if err := os.WriteFile(filepath.Join(fakeBin, "gt"), []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GT_TEST_ARGS\"\nexit 23\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_TEST_ARGS", argsPath)
 
 	socket := fmt.Sprintf("gt-restart-custody-%d-%d", os.Getpid(), time.Now().UnixNano())
 	env := []string{"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=/tmp"}
@@ -422,8 +425,8 @@ func TestRestartPolecatSessionProductionComposition(t *testing.T) {
 		_ = tm.KillServer()
 		_ = os.Remove(filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()), socket))
 	})
-	start := func(nonce string) tmux.SessionGeneration {
-		cmd := exec.Command("tmux", "-L", socket, "new-session", "-d", "-s", sessionName,
+	startNamed := func(name, nonce string) tmux.SessionGeneration {
+		cmd := exec.Command("tmux", "-L", socket, "new-session", "-d", "-s", name,
 			"-e", tmux.EnvSessionGeneration+"="+nonce,
 			"-e", tmux.EnvSessionCustody+"=fixture-custody-0001",
 			"-e", tmux.EnvSessionPane+"=", "sleep 60")
@@ -431,12 +434,13 @@ func TestRestartPolecatSessionProductionComposition(t *testing.T) {
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("create isolated session: %v: %s", err, output)
 		}
-		generation, err := tm.CaptureSessionGeneration(sessionName)
+		generation, err := tm.CaptureSessionGeneration(name)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return generation
 	}
+	start := func(nonce string) tmux.SessionGeneration { return startNamed(sessionName, nonce) }
 
 	original := start("original-generation")
 	if err := tm.KillSessionGeneration(original); err != nil {
@@ -462,6 +466,37 @@ func TestRestartPolecatSessionProductionComposition(t *testing.T) {
 	}
 	if alive, err := tm.HasSession(sessionName); err != nil || alive {
 		t.Fatalf("stopped generation remains: alive=%v err=%v", alive, err)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(args), "session\nstart\ngastown/nux\n--if-absent\n"; got != want {
+		t.Fatalf("start args = %q, want %q", got, want)
+	}
+
+	manager := polecat.NewSessionManager(tm, &rig.Rig{Name: "gastown", Path: t.TempDir()})
+	managerSessionName := manager.SessionName("nux")
+	postStopOriginal := startNamed(managerSessionName, "post-stop-original")
+	var postStopReplacement tmux.SessionGeneration
+	performed, err = restartPolecatSessionGenerationWith(postStopOriginal, true,
+		func(got tmux.SessionGeneration) error {
+			if err := tm.KillSessionGeneration(got); err != nil {
+				return err
+			}
+			postStopReplacement = startNamed(managerSessionName, "post-stop-replacement")
+			return nil
+		},
+		func() error {
+			return manager.Start("nux", polecat.SessionStartOptions{IfAbsent: true})
+		},
+	)
+	if !performed || !errors.Is(err, polecat.ErrSessionRunning) {
+		t.Fatalf("post-stop replacement restart = performed %v, err %v", performed, err)
+	}
+	current, err = tm.CaptureSessionGeneration(managerSessionName)
+	if err != nil || !current.Equal(postStopReplacement) {
+		t.Fatalf("post-stop replacement changed: current=%+v err=%v", current, err)
 	}
 }
 
