@@ -198,12 +198,17 @@ func inspectDoltCleanupListeners(out io.Writer, inventory func() ([]doltserver.L
 
 func renderDoltCleanupProcessScope(out io.Writer, inventory []doltserver.LocalDoltServer) {
 	fmt.Fprintln(out, "Process cleanup was not performed.")
-	testLeaks := 0
+	counts := make(map[doltserver.DoltServerClass]int)
 	for _, server := range inventory {
-		if server.Class == doltserver.DoltServerOwnedTestLeak {
-			testLeaks++
-		}
+		counts[server.Class]++
 	}
+	configured := counts[doltserver.DoltServerConfiguredPortImposter]
+	townLeaks := counts[doltserver.DoltServerOwnedTownLeak]
+	unknown := counts[doltserver.DoltServerUnknown]
+	if configured+townLeaks+unknown > 0 {
+		fmt.Fprintf(out, "Report-only listener counts: configured-port-imposter=%d owned-town-leak=%d unknown=%d.\n", configured, townLeaks, unknown)
+	}
+	testLeaks := counts[doltserver.DoltServerOwnedTestLeak]
 	if testLeaks > 0 {
 		fmt.Fprintf(out, "%d positively test-owned Dolt listener leak(s) found.\n", testLeaks)
 		fmt.Fprintln(out, "Preview exact test-leak cleanup: gt dolt cleanup-test-leaks")
@@ -213,6 +218,19 @@ func renderDoltCleanupProcessScope(out io.Writer, inventory []doltserver.LocalDo
 func renderNoOrphanedTestDatabases(out io.Writer, inventory []doltserver.LocalDoltServer) {
 	fmt.Fprintln(out, "No orphaned test databases found.")
 	renderDoltCleanupProcessScope(out, inventory)
+}
+
+func renderDoltCleanupListenerReport(out io.Writer, noOrphans bool, inventory func() ([]doltserver.LocalDoltServer, error)) error {
+	servers, err := inspectDoltCleanupListeners(out, inventory)
+	if err != nil {
+		return err
+	}
+	if noOrphans {
+		renderNoOrphanedTestDatabases(out, servers)
+	} else {
+		renderDoltCleanupProcessScope(out, servers)
+	}
+	return nil
 }
 
 func writeTestLeakPreview(path string, selections []doltserver.TestLeakSelection) error {
@@ -1340,21 +1358,15 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
-	inventory, err := inspectDoltCleanupListeners(os.Stdout, func() ([]doltserver.LocalDoltServer, error) {
-		return doltserver.InventoryLocalDoltServersWithError(townRoot)
-	})
-	if err != nil {
-		return err
-	}
-
 	orphans, err := doltserver.FindOrphanedDatabases(townRoot)
 	if err != nil {
 		return fmt.Errorf("finding orphaned databases: %w", err)
 	}
 
 	if len(orphans) == 0 {
-		renderNoOrphanedTestDatabases(os.Stdout, inventory)
-		return nil
+		return renderDoltCleanupListenerReport(os.Stdout, true, func() ([]doltserver.LocalDoltServer, error) {
+			return doltserver.InventoryLocalDoltServersWithError(townRoot)
+		})
 	}
 
 	fmt.Printf("Found %d orphaned database(s) in .dolt-data/:\n\n", len(orphans))
@@ -1365,8 +1377,9 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 
 	if doltCleanupDry {
 		fmt.Println("\nDry run: no changes made.")
-		renderDoltCleanupProcessScope(os.Stdout, inventory)
-		return nil
+		return renderDoltCleanupListenerReport(os.Stdout, false, func() ([]doltserver.LocalDoltServer, error) {
+			return doltserver.InventoryLocalDoltServersWithError(townRoot)
+		})
 	}
 
 	// BALK: If orphans are a large fraction of all databases, something is likely
@@ -1438,9 +1451,9 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("\n%s Removed %d/%d orphaned database(s)\n",
 		style.Bold.Render("✓"), removed, len(orphans))
-	renderDoltCleanupProcessScope(os.Stdout, inventory)
-
-	return nil
+	return renderDoltCleanupListenerReport(os.Stdout, false, func() ([]doltserver.LocalDoltServer, error) {
+		return doltserver.InventoryLocalDoltServersWithError(townRoot)
+	})
 }
 
 func runDoltList(cmd *cobra.Command, args []string) error {

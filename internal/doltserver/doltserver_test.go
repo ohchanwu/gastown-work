@@ -680,6 +680,28 @@ func TestRemediatePreviewedTestLeaksRejectsPIDReuseChangedOwner(t *testing.T) {
 	}
 }
 
+func TestRemediatePreviewedTestLeaksRejectsFinalPIDReplacement(t *testing.T) {
+	original := LocalDoltServer{
+		DoltListener: DoltListener{PID: 622, Port: 4622},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(os.TempDir(), "gastown-test-dolt.final-original"),
+		ProcessToken: "original-start",
+	}
+	replacement := original
+	replacement.ProcessToken = "replacement-start"
+
+	err := remediatePreviewedTestLeaks(
+		[]LocalDoltServer{original},
+		[]TestLeakSelection{newTestLeakSelection(original)},
+		true,
+		func(TestLeakSelection) error { return nil },
+		func() ([]LocalDoltServer, error) { return []LocalDoltServer{replacement}, nil },
+	)
+	if err == nil {
+		t.Fatal("cleanup accepted a replacement identity on the final rescan")
+	}
+}
+
 func TestNewTestLeakSelectionIncludesProcessIdentity(t *testing.T) {
 	original := LocalDoltServer{
 		DoltListener: DoltListener{PID: 631, Port: 4631},

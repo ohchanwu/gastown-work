@@ -39,20 +39,51 @@ func TestRenderNoOrphanedTestDatabasesStatesDatabaseOnlyScope(t *testing.T) {
 
 func TestRenderDoltCleanupProcessScopePointsToExactTestLeakPreview(t *testing.T) {
 	inventory := []doltserver.LocalDoltServer{
+		{Class: doltserver.DoltServerConfiguredPortImposter, OwnerPath: "/private/imposter", ProcessToken: "imposter-token"},
+		{Class: doltserver.DoltServerOwnedTownLeak, OwnerPath: "/private/town", ProcessToken: "town-token"},
 		{Class: doltserver.DoltServerOwnedTestLeak},
 		{Class: doltserver.DoltServerOwnedTestLeak},
-		{Class: doltserver.DoltServerUnknown},
+		{Class: doltserver.DoltServerUnknown, OwnerPath: "/private/unknown", ProcessToken: "unknown-token"},
 	}
 	var out bytes.Buffer
 	renderDoltCleanupProcessScope(&out, inventory)
 	got := out.String()
 	for _, want := range []string{
 		"Process cleanup was not performed.",
+		"Report-only listener counts: configured-port-imposter=1 owned-town-leak=1 unknown=1.",
 		"2 positively test-owned Dolt listener leak(s) found.",
 		"Preview exact test-leak cleanup: gt dolt cleanup-test-leaks",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("cleanup output missing %q: %q", want, got)
+		}
+	}
+	for _, secret := range []string{"/private/imposter", "imposter-token", "/private/town", "town-token", "/private/unknown", "unknown-token"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("cleanup output exposed listener custody %q: %q", secret, got)
+		}
+	}
+}
+
+func TestRenderDoltCleanupListenerReportInventoriesAtReportTime(t *testing.T) {
+	var out bytes.Buffer
+	calls := 0
+	err := renderDoltCleanupListenerReport(&out, true, func() ([]doltserver.LocalDoltServer, error) {
+		calls++
+		return []doltserver.LocalDoltServer{{Class: doltserver.DoltServerUnknown}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("listener inventory calls = %d, want 1 at report time", calls)
+	}
+	for _, want := range []string{
+		"No orphaned test databases found.",
+		"Report-only listener counts: configured-port-imposter=0 owned-town-leak=0 unknown=1.",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("cleanup report missing %q: %q", want, out.String())
 		}
 	}
 }

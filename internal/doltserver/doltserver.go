@@ -1696,10 +1696,8 @@ func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSe
 		if wanted.Class != DoltServerOwnedTestLeak || wanted.OwnershipToken == "" {
 			return fmt.Errorf("invalid test-leak preview selection")
 		}
-		for _, server := range initial {
-			if server.PID == wanted.PID && server.Port == wanted.Port && newTestLeakSelection(server) != wanted {
-				return fmt.Errorf("previewed test-leak ownership changed for PID %d port %d", wanted.PID, wanted.Port)
-			}
+		if testLeakSelectionState(initial, wanted) == revalidatedProcessChanged {
+			return fmt.Errorf("previewed test-leak ownership changed for PID %d port %d", wanted.PID, wanted.Port)
 		}
 	}
 	if !apply {
@@ -1714,7 +1712,16 @@ func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSe
 	if err != nil {
 		return err
 	}
-	if remaining := len(previewedTestLeaks(current, preview)); remaining > 0 {
+	remaining := 0
+	for _, wanted := range preview {
+		switch testLeakSelectionState(current, wanted) {
+		case revalidatedProcessChanged:
+			return fmt.Errorf("previewed test-leak ownership changed for PID %d port %d on final inventory", wanted.PID, wanted.Port)
+		case revalidatedProcessOwned:
+			remaining++
+		}
+	}
+	if remaining > 0 {
 		return fmt.Errorf("%d previewed test-owned Dolt listener(s) remain", remaining)
 	}
 	return nil
