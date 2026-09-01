@@ -2081,8 +2081,7 @@ func findStrandedConvoysContext(ctx context.Context, townRoot string) ([]strande
 	if err != nil {
 		return nil, convoyStrandedScanError(ctx)
 	}
-	cache := newConvoyIssueDetailsCacheContext(getConvoyIssueDetailsSnapshotContext)
-	snapshot, err := loadConvoyRelationshipSnapshotContext(ctx, townRoot, convoys, loadConvoyTrackedIDsContext, cache.get)
+	snapshot, err := loadConvoyRelationshipSnapshotContext(ctx, townRoot, convoys, loadConvoyTrackedIDsContext, getConvoyIssueDetailsSnapshotContext)
 	if err != nil {
 		return nil, convoyStrandedScanError(ctx)
 	}
@@ -2108,6 +2107,21 @@ func findStrandedConvoysContext(ctx context.Context, townRoot string) ([]strande
 	scheduledSet, err := areScheduledContext(ctx, trackedIDs)
 	if err != nil {
 		return nil, convoyStrandedScanError(ctx)
+	}
+	sessionSet, err := tmux.NewTmux().GetSessionSetContext(ctx)
+	if err != nil {
+		return nil, convoyStrandedScanError(ctx)
+	}
+	routes, err := beads.LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		return nil, convoyStrandedScanError(ctx)
+	}
+	slingablePrefixes := make(map[string]bool, len(routes))
+	for _, route := range routes {
+		if _, exists := slingablePrefixes[route.Prefix]; exists {
+			return nil, convoyStrandedScanError(ctx)
+		}
+		slingablePrefixes[route.Prefix] = route.Path != "."
 	}
 
 	// Results retain input order, so normal and JSON output stay deterministic.
@@ -2142,12 +2156,19 @@ func findStrandedConvoysContext(ctx context.Context, townRoot string) ([]strande
 
 		var readyIssues []string
 		for _, t := range tracked {
-			ready, err := isReadyIssueContext(ctx, t, scheduledSet)
+			ready, err := isReadyIssueWithSessionLookup(t, scheduledSet, func(name string) (bool, error) {
+				return sessionSet.Has(name), nil
+			})
 			if err != nil {
 				return nil, convoyStrandedScanError(ctx)
 			}
 			if ready {
-				if !isSlingableBead(townRoot, t.ID) {
+				prefix := beads.ExtractPrefix(t.ID)
+				slingable, known := slingablePrefixes[prefix]
+				if prefix != "" && !known {
+					return nil, convoyStrandedScanError(ctx)
+				}
+				if prefix != "" && !slingable {
 					continue
 				}
 				if !convoyops.IsSlingableType(t.IssueType) {
@@ -2236,6 +2257,12 @@ func isReadyIssue(t trackedIssueInfo, scheduledSet map[string]bool) bool {
 }
 
 func isReadyIssueContext(ctx context.Context, t trackedIssueInfo, scheduledSet map[string]bool) (bool, error) {
+	return isReadyIssueWithSessionLookup(t, scheduledSet, func(name string) (bool, error) {
+		return tmux.NewTmux().HasSessionContext(ctx, name)
+	})
+}
+
+func isReadyIssueWithSessionLookup(t trackedIssueInfo, scheduledSet map[string]bool, hasSession func(string) (bool, error)) (bool, error) {
 	status := strings.TrimSpace(t.Status)
 
 	// Unresolved issues are not safe to dispatch.
@@ -2280,7 +2307,7 @@ func isReadyIssueContext(ctx context.Context, t trackedIssueInfo, scheduledSet m
 
 	// Only a confirmed missing session makes assigned work ready. Cancellation,
 	// missing server, and other probe failures leave the full scan uncertain.
-	exists, err := tmux.NewTmux().HasSessionContext(ctx, sessionName)
+	exists, err := hasSession(sessionName)
 	if err != nil {
 		return false, err
 	}
@@ -2322,8 +2349,7 @@ func checkCompletedConvoys(ctx context.Context, townBeads string, dryRun, quiet 
 	if err != nil {
 		return convoyCheckSummary{}, fmt.Errorf("listing convoys: %w", err)
 	}
-	cache := newConvoyIssueDetailsCacheContext(getConvoyIssueDetailsSnapshotContext)
-	snapshot, err := loadConvoyRelationshipSnapshotContext(ctx, townBeads, convoys, loadConvoyTrackedIDsContext, cache.get)
+	snapshot, err := loadConvoyRelationshipSnapshotContext(ctx, townBeads, convoys, loadConvoyTrackedIDsContext, getConvoyIssueDetailsSnapshotContext)
 	if err != nil {
 		return convoyCheckSummary{}, fmt.Errorf("loading convoy relationships: %w", err)
 	}
@@ -3273,7 +3299,7 @@ func loadConvoyRelationshipSnapshotContext(
 	townBeads string,
 	convoys []convoyListIssue,
 	loadTracked func(context.Context, string, []string) (map[string][]string, error),
-	loadDetails func(context.Context, []string) map[string]*issueDetails,
+	loadDetails func(context.Context, []string) (map[string]*issueDetails, error),
 ) (map[string][]trackedIssueInfo, error) {
 	convoyIDs := make([]string, len(convoys))
 	for i, convoy := range convoys {
@@ -3299,7 +3325,10 @@ func loadConvoyRelationshipSnapshotContext(
 		issueIDs = append(issueIDs, id)
 	}
 	sort.Strings(issueIDs)
-	details := loadDetails(ctx, issueIDs)
+	details, err := loadDetails(ctx, issueIDs)
+	if err != nil {
+		return nil, err
+	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -3450,19 +3479,22 @@ func getIssueDetailsBatchContext(ctx context.Context, issueIDs []string) map[str
 
 // getConvoyIssueDetailsSnapshotContext performs one fresh routed batch without
 // retrying unresolved IDs; missing rows remain unknown in the command snapshot.
-func getConvoyIssueDetailsSnapshotContext(ctx context.Context, issueIDs []string) map[string]*issueDetails {
+func getConvoyIssueDetailsSnapshotContext(ctx context.Context, issueIDs []string) (map[string]*issueDetails, error) {
 	result := make(map[string]*issueDetails, len(issueIDs))
-	client := convoyIssueClient()
-	if client == nil || len(issueIDs) == 0 {
-		return result
+	if len(issueIDs) == 0 {
+		return result, nil
 	}
-	issues, _ := client.ShowMultipleContext(ctx, issueIDs)
+	client := convoyIssueClient()
+	if client == nil {
+		return nil, errors.New("convoy issue client unavailable")
+	}
+	issues, err := client.ShowMultipleContext(ctx, issueIDs)
 	for id, issue := range issues {
 		if details := issueToDetails(issue); details != nil {
 			result[id] = details
 		}
 	}
-	return result
+	return result, err
 }
 
 func getIssueDetailsBatchWithClientContext(ctx context.Context, client *beads.Beads, issueIDs []string) map[string]*issueDetails {

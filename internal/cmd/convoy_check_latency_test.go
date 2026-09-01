@@ -86,12 +86,14 @@ func TestCheckCompletedConvoysLiveSizeSkipsWorkerInventory(t *testing.T) {
     sep=
     printf '['
     for id do
-      printf '%%s{"id":"%%s","title":"Open task","status":"open","issue_type":"task"}' "$sep" "$id"
+	  status=open
+	  [ "$id" = "hq-task-00" ] && status=closed
+	  printf '%%s{"id":"%%s","title":"Task","status":"%%s","issue_type":"task"}' "$sep" "$id" "$status"
       sep=,
     done
     printf ']\n'
     ;;
-  close*|update*|export*) printf '%%s\n' "$*" >> "$GT_MUTATION_LOG"; exit 1 ;;
+  close*|update*|export*) printf '%%s\n' "$*" >> "$GT_MUTATION_LOG" ;;
   *) printf 'unexpected bd args: %%s\n' "$*" >&2; exit 1 ;;
 esac
 `, convoyJSON, dependencyJSON)
@@ -106,8 +108,8 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Checked != 51 || summary.EligibleClosed != 0 || summary.SkippedUncertain != 0 || summary.TimedOut || len(summary.Errors) != 0 {
-		t.Fatalf("summary = %+v, want successful no-ready no-op", summary)
+	if summary.Checked != 51 || summary.EligibleClosed != 1 || summary.SkippedUncertain != 0 || summary.TimedOut || len(summary.Errors) != 0 {
+		t.Fatalf("dry-run summary = %+v, want one eligible closure", summary)
 	}
 	if data, readErr := os.ReadFile(mutationLog); readErr == nil || !os.IsNotExist(readErr) {
 		t.Fatalf("dry-run mutation log = %q, err=%v", data, readErr)
@@ -134,5 +136,20 @@ esac
 	}
 	if scans := strings.Count(string(data), "scan\n"); scans != 1 {
 		t.Fatalf("issue detail batch process launches = %d, want 1", scans)
+	}
+
+	summary, err = checkCompletedConvoys(context.Background(), townRoot, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.EligibleClosed != 1 || len(summary.Errors) != 0 {
+		t.Fatalf("non-dry-run summary = %+v, want one closure", summary)
+	}
+	data, err = os.ReadFile(mutationLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "close hq-cv-50") {
+		t.Fatalf("non-dry-run mutation log = %q, want convoy close", data)
 	}
 }

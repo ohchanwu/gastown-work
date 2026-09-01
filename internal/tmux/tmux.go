@@ -3031,7 +3031,12 @@ func NewSessionSet(names []string) *SessionSet {
 //
 // Builds the map directly from tmux output to avoid intermediate slice allocation.
 func (t *Tmux) GetSessionSet() (*SessionSet, error) {
-	out, err := t.run("list-sessions", "-F", "#{session_name}")
+	return t.GetSessionSetContext(context.Background())
+}
+
+// GetSessionSetContext returns the current session set with caller cancellation.
+func (t *Tmux) GetSessionSetContext(ctx context.Context) (*SessionSet, error) {
+	out, err := t.runContext(ctx, "list-sessions", "-F", "#{session_name}")
 	if err != nil {
 		if errors.Is(err, ErrNoServer) {
 			return &SessionSet{sessions: make(map[string]struct{})}, nil

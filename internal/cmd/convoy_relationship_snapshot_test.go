@@ -92,12 +92,12 @@ func TestConvoyRelationshipSnapshotFiftyRecords(t *testing.T) {
 			}
 			return edges, nil
 		},
-		func(_ context.Context, gotIDs []string) map[string]*issueDetails {
+		func(_ context.Context, gotIDs []string) (map[string]*issueDetails, error) {
 			detailLoads++
 			for _, id := range gotIDs {
 				detailIDs[id]++
 			}
-			return details
+			return details, nil
 		},
 	)
 	if err != nil {
@@ -136,9 +136,9 @@ func TestConvoyRelationshipSnapshotPreservesFailureAndCancellation(t *testing.T)
 	_, err := loadConvoyRelationshipSnapshotContext(
 		context.Background(), "unused", convoys,
 		func(context.Context, string, []string) (map[string][]string, error) { return nil, wantErr },
-		func(context.Context, []string) map[string]*issueDetails {
+		func(context.Context, []string) (map[string]*issueDetails, error) {
 			t.Fatal("details loaded after edge failure")
-			return nil
+			return nil, nil
 		},
 	)
 	if !errors.Is(err, wantErr) {
@@ -150,12 +150,26 @@ func TestConvoyRelationshipSnapshotPreservesFailureAndCancellation(t *testing.T)
 	_, err = loadConvoyRelationshipSnapshotContext(
 		ctx, "unused", convoys,
 		func(ctx context.Context, _ string, _ []string) (map[string][]string, error) { return nil, ctx.Err() },
-		func(context.Context, []string) map[string]*issueDetails {
+		func(context.Context, []string) (map[string]*issueDetails, error) {
 			t.Fatal("details loaded after cancellation")
-			return nil
+			return nil, nil
 		},
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation error = %v, want context.Canceled", err)
+	}
+
+	wantErr = errors.New("partial routed detail query")
+	_, err = loadConvoyRelationshipSnapshotContext(
+		context.Background(), "unused", convoys,
+		func(context.Context, string, []string) (map[string][]string, error) {
+			return map[string][]string{"hq-convoy-00": {"aa-one", "bb-one"}}, nil
+		},
+		func(context.Context, []string) (map[string]*issueDetails, error) {
+			return map[string]*issueDetails{"aa-one": {Status: "open"}}, wantErr
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("detail error = %v, want %v", err, wantErr)
 	}
 }

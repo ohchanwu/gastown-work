@@ -88,6 +88,30 @@ func ResolveRoutingTarget(townRoot, beadID, fallbackDir string) string {
 	return beadsDir
 }
 
+func resolveRoutingTargetFromRoutes(townRoot, beadID, fallbackDir string, routes []Route) string {
+	if townRoot == "" {
+		return fallbackDir
+	}
+	prefix := ExtractPrefix(beadID)
+	if prefix == "" {
+		return fallbackDir
+	}
+	for _, route := range routes {
+		if route.Prefix != prefix {
+			continue
+		}
+		rigPath := townRoot
+		if route.Path != "." {
+			rigPath = filepath.Join(townRoot, route.Path)
+		}
+		if beadsDir := ResolveBeadsDir(rigPath); beadsDir != "" {
+			return beadsDir
+		}
+		break
+	}
+	return fallbackDir
+}
+
 // EnsureCustomTypes ensures the target beads directory has custom types configured.
 // Uses a two-level caching strategy:
 //   - In-memory cache for multiple creates in the same CLI invocation

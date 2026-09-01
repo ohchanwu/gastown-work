@@ -2877,6 +2877,28 @@ func TestSessionSet(t *testing.T) {
 	}
 }
 
+func TestGetSessionSetContextCancels(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	bin := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexec sleep 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envPinnedTmuxBinary, bin)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := NewTmux().GetSessionSetContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GetSessionSetContext() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("GetSessionSetContext() returned after %s", elapsed.Round(time.Millisecond))
+	}
+}
+
 func TestCleanupOrphanedSessions(t *testing.T) {
 	// newTestTmux creates an isolated tmux server (unique socket per test).
 	// CleanupOrphanedSessions operates on the Tmux receiver which carries that

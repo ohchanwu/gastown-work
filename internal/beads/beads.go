@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1679,30 +1680,80 @@ func (b *Beads) ShowMultipleContext(ctx context.Context, ids []string) (map[stri
 
 	if !b.noRoute {
 		fallbackDir := b.getResolvedBeadsDir()
+		townRoot := b.getTownRoot()
+		var routes []Route
+		if townRoot != "" {
+			var err error
+			routes, err = LoadRoutes(filepath.Join(townRoot, ".beads"))
+			if err != nil {
+				return nil, fmt.Errorf("loading routes: %w", err)
+			}
+		}
 		groups := make(map[string][]string)
 		for _, id := range ids {
-			targetDir := ResolveRoutingTarget(b.getTownRoot(), id, fallbackDir)
+			targetDir := resolveRoutingTargetFromRoutes(townRoot, id, fallbackDir, routes)
 			groups[targetDir] = append(groups[targetDir], id)
 		}
 
 		if len(groups) > 1 || groups[fallbackDir] == nil {
+			targetDirs := make([]string, 0, len(groups))
+			for targetDir := range groups {
+				targetDirs = append(targetDirs, targetDir)
+			}
+			sort.Strings(targetDirs)
+
+			type routeResult struct {
+				issues map[string]*Issue
+				err    error
+			}
+			results := make([]routeResult, len(targetDirs))
+			jobs := make(chan int)
+			workers := len(targetDirs)
+			if workers > 4 {
+				workers = 4
+			}
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for range workers {
+				go func() {
+					defer wg.Done()
+					for index := range jobs {
+						targetDir := targetDirs[index]
+						target := b
+						if targetDir != fallbackDir {
+							target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+						}
+						results[index].issues, results[index].err = target.showMultipleLocalContext(ctx, groups[targetDir])
+					}
+				}()
+			}
+			for index := range targetDirs {
+				select {
+				case jobs <- index:
+				case <-ctx.Done():
+					close(jobs)
+					wg.Wait()
+					return nil, ctx.Err()
+				}
+			}
+			close(jobs)
+			wg.Wait()
+
 			result := make(map[string]*Issue, len(ids))
 			var firstErr error
-			for targetDir, groupIDs := range groups {
-				target := b
-				if targetDir != fallbackDir {
-					target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-				}
-				issues, err := target.showMultipleLocalContext(ctx, groupIDs)
-				if err != nil {
+			for _, route := range results {
+				if route.err != nil {
 					if firstErr == nil {
-						firstErr = err
+						firstErr = route.err
 					}
 					continue
 				}
-				for id, issue := range issues {
+				for id, issue := range route.issues {
 					result[id] = issue
 				}
+			}
+			if err := ctx.Err(); err != nil {
+				return result, err
 			}
 			return result, firstErr
 		}

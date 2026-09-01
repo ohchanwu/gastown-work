@@ -21,12 +21,19 @@ func TestFindStrandedConvoysLiveSize(t *testing.T) {
 
 	townRoot, _ := makeRoutingTownWorkspace(t)
 	chdirConvoyTest(t, townRoot)
-	for _, path := range []string{filepath.Join(townRoot, "rig-a", "polecats"), filepath.Join(townRoot, "rig-a", "mayor", "rig", ".beads")} {
+	for _, path := range []string{
+		filepath.Join(townRoot, "rig-a", "polecats"),
+		filepath.Join(townRoot, "rig-a", "mayor", "rig", ".beads"),
+		filepath.Join(townRoot, "rig-b", "polecats"),
+		filepath.Join(townRoot, "rig-b", "mayor", "rig", ".beads"),
+	} {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte("{\"prefix\":\"gt-\",\"path\":\"rig-a/mayor/rig\"}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(
+		"{\"prefix\":\"gt-\",\"path\":\"rig-a/mayor/rig\"}\n"+
+			"{\"prefix\":\"bd-\",\"path\":\"rig-b/mayor/rig\"}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if !isSlingableBead(townRoot, "gt-task-00") {
@@ -36,7 +43,11 @@ func TestFindStrandedConvoysLiveSize(t *testing.T) {
 	rows := make([]map[string]string, len(convoys))
 	for i := range convoys {
 		convoys[i] = convoyListIssue{ID: fmt.Sprintf("hq-cv-%02d", i), Title: fmt.Sprintf("Convoy %02d", i), Status: "open", IssueType: "convoy", Labels: []string{"gt:convoy"}}
-		rows[i] = map[string]string{"issue_id": convoys[i].ID, "depends_on_id": fmt.Sprintf("gt-task-%02d", i)}
+		prefix := "gt"
+		if i%2 == 1 {
+			prefix = "bd"
+		}
+		rows[i] = map[string]string{"issue_id": convoys[i].ID, "depends_on_id": fmt.Sprintf("%s-task-%02d", prefix, i)}
 	}
 	convoyJSON, err := json.Marshal(convoys)
 	if err != nil {
@@ -63,7 +74,7 @@ case "$*" in
     sep=
     printf '['
     for id do
-      printf '%%s{"id":"%%s","title":"Open task","status":"open","issue_type":"task"}' "$sep" "$id"
+	  printf '%%s{"id":"%%s","title":"Open task","status":"open","issue_type":"task","assignee":"gastown/polecats/capable"}' "$sep" "$id"
       sep=,
     done
     printf ']\n'
@@ -77,6 +88,13 @@ esac
 	t.Setenv("GT_DETAIL_SCAN_LOG", detailLog)
 	t.Setenv("GT_WORKER_SCAN_LOG", workerLog)
 	t.Setenv("GT_COMMAND_LOG", commandLog)
+	tmuxLog := filepath.Join(t.TempDir(), "tmux-scans")
+	tmuxBin := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(tmuxBin, []byte("#!/bin/sh\nprintf 'scan\\n' >> \"$GT_TMUX_SCAN_LOG\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_INTERNAL_PINNED_TMUX_BINARY", tmuxBin)
+	t.Setenv("GT_TMUX_SCAN_LOG", tmuxLog)
 	started := time.Now()
 	got, err := findStrandedConvoysContext(context.Background(), townRoot)
 	if err != nil {
@@ -103,18 +121,35 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scans := strings.Count(string(data), "scan\n"); scans != 1 {
-		t.Fatalf("issue detail batch process launches = %d, want 1", scans)
+	if scans := strings.Count(string(data), "scan\n"); scans != 2 {
+		t.Fatalf("issue detail route-group process launches = %d, want 2", scans)
 	}
 	data, err = os.ReadFile(workerLog)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if scans := strings.Count(string(data), "scan\n"); scans != 2 {
+		t.Fatalf("worker inventory route scans = %d, want 2", scans)
+	}
+	data, err = os.ReadFile(tmuxLog)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if scans := strings.Count(string(data), "scan\n"); scans != 1 {
-		t.Fatalf("worker inventory process launches = %d, want 1", scans)
+		t.Fatalf("tmux session inventory process launches = %d, want 1", scans)
 	}
 	if elapsed := time.Since(started); elapsed >= 5*time.Second {
 		t.Fatalf("stranded scan elapsed = %s, want under 5s", elapsed)
+	}
+
+	if err := os.Remove(filepath.Join(townRoot, ".beads", "routes.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(townRoot, ".beads", "routes.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := findStrandedConvoysContext(context.Background(), townRoot); err == nil {
+		t.Fatal("unreadable route snapshot published a complete stranded inventory")
 	}
 }
 
