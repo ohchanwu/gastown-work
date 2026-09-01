@@ -1591,6 +1591,8 @@ func RestartPolecatSession(workDir, rigName, polecatName string) error {
 	return nil
 }
 
+var restartPolecatSession = RestartPolecatSession
+
 // NukePolecat executes the actual nuke operation for a polecat.
 // This kills the tmux session, removes the worktree, and cleans up beads.
 // Refuses to nuke polecats with pending MRs in the refinery queue (gt-6a9d).
@@ -1955,6 +1957,17 @@ func guardZombieMutation(expectedIncarnation string, expectedSession tmux.Sessio
 	return zombie, true
 }
 
+var zombieRecoveryDispositionForPolecat = func(townRoot, rigName, polecatName string, t *tmux.Tmux) (polecat.WorkstateDisposition, error) {
+	r := &rig.Rig{Name: rigName, Path: filepath.Join(townRoot, rigName)}
+	clonePath := filepath.Join(r.Path, "polecats", polecatName, rigName)
+	mgr := polecat.NewManager(r, git.NewGit(clonePath), t)
+	current, err := mgr.Get(polecatName)
+	if err != nil {
+		return polecat.WorkstateDisposition{}, fmt.Errorf("reading polecat workstate: %w", err)
+	}
+	return mgr.WorkstateDispositionForPolecat(polecatName, current.State, current.Issue), nil
+}
+
 func guardedZombieMutation(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, snap *agentBeadSnapshot, zombie ZombieResult, stillZombie func(*agentBeadSnapshot) (bool, error), mutate func(*ZombieResult, *agentBeadSnapshot) (bool, error)) (ZombieResult, bool) {
 	expectedSession, expectedSessionAlive, err := captureZombieSession(t, sessionName)
 	if err != nil {
@@ -1966,18 +1979,11 @@ func guardedZombieMutation(bd *BdCli, workDir, townRoot, rigName, polecatName, s
 	if snap != nil && snap.Fields != nil {
 		expectedIncarnation = snap.Fields.Incarnation
 	}
-	r := &rig.Rig{Name: rigName, Path: filepath.Join(townRoot, rigName)}
-	clonePath := filepath.Join(r.Path, "polecats", polecatName, rigName)
-	mgr := polecat.NewManager(r, git.NewGit(clonePath), t)
 	agentBeadID := beads.PolecatBeadIDWithPrefix(beads.GetPrefixForRig(townRoot, rigName), rigName, polecatName)
 
 	return guardZombieMutation(expectedIncarnation, expectedSession, expectedSessionAlive, zombie, zombieMutationGuardOps{
 		recovery: func() (polecat.WorkstateDisposition, error) {
-			current, err := mgr.Get(polecatName)
-			if err != nil {
-				return polecat.WorkstateDisposition{}, fmt.Errorf("reading polecat workstate: %w", err)
-			}
-			return mgr.WorkstateDispositionForPolecat(polecatName, current.State, current.Issue), nil
+			return zombieRecoveryDispositionForPolecat(townRoot, rigName, polecatName, t)
 		},
 		currentSnapshot: func() (*agentBeadSnapshot, error) {
 			return fetchAgentBeadSnapshotChecked(bd, workDir, agentBeadID)
@@ -2205,11 +2211,11 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 				return intent != nil && time.Since(intent.Timestamp) > witCfg.DoneIntentStuckTimeoutD(), nil
 			},
 			func(current *ZombieResult, _ *agentBeadSnapshot) (bool, error) {
-				err := RestartPolecatSession(workDir, rigName, polecatName)
+				err := restartPolecatSession(workDir, rigName, polecatName)
 				if err != nil {
 					current.Action = fmt.Sprintf("restart-stuck-session-failed: %v", err)
 				}
-				return true, err
+				return err == nil, err
 			})
 	}
 
@@ -2227,11 +2233,11 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		return guardedZombieMutation(bd, workDir, townRoot, rigName, polecatName, sessionName, t, snap, zombie,
 			func(*agentBeadSnapshot) (bool, error) { return !t.IsAgentAlive(sessionName), nil },
 			func(current *ZombieResult, _ *agentBeadSnapshot) (bool, error) {
-				err := RestartPolecatSession(workDir, rigName, polecatName)
+				err := restartPolecatSession(workDir, rigName, polecatName)
 				if err != nil {
 					current.Action = fmt.Sprintf("restart-agent-dead-session-failed: %v", err)
 				}
-				return true, err
+				return err == nil, err
 			})
 	}
 
@@ -2259,11 +2265,11 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 				return status == "closed", nil
 			},
 			func(current *ZombieResult, _ *agentBeadSnapshot) (bool, error) {
-				err := RestartPolecatSession(workDir, rigName, polecatName)
+				err := restartPolecatSession(workDir, rigName, polecatName)
 				if err != nil {
 					current.Action = fmt.Sprintf("restart-bead-closed-failed: %v", err)
 				}
-				return true, err
+				return err == nil, err
 			})
 	}
 
@@ -2448,11 +2454,11 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 				return intent != nil && time.Since(intent.Timestamp) >= witCfg.DoneIntentRecentGraceD(), nil
 			},
 			func(current *ZombieResult, _ *agentBeadSnapshot) (bool, error) {
-				err := RestartPolecatSession(workDir, rigName, polecatName)
+				err := restartPolecatSession(workDir, rigName, polecatName)
 				if err != nil {
 					current.Action = fmt.Sprintf("restart-failed (done-intent): %v", err)
 				}
-				return true, err
+				return err == nil, err
 			})
 	}
 
@@ -2572,10 +2578,11 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	// Instead archive the polecat — its work is done.
 	if merged, err := verifyBranchAlreadyMerged(workDir, rigName, polecatName); err == nil && merged {
 		zombie.Action = "archived-work-already-merged (aa-apw)"
-		zombie.MutationPerformed = true
 		if nukeErr := NukePolecat(bd, workDir, rigName, polecatName); nukeErr != nil {
 			zombie.Error = fmt.Errorf("archive: %w", nukeErr)
 			zombie.Action = fmt.Sprintf("archive-failed-work-already-merged: %v", nukeErr)
+		} else {
+			zombie.MutationPerformed = true
 		}
 		return
 	}
@@ -2588,10 +2595,11 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 			zombie.Action = fmt.Sprintf("cleanup-deferred-acp (cleanup_status=%s, existing-wisp=%s)", cleanupStatus, existingWisp)
 			return
 		}
-		zombie.MutationPerformed = true
 		wispID, wispErr := createCleanupWisp(bd, workDir, polecatName, hookBead, "")
 		if wispErr != nil {
 			zombie.Error = wispErr
+		} else {
+			zombie.MutationPerformed = true
 		}
 		zombie.Action = fmt.Sprintf("cleanup-deferred-acp:%s (Mayor ACP session active)", wispID)
 		return
@@ -2616,13 +2624,13 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 		// No existing wisp — create one as the atomic interlock (gt-7vs1).
 		// Previous code checked then created, allowing two concurrent patrols to
 		// both see "no wisp" and create duplicates. Now we create first, then dedup.
-		zombie.MutationPerformed = true
 		wispID, wispErr := createCleanupWisp(bd, workDir, polecatName, hookBead, "")
 		if wispErr != nil {
 			zombie.Error = fmt.Errorf("cleanup wisp: %w", wispErr)
 			zombie.Action = fmt.Sprintf("restarted-dirty (cleanup_status=%s, wisp-failed)", cleanupStatus)
 			break
 		}
+		zombie.MutationPerformed = true
 
 		// Dedup: re-check after creation to detect races with concurrent patrols.
 		// If another patrol also just created a wisp, there will be >1. Use
@@ -2654,8 +2662,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	}
 
 	// Restart regardless of cleanup state — the worktree is preserved.
-	zombie.MutationPerformed = true
-	if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+	if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 		if zombie.Error == nil {
 			zombie.Error = fmt.Errorf("restart: %w", err)
 		} else {
@@ -2664,6 +2671,8 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 		if zombie.Action == "restarted" {
 			zombie.Action = fmt.Sprintf("restart-failed: %v", err)
 		}
+	} else {
+		zombie.MutationPerformed = true
 	}
 }
 

@@ -1,14 +1,131 @@
 package witness
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestDetectZombieLiveSessionPreservesRecoveryHold(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("isolated tmux fixture is Unix-only")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+
+	oldRecovery := zombieRecoveryDispositionForPolecat
+	oldRestart := restartPolecatSession
+	zombieRecoveryDispositionForPolecat = func(string, string, string, *tmux.Tmux) (polecat.WorkstateDisposition, error) {
+		return polecat.WorkstateDisposition{
+			Verdict: polecat.WorkstateVerdictNeedsRecovery, NeedsRecovery: true,
+			Blockers: []string{"dirty-worktree"},
+		}, nil
+	}
+	restarts := 0
+	restartPolecatSession = func(string, string, string) error {
+		restarts++
+		return nil
+	}
+	t.Cleanup(func() {
+		zombieRecoveryDispositionForPolecat = oldRecovery
+		restartPolecatSession = oldRestart
+	})
+
+	for _, tt := range []struct {
+		name           string
+		doneIntent     bool
+		classification ZombieClassification
+	}{
+		{name: "stuck in done", doneIntent: true, classification: ZombieStuckInDone},
+		{name: "agent dead in live session", classification: ZombieAgentDeadInSession},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			socket := fmt.Sprintf("gt-recovery-hold-%d-%d", os.Getpid(), time.Now().UnixNano())
+			env := []string{"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=/tmp"}
+			tm := tmux.NewTmuxWithSocketAndEnv(socket, env)
+			sessionName := "gastown-nux"
+			start := exec.Command("tmux", "-L", socket, "new-session", "-d", "-s", sessionName,
+				"-e", tmux.EnvSessionGeneration+"=fixture-generation-0001",
+				"-e", tmux.EnvSessionCustody+"=fixture-custody-0001",
+				"-e", tmux.EnvSessionPane+"=", "sleep 60")
+			start.Env = env
+			if output, err := start.CombinedOutput(); err != nil {
+				t.Fatalf("create isolated session: %v: %s", err, output)
+			}
+			t.Cleanup(func() {
+				_ = tm.KillServer()
+				_ = os.Remove(filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()), socket))
+			})
+			generation, err := tm.CaptureSessionGeneration(sessionName)
+			if err != nil {
+				t.Fatalf("capture isolated session: %v", err)
+			}
+
+			stamp := time.Now().Add(-2 * config.DefaultWitnessDoneIntentStuckTimeout)
+			labels := []string{}
+			var intent *DoneIntent
+			if tt.doneIntent {
+				labels = []string{fmt.Sprintf("done-intent:COMPLETED:%d", stamp.Unix())}
+				intent = &DoneIntent{ExitType: "COMPLETED", Timestamp: stamp}
+			}
+			description := "role_type: polecat\nrig: gastown\nagent_state: working\nhook_bead: gt-work\ncleanup_status: has_uncommitted\nincarnation: generation-1"
+			payload, err := json.Marshal([]map[string]any{{
+				"agent_state": "working", "hook_bead": "gt-work", "labels": labels,
+				"updated_at": time.Now().UTC().Format(time.RFC3339), "description": description,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bd, _ := mockBd(func(args []string) (string, error) {
+				if len(args) > 0 && args[0] == "show" {
+					return string(payload), nil
+				}
+				return "[]", nil
+			}, func([]string) error { return nil })
+			snapshot := &agentBeadSnapshot{
+				AgentState: "working", HookBead: "gt-work", Labels: labels,
+				Fields: &beads.AgentFields{Incarnation: "generation-1", CleanupStatus: "has_uncommitted"},
+			}
+
+			result, found := detectZombieLiveSession(
+				bd, t.TempDir(), t.TempDir(), "gastown", "nux", sessionName,
+				tm, intent, &config.WitnessThresholds{}, snapshot,
+			)
+			if !found || result.Classification != tt.classification {
+				t.Fatalf("result = %+v, found=%v", result, found)
+			}
+			if result.Action != "preserved-recovery-hold" || result.MutationPerformed {
+				t.Fatalf("hold result = %+v", result)
+			}
+			if restarts != 0 {
+				t.Fatalf("restart calls = %d, want 0", restarts)
+			}
+			current, err := tm.CaptureSessionGeneration(sessionName)
+			if err != nil || !current.Equal(generation) {
+				t.Fatalf("session generation changed: current=%+v err=%v", current, err)
+			}
+			if err := tm.KillSessionGeneration(generation); err != nil {
+				t.Fatalf("clean exact fixture session: %v", err)
+			}
+			if alive, err := tm.HasSession(sessionName); err != nil || alive {
+				t.Fatalf("fixture session leaked: alive=%v err=%v", alive, err)
+			}
+		})
+	}
+}
 
 func TestGuardZombieMutation(t *testing.T) {
 	originalSession := testZombieSessionGeneration("$1")
@@ -29,10 +146,12 @@ func TestGuardZombieMutation(t *testing.T) {
 		sessionErr           error
 		stillZombie          bool
 		stillZombieErr       error
+		mutationErr          error
 		wantFound            bool
 		wantAction           string
 		wantError            string
 		wantMutations        int
+		wantPerformed        bool
 	}{
 		{
 			name: "stuck done session preserves recovery hold",
@@ -152,7 +271,16 @@ func TestGuardZombieMutation(t *testing.T) {
 			expectedIncarnation: "generation-1", currentIncarnation: "generation-1",
 			expectedSession: originalSession, expectedSessionAlive: true,
 			currentSession: originalSession, currentSessionAlive: true,
-			stillZombie: true, wantFound: true, wantMutations: 1,
+			stillZombie: true, wantFound: true, wantMutations: 1, wantPerformed: true,
+		},
+		{
+			name:                "failed mutation is not reported as performed",
+			disposition:         safeZombieDisposition(),
+			expectedIncarnation: "generation-1", currentIncarnation: "generation-1",
+			expectedSession: originalSession, expectedSessionAlive: true,
+			currentSession: originalSession, currentSessionAlive: true,
+			stillZombie: true, mutationErr: lookupErr,
+			wantFound: true, wantError: "lookup failed", wantMutations: 1,
 		},
 	}
 
@@ -179,7 +307,7 @@ func TestGuardZombieMutation(t *testing.T) {
 					},
 					mutate: func(*ZombieResult, *agentBeadSnapshot) (bool, error) {
 						mutations++
-						return true, nil
+						return tt.mutationErr == nil, tt.mutationErr
 					},
 				},
 			)
@@ -201,8 +329,8 @@ func TestGuardZombieMutation(t *testing.T) {
 			if tt.wantError != "" && (got.Error == nil || !strings.Contains(got.Error.Error(), tt.wantError)) {
 				t.Errorf("error = %v, want substring %q", got.Error, tt.wantError)
 			}
-			if got.MutationPerformed != (tt.wantMutations > 0) {
-				t.Errorf("mutation_performed = %v, want %v", got.MutationPerformed, tt.wantMutations > 0)
+			if got.MutationPerformed != tt.wantPerformed {
+				t.Errorf("mutation_performed = %v, want %v", got.MutationPerformed, tt.wantPerformed)
 			}
 			if tt.expectedIncarnation != "" && got.RecoveryVerdict != tt.disposition.Verdict {
 				t.Errorf("recovery_verdict = %q, want %q", got.RecoveryVerdict, tt.disposition.Verdict)
