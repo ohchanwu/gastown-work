@@ -559,7 +559,7 @@ func (m *SessionManager) startContext(ctx context.Context, polecat string, opts 
 	sessionID := m.SessionName(polecat)
 	if opts.IfAbsent {
 		running, err := m.tmux.HasSessionContext(ctx, sessionID)
-		if err != nil {
+		if err != nil && !errors.Is(err, tmux.ErrNoServer) {
 			return fmt.Errorf("checking session: %w", err)
 		}
 		if running {

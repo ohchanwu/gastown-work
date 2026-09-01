@@ -196,6 +196,41 @@ func TestSessionManagerStartIfAbsentPreservesExistingSession(t *testing.T) {
 	}
 }
 
+func TestSessionManagerStartIfAbsentTreatsMissingServerAsAbsent(t *testing.T) {
+	requireTmux(t)
+	installMockBd(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reg := session.NewPrefixRegistry()
+	reg.Register("xz", "testrig")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-if-absent-no-server-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = tm.KillServer() })
+	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}})
+	createErr := errors.New("creation reached")
+	m.newSessionGeneration = func(context.Context, string, string, string, map[string]string) (tmux.SessionGeneration, error) {
+		return tmux.SessionGeneration{}, createErr
+	}
+
+	err := m.Start("Toast", SessionStartOptions{
+		WorkDir: workDir, Command: "sh", Incarnation: "fixture-generation", IfAbsent: true,
+	})
+	if !errors.Is(err, createErr) {
+		t.Fatalf("Start() error = %v, want creation attempt after missing server", err)
+	}
+}
+
 func TestRetirementAppliedRequiresOldSessionAbsenceAndTerminalBead(t *testing.T) {
 	setupTestRegistryForSession(t)
 	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-retirement-applied-%d", time.Now().UnixNano()))
