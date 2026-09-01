@@ -2958,7 +2958,10 @@ func TestHandleZombieRestart_SkipsWhenBranchAlreadyMerged(t *testing.T) {
 	)
 
 	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
-	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "has_unpushed", z)
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "has_unpushed", z, func() (bool, error) {
+		t.Fatal("restart called after merged-work archive")
+		return false, nil
+	})
 
 	// Action must reflect the archive decision; must NOT be a "restarted*" action.
 	if !strings.Contains(z.Action, "work-already-merged") {
@@ -2987,7 +2990,9 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 	)
 
 	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
-	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z)
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z, func() (bool, error) {
+		return true, nil
+	})
 
 	// Should NOT take the archive path.
 	if strings.Contains(z.Action, "work-already-merged") {

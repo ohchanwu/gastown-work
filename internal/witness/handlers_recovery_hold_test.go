@@ -35,9 +35,9 @@ func TestDetectZombieLiveSessionPreservesRecoveryHold(t *testing.T) {
 		}, nil
 	}
 	restarts := 0
-	restartPolecatSession = func(string, string, string) error {
+	restartPolecatSession = func(string, string, string, *tmux.Tmux, tmux.SessionGeneration, bool) (bool, error) {
 		restarts++
-		return nil
+		return true, nil
 	}
 	t.Cleanup(func() {
 		zombieRecoveryDispositionForPolecat = oldRecovery
@@ -196,6 +196,29 @@ func TestGuardZombieMutation(t *testing.T) {
 			wantAction: "preserved-recovery-check-error", wantError: "empty recovery verdict",
 		},
 		{
+			name: "unknown safe verdict fails closed",
+			disposition: polecat.WorkstateDisposition{
+				Verdict: "UNKNOWN", Reusable: true, SafeToNuke: true,
+			},
+			expectedIncarnation: "generation-1", currentIncarnation: "generation-1",
+			expectedSession: originalSession, expectedSessionAlive: true,
+			currentSession: originalSession, currentSessionAlive: true,
+			stillZombie: true, wantFound: true,
+			wantAction: "preserved-recovery-check-error", wantError: "non-canonical recovery disposition",
+		},
+		{
+			name: "contradictory safe verdict fails closed",
+			disposition: polecat.WorkstateDisposition{
+				Verdict: polecat.WorkstateVerdictSafeToNuke, Reusable: true, SafeToNuke: true,
+				NeedsRecovery: true,
+			},
+			expectedIncarnation: "generation-1", currentIncarnation: "generation-1",
+			expectedSession: originalSession, expectedSessionAlive: true,
+			currentSession: originalSession, currentSessionAlive: true,
+			stillZombie: true, wantFound: true,
+			wantAction: "preserved-recovery-check-error", wantError: "non-canonical recovery disposition",
+		},
+		{
 			name:                "agent identity lookup fails closed",
 			disposition:         safeZombieDisposition(),
 			expectedIncarnation: "generation-1", snapshotErr: lookupErr,
@@ -305,7 +328,7 @@ func TestGuardZombieMutation(t *testing.T) {
 					stillZombie: func(*agentBeadSnapshot) (bool, error) {
 						return tt.stillZombie, tt.stillZombieErr
 					},
-					mutate: func(*ZombieResult, *agentBeadSnapshot) (bool, error) {
+					mutate: func(*ZombieResult, *agentBeadSnapshot, tmux.SessionGeneration, bool) (bool, error) {
 						mutations++
 						return tt.mutationErr == nil, tt.mutationErr
 					},
@@ -343,7 +366,103 @@ func TestGuardZombieMutation(t *testing.T) {
 }
 
 func safeZombieDisposition() polecat.WorkstateDisposition {
-	return polecat.WorkstateDisposition{Verdict: polecat.WorkstateVerdictSafeToNuke, SafeToNuke: true}
+	return polecat.WorkstateDisposition{Verdict: polecat.WorkstateVerdictSafeToNuke, Reusable: true, SafeToNuke: true}
+}
+
+func TestRestartPolecatSessionGenerationWithFailsClosedAndReportsPartialMutation(t *testing.T) {
+	generation := testZombieSessionGeneration("$restart")
+
+	t.Run("replacement after final validation", func(t *testing.T) {
+		starts := 0
+		performed, err := restartPolecatSessionGenerationWith(generation, true,
+			func(got tmux.SessionGeneration) error {
+				if !got.Equal(generation) {
+					t.Fatalf("stop generation = %+v, want exact %+v", got, generation)
+				}
+				return tmux.ErrSessionGenerationChanged
+			},
+			func() error { starts++; return nil },
+		)
+		if performed || !errors.Is(err, tmux.ErrSessionGenerationChanged) || starts != 0 {
+			t.Fatalf("restart = performed %v, err %v, starts %d; want preserved replacement", performed, err, starts)
+		}
+	})
+
+	t.Run("stop succeeds and start fails", func(t *testing.T) {
+		startErr := errors.New("start failed")
+		performed, err := restartPolecatSessionGenerationWith(generation, true,
+			func(tmux.SessionGeneration) error { return nil },
+			func() error { return startErr },
+		)
+		if !performed || !errors.Is(err, startErr) {
+			t.Fatalf("restart = performed %v, err %v; want truthful partial mutation", performed, err)
+		}
+	})
+}
+
+func TestRestartPolecatSessionProductionComposition(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("isolated tmux fixture is Unix-only")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is unavailable")
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "gt"), []byte("#!/bin/sh\nexit 23\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	socket := fmt.Sprintf("gt-restart-custody-%d-%d", os.Getpid(), time.Now().UnixNano())
+	env := []string{"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=/tmp"}
+	tm := tmux.NewTmuxWithSocketAndEnv(socket, env)
+	sessionName := "gastown-nux"
+	t.Cleanup(func() {
+		_ = tm.KillServer()
+		_ = os.Remove(filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()), socket))
+	})
+	start := func(nonce string) tmux.SessionGeneration {
+		cmd := exec.Command("tmux", "-L", socket, "new-session", "-d", "-s", sessionName,
+			"-e", tmux.EnvSessionGeneration+"="+nonce,
+			"-e", tmux.EnvSessionCustody+"=fixture-custody-0001",
+			"-e", tmux.EnvSessionPane+"=", "sleep 60")
+		cmd.Env = env
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("create isolated session: %v: %s", err, output)
+		}
+		generation, err := tm.CaptureSessionGeneration(sessionName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return generation
+	}
+
+	original := start("original-generation")
+	if err := tm.KillSessionGeneration(original); err != nil {
+		t.Fatal(err)
+	}
+	replacement := start("replacement-generation")
+	performed, err := RestartPolecatSession(t.TempDir(), "gastown", "nux", tm, original, true)
+	if performed || !errors.Is(err, tmux.ErrSessionGenerationChanged) {
+		t.Fatalf("replacement restart = performed %v, err %v", performed, err)
+	}
+	current, err := tm.CaptureSessionGeneration(sessionName)
+	if err != nil || !current.Equal(replacement) {
+		t.Fatalf("replacement changed: current=%+v err=%v", current, err)
+	}
+	if err := tm.KillSessionGeneration(replacement); err != nil {
+		t.Fatal(err)
+	}
+
+	startFailure := start("start-failure-generation")
+	performed, err = RestartPolecatSession(t.TempDir(), "gastown", "nux", tm, startFailure, true)
+	if !performed || err == nil || !strings.Contains(err.Error(), "starting replacement session") {
+		t.Fatalf("partial restart = performed %v, err %v", performed, err)
+	}
+	if alive, err := tm.HasSession(sessionName); err != nil || alive {
+		t.Fatalf("stopped generation remains: alive=%v err=%v", alive, err)
+	}
 }
 
 func testZombieSessionGeneration(id string) tmux.SessionGeneration {
