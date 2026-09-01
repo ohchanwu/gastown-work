@@ -3745,6 +3745,46 @@ exit 0
 	}
 }
 
+func TestRemoveDatabasePreservesDirectoryWhenUserTableProbeFails(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
+case "$*" in
+  *"SHOW TABLES"*) printf 'inspection unavailable\n' >&2; exit 1 ;;
+  *"DROP DATABASE"*|*"DELETE FROM dolt_branch_control"*) exit 0 ;;
+esac
+exit 0
+`)
+
+	err := RemoveDatabase(townRoot, "testdb_remove", false)
+	if err == nil || !strings.Contains(err.Error(), "inspecting user tables") {
+		t.Fatalf("RemoveDatabase() error = %v, want table-inspection failure", err)
+	}
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		t.Fatalf("database directory was not preserved: %v", statErr)
+	}
+}
+
+func TestRemoveDatabaseDropFailureDoesNotDeleteBranchControl(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "branch-delete-ran")
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, fmt.Sprintf(`
+case "$*" in
+  *"DROP DATABASE"*) printf 'transport failure\n' >&2; exit 1 ;;
+  *"DELETE FROM dolt_branch_control"*) printf ran > %q; exit 0 ;;
+esac
+exit 0
+`, marker))
+
+	err := RemoveDatabase(townRoot, "testdb_remove", true)
+	if err == nil || !strings.Contains(err.Error(), "dropping database") {
+		t.Fatalf("RemoveDatabase() error = %v, want DROP failure", err)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("branch-control deletion ran before failed DROP: %v", statErr)
+	}
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		t.Fatalf("database directory was not preserved: %v", statErr)
+	}
+}
+
 func TestRemoveDatabasePreservesDirectoryOnBranchControlFailure(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
 case "$*" in
@@ -3763,10 +3803,10 @@ exit 0
 	}
 }
 
-func TestRemoveDatabaseSelectsTargetForBranchControlCleanup(t *testing.T) {
+func TestRemoveDatabaseSelectsSurvivingDatabaseForBranchControlCleanup(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
 case "$*" in
-  *"USE "*"DELETE FROM dolt_branch_control"*) exit 0 ;;
+  *"USE "*"control_db"*"DELETE FROM dolt_branch_control"*) exit 0 ;;
   *"DELETE FROM dolt_branch_control"*) printf 'no database selected\n' >&2; exit 1 ;;
   *"DROP DATABASE"*) exit 0 ;;
 esac
@@ -3809,6 +3849,7 @@ func setupRemoveDatabaseSQLTest(t *testing.T, behavior string) (string, string) 
 	if err := os.MkdirAll(filepath.Join(dbPath, ".dolt"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), "control_db")
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -506,11 +506,12 @@ After migration, 'bd mol wisp list' will work and agent lifecycle
 }
 
 var (
-	doltLogLines     int
-	doltLogFollow    bool
-	doltMigrateDry   bool
-	doltCleanupDry   bool
-	doltCleanupForce bool
+	doltLogLines            int
+	doltLogFollow           bool
+	doltMigrateDry          bool
+	doltCleanupDry          bool
+	doltCleanupForce        bool
+	listDatabasesForCleanup = doltserver.ListDatabases
 
 	doltMigrateWispsDry bool
 	doltMigrateWispsDB  string
@@ -1386,10 +1387,13 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	// BALK: If orphans are a large fraction of all databases, something is likely
 	// wrong with the orphan detection (e.g., metadata files not found). Refuse to
 	// proceed without --force to prevent accidentally dropping production databases. (gt-xvh)
-	allDBs, _ := doltserver.ListDatabases(townRoot)
-	if len(allDBs) > 0 && !doltCleanupForce {
+	if !doltCleanupForce {
+		allDBs, listErr := listDatabasesForCleanup(townRoot)
+		if listErr != nil {
+			return fmt.Errorf("listing databases for cleanup safety: %w", listErr)
+		}
 		orphanRatio := float64(len(orphans)) / float64(len(allDBs))
-		if orphanRatio > 0.5 && len(orphans) > 3 {
+		if len(allDBs) > 0 && orphanRatio > 0.5 && len(orphans) > 3 {
 			fmt.Printf("\n%s %d of %d databases (%.0f%%) flagged as orphans — this is suspicious.\n",
 				style.Bold.Render("!"), len(orphans), len(allDBs), orphanRatio*100)
 			fmt.Printf("  This usually means metadata.json files are missing or incorrect,\n")

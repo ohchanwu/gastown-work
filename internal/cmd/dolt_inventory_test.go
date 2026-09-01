@@ -191,6 +191,40 @@ exit 2
 	}
 }
 
+func TestRunDoltCleanupStopsWhenDatabaseInventoryFails(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	noms := filepath.Join(townRoot, ".dolt-data", "testdb_unverified", ".dolt", "noms")
+	if err := os.MkdirAll(noms, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(noms, "manifest"), []byte("test"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(townRoot)
+	oldDry, oldForce := doltCleanupDry, doltCleanupForce
+	doltCleanupDry, doltCleanupForce = false, false
+	oldList := listDatabasesForCleanup
+	listDatabasesForCleanup = func(string) ([]string, error) {
+		return nil, errors.New("catalog unavailable")
+	}
+	t.Cleanup(func() {
+		doltCleanupDry, doltCleanupForce = oldDry, oldForce
+		listDatabasesForCleanup = oldList
+	})
+
+	err := runDoltCleanup(nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "listing databases for cleanup safety") {
+		t.Fatalf("runDoltCleanup() error = %v, want inventory failure", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(townRoot, ".dolt-data", "testdb_unverified")); statErr != nil {
+		t.Fatalf("orphan was not preserved: %v", statErr)
+	}
+}
+
 func TestSummarizeDoltInventoryUsesActionableClassification(t *testing.T) {
 	inventory := []doltserver.LocalDoltServer{
 		{Class: doltserver.DoltServerCanonical},

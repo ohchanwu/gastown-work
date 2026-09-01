@@ -4001,7 +4001,11 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 	if !force {
 		if running {
 			// Server is up — check via SQL for user tables
-			if hasData, _ := databaseHasUserTables(townRoot, dbName); hasData {
+			hasData, inspectErr := databaseHasUserTables(townRoot, dbName)
+			if inspectErr != nil {
+				return fmt.Errorf("inspecting user tables in database %q: %w", dbName, inspectErr)
+			}
+			if hasData {
 				return fmt.Errorf("database %q has user tables — use --force to remove", dbName)
 			}
 		} else {
@@ -4017,17 +4021,15 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 		}
 	}
 
-	// If server is running, clean up branch control entries and then DROP the database.
+	// If server is running, DROP the database and then clean up branch control entries.
 	// In Dolt 1.81.x, DROP DATABASE does not automatically remove dolt_branch_control
 	// entries for the dropped database. These stale entries cause the database directory
 	// to be recreated when connections reference the database name (gt-zlv7l).
 	if running {
-		// dolt_branch_control is global but exposed through each Dolt database, so select
-		// the target while it is still loaded. Fail closed before DROP if cleanup is uncertain.
 		identifier := strings.ReplaceAll(dbName, "`", "``")
-		branchQuery := fmt.Sprintf("USE `%s`; DELETE FROM dolt_branch_control WHERE `database` = '%s'", identifier, EscapeSQL(dbName))
-		if err := serverExecSQL(townRoot, branchQuery); err != nil {
-			return fmt.Errorf("cleaning branch-control entries for database %q: %w", dbName, err)
+		controlDB, controlErr := branchControlDatabase(townRoot, dbName)
+		if controlErr != nil {
+			return controlErr
 		}
 
 		// Try to DROP — capture errors for read-only detection (gt-r1cyd)
@@ -4039,6 +4041,15 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 				return fmt.Errorf("dropping database %q: %w", dbName, dropErr)
 			}
 		}
+
+		// dolt_branch_control is global but exposed through each loaded Dolt database.
+		// Select a surviving database so a failed DROP cannot leave branch-control state
+		// partially removed and a successful DROP cannot invalidate the cleanup context.
+		controlIdentifier := strings.ReplaceAll(controlDB, "`", "``")
+		branchQuery := fmt.Sprintf("USE `%s`; DELETE FROM dolt_branch_control WHERE `database` = '%s'", controlIdentifier, EscapeSQL(dbName))
+		if err := serverExecSQL(townRoot, branchQuery); err != nil {
+			return fmt.Errorf("cleaning branch-control entries for database %q: %w", dbName, err)
+		}
 	}
 
 	InvalidateDBCache() // Database removed — bust the cache.
@@ -4049,6 +4060,19 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 	}
 
 	return nil
+}
+
+func branchControlDatabase(townRoot, removedDB string) (string, error) {
+	databases, err := ListDatabases(townRoot)
+	if err != nil {
+		return "", fmt.Errorf("listing databases for branch-control cleanup: %w", err)
+	}
+	for _, database := range databases {
+		if database != removedDB {
+			return database, nil
+		}
+	}
+	return "", fmt.Errorf("no surviving database available for branch-control cleanup of %q", removedDB)
 }
 
 func isDatabaseNotFoundError(err error) bool {
