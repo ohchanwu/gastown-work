@@ -88,6 +88,43 @@ func TestRenderDoltCleanupListenerReportInventoriesAtReportTime(t *testing.T) {
 	}
 }
 
+func TestRunDoltCleanupReturnsNonzeroOnRefusedOrphan(t *testing.T) {
+	townRoot := t.TempDir()
+	dbPath := filepath.Join(townRoot, ".dolt-data", "testdb_refused", ".dolt", "noms")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dbPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dbPath, "manifest"), []byte("test"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dbPath, "data"), make([]byte, 2<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_DOLT_PORT", "1")
+	t.Chdir(townRoot)
+	oldDry, oldForce := doltCleanupDry, doltCleanupForce
+	doltCleanupDry, doltCleanupForce = false, false
+	t.Cleanup(func() { doltCleanupDry, doltCleanupForce = oldDry, oldForce })
+
+	var runErr error
+	output := captureStdout(t, func() { runErr = runDoltCleanup(nil, nil) })
+	if runErr == nil {
+		t.Fatal("runDoltCleanup() succeeded after refusing an orphan")
+	}
+	if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", "testdb_refused")); err != nil {
+		t.Fatalf("refused orphan was not preserved: %v", err)
+	}
+	if !strings.Contains(output, "Process cleanup was not performed.") {
+		t.Fatalf("final listener report did not run: %q", output)
+	}
+	if strings.Contains(output, "✓ Removed 0/1") {
+		t.Fatalf("partial cleanup rendered a success marker: %q", output)
+	}
+}
+
 func TestSummarizeDoltInventoryUsesActionableClassification(t *testing.T) {
 	inventory := []doltserver.LocalDoltServer{
 		{Class: doltserver.DoltServerCanonical},

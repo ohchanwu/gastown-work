@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1418,12 +1419,15 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 
 	fmt.Println()
 	removed := 0
+	var cleanupErr error
 	for _, o := range orphans {
 		if err := doltserver.RemoveDatabase(townRoot, o.Name, doltCleanupForce); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("removing database %s: %w", o.Name, err))
 			// If DROP caused read-only, stop immediately and recover (gt-r1cyd)
 			if doltserver.IsReadOnlyError(err.Error()) {
 				fmt.Printf("  %s DROP put server into read-only mode — attempting recovery...\n", style.Bold.Render("!"))
 				if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("recovering read-only server: %w", recoverErr))
 					fmt.Printf("  %s Recovery failed: %v\n", style.Bold.Render("✗"), recoverErr)
 					fmt.Printf("  Run: gt dolt stop && gt dolt start\n")
 				} else {
@@ -1441,6 +1445,7 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		if readOnly, _ := doltserver.CheckReadOnly(townRoot); readOnly {
 			fmt.Printf("  %s Server went read-only after DROP — attempting recovery...\n", style.Bold.Render("!"))
 			if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("recovering read-only server: %w", recoverErr))
 				fmt.Printf("  %s Recovery failed: %v\n", style.Bold.Render("✗"), recoverErr)
 				fmt.Printf("  Run: gt dolt stop && gt dolt start\n")
 				break
@@ -1449,11 +1454,15 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("\n%s Removed %d/%d orphaned database(s)\n",
-		style.Bold.Render("✓"), removed, len(orphans))
-	return renderDoltCleanupListenerReport(os.Stdout, false, func() ([]doltserver.LocalDoltServer, error) {
+	marker := "✓"
+	if cleanupErr != nil {
+		marker = "!"
+	}
+	fmt.Printf("\n%s Removed %d/%d orphaned database(s)\n", style.Bold.Render(marker), removed, len(orphans))
+	reportErr := renderDoltCleanupListenerReport(os.Stdout, false, func() ([]doltserver.LocalDoltServer, error) {
 		return doltserver.InventoryLocalDoltServersWithError(townRoot)
 	})
+	return errors.Join(cleanupErr, reportErr)
 }
 
 func runDoltList(cmd *cobra.Command, args []string) error {
