@@ -2041,9 +2041,18 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 		return 0, fmt.Errorf("refusing to reap Dolt outside temp dir: %s", absRoot)
 	}
 
+	rescan := func() ([]LocalDoltServer, error) {
+		return InventoryLocalDoltServersWithError(absRoot)
+	}
+	stopped, err := reapOwnedTestServersWith(absRoot, rescan, func(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error)) error {
+		return terminateSelectedTestLeak(selection, rescan)
+	})
+	if err != nil {
+		return 0, err
+	}
+
 	config := DefaultConfig(absRoot)
 	candidates := ownedDoltTestServerCandidates(absRoot, config)
-	stopped := 0
 	for _, pid := range candidates {
 		if pid <= 0 || pid == os.Getpid() || !processIsAlive(pid) {
 			continue
@@ -2054,28 +2063,45 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 		if !doltProcessMatchesTown(absRoot, pid, config) {
 			continue
 		}
+		processToken := getProcessStartToken(pid)
+		if processToken == "" {
+			return stopped, fmt.Errorf("capturing owned Dolt PID %d identity", pid)
+		}
 		proc, err := os.FindProcess(pid)
 		if err != nil {
-			continue
+			return stopped, fmt.Errorf("finding owned Dolt PID %d: %w", pid, err)
 		}
-		if err := gracefulTerminate(proc); err != nil {
+		if err := terminateRevalidatedProcess(pid, func() (bool, error) {
+			if !processIsAlive(pid) {
+				return false, nil
+			}
+			return getProcessStartToken(pid) == processToken && isDoltSQLServerProcess(pid) && doltProcessMatchesTown(absRoot, pid, config), nil
+		}, func(kill bool) error {
+			if kill {
+				return proc.Kill()
+			}
+			return gracefulTerminate(proc)
+		}, time.Sleep); err != nil {
 			return stopped, fmt.Errorf("terminating owned Dolt PID %d: %w", pid, err)
 		}
-		for i := 0; i < 20; i++ {
-			time.Sleep(100 * time.Millisecond)
-			if !processIsAlive(pid) {
-				stopped++
-				break
-			}
-		}
-		if processIsAlive(pid) {
-			_ = proc.Kill()
-			time.Sleep(100 * time.Millisecond)
-			stopped++
-		}
+		stopped++
 	}
 
 	return stopped, nil
+}
+
+func reapOwnedTestServersWith(ownerRoot string, rescan func() ([]LocalDoltServer, error), terminate func(TestLeakSelection, func() ([]LocalDoltServer, error)) error) (int, error) {
+	initial, err := rescan()
+	if err != nil {
+		return 0, err
+	}
+	preview := TestLeakSelections(testLeaksWithin(initial, ownerRoot))
+	if err := remediatePreviewedTestLeaks(initial, preview, true, func(selection TestLeakSelection) error {
+		return terminate(selection, rescan)
+	}, rescan); err != nil {
+		return 0, err
+	}
+	return len(preview), nil
 }
 
 func ownedDoltTestServerCandidates(townRoot string, config *Config) []int {

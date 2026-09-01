@@ -156,9 +156,9 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 		t.Fatalf("starting Dolt container: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(ctr); err != nil {
-			t.Logf("terminating Dolt container: %v", err)
-		}
+		terminateDoltContainerOnCleanup(t, func() error {
+			return testcontainers.TerminateContainer(ctr)
+		})
 	})
 
 	port, err := ctr.MappedPort(ctx, "3306/tcp")
@@ -169,6 +169,12 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 	portStr := port.Port()
 	t.Setenv("GT_DOLT_PORT", portStr)
 	return portStr
+}
+
+func terminateDoltContainerOnCleanup(t interface{ Errorf(string, ...any) }, terminate func() error) {
+	if err := terminate(); err != nil {
+		t.Errorf("terminating Dolt container: %v", err)
+	}
 }
 
 // EnsureDoltContainerForTestMain starts a shared Dolt container for use in

@@ -5,6 +5,7 @@ package testutil
 import (
 	"errors"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -86,5 +87,26 @@ func TestEnsureDoltContainerForTestMainPoisonsRouteWhenDockerUnavailable(t *test
 	}
 	if got := os.Getenv("GT_TEST_EXTERNAL_DOLT"); got != "" {
 		t.Errorf("GT_TEST_EXTERNAL_DOLT = %q, want unset", got)
+	}
+}
+
+func TestTerminateDoltContainerOnCleanupFailsResponsibleTest(t *testing.T) {
+	want := errors.New("container runtime refused termination")
+	recorder := &cleanupRecorder{}
+
+	terminateDoltContainerOnCleanup(recorder, func() error { return want })
+
+	if len(recorder.errors) != 1 || !strings.Contains(recorder.errors[0], want.Error()) {
+		t.Fatalf("cleanup errors = %v, want preserved cause %q", recorder.errors, want)
+	}
+}
+
+func TestTerminateDoltContainerOnCleanupAcceptsSuccess(t *testing.T) {
+	recorder := &cleanupRecorder{}
+
+	terminateDoltContainerOnCleanup(recorder, func() error { return nil })
+
+	if len(recorder.errors) != 0 {
+		t.Fatalf("cleanup errors = %v, want none", recorder.errors)
 	}
 }

@@ -17,7 +17,7 @@ func TestMain(m *testing.M) {
 	// accumulation in the shared production Dolt data dir.
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
 		fmt.Fprintf(os.Stderr, "convoy TestMain: setup failed: %v\n", err)
-		os.Exit(convoyTestMainExitCode(0, err, nil))
+		os.Exit(testutil.DoltTestMainExitCode(0, err, nil))
 	}
 
 	code := m.Run()
@@ -25,12 +25,5 @@ func TestMain(m *testing.M) {
 	if cleanupErr != nil {
 		fmt.Fprintf(os.Stderr, "convoy TestMain: cleanup failed: %v\n", cleanupErr)
 	}
-	os.Exit(convoyTestMainExitCode(code, nil, cleanupErr))
-}
-
-func convoyTestMainExitCode(testCode int, setupErr, cleanupErr error) int {
-	if setupErr != nil || cleanupErr != nil {
-		return 1
-	}
-	return testCode
+	os.Exit(testutil.DoltTestMainExitCode(code, nil, cleanupErr))
 }

@@ -287,6 +287,9 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "remove tmux test socket directory: %v\n", err)
 		code = 1
 	}
-	testutil.TerminateDoltContainer()
-	os.Exit(code)
+	cleanupErr := testutil.TerminateDoltContainer()
+	if cleanupErr != nil {
+		fmt.Fprintf(os.Stderr, "polecat TestMain: Dolt cleanup failed: %v\n", cleanupErr)
+	}
+	os.Exit(testutil.DoltTestMainExitCode(code, nil, cleanupErr))
 }

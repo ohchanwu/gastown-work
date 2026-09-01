@@ -838,6 +838,107 @@ func TestReapOwnedTestServersRefusesNonTempRoot(t *testing.T) {
 	}
 }
 
+func TestReapOwnedTestServersWithVerifiesExactAbsence(t *testing.T) {
+	ownerRoot := t.TempDir()
+	leak := LocalDoltServer{
+		DoltListener: DoltListener{PID: 801, Port: 4801},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(ownerRoot, ".dolt-data"),
+		ProcessToken: "original-start",
+	}
+	current := []LocalDoltServer{leak}
+	signals := 0
+
+	stopped, err := reapOwnedTestServersWith(ownerRoot,
+		func() ([]LocalDoltServer, error) { return current, nil },
+		func(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error)) error {
+			return terminateSelectedTestLeakWith(selection, rescan, func(bool) error {
+				signals++
+				current = nil
+				return nil
+			}, func(time.Duration) {})
+		})
+	if err != nil {
+		t.Fatalf("reapOwnedTestServersWith: %v", err)
+	}
+	if stopped != 1 || signals != 1 {
+		t.Fatalf("stopped = %d, signals = %d, want 1 and 1", stopped, signals)
+	}
+}
+
+func TestReapOwnedTestServersWithRejectsSurvivingListener(t *testing.T) {
+	ownerRoot := t.TempDir()
+	leak := LocalDoltServer{
+		DoltListener: DoltListener{PID: 802, Port: 4802},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(ownerRoot, ".dolt-data"),
+		ProcessToken: "survivor-start",
+	}
+	signals := 0
+	stopped, err := reapOwnedTestServersWith(ownerRoot,
+		func() ([]LocalDoltServer, error) { return []LocalDoltServer{leak}, nil },
+		func(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error)) error {
+			return terminateSelectedTestLeakWith(selection, rescan, func(bool) error {
+				signals++
+				return nil
+			}, func(time.Duration) {})
+		})
+	if err == nil {
+		t.Fatal("reap accepted a listener that survived graceful and forceful termination")
+	}
+	if stopped != 0 || signals != 2 {
+		t.Fatalf("stopped = %d, signals = %d, want 0 and 2", stopped, signals)
+	}
+}
+
+func TestReapOwnedTestServersWithRejectsIdentityChangeBeforeSignal(t *testing.T) {
+	ownerRoot := t.TempDir()
+	original := LocalDoltServer{
+		DoltListener: DoltListener{PID: 803, Port: 4803},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(ownerRoot, ".dolt-data"),
+		ProcessToken: "original-start",
+	}
+	changed := original
+	changed.ProcessToken = "replacement-start"
+	rescans := 0
+	signals := 0
+
+	stopped, err := reapOwnedTestServersWith(ownerRoot,
+		func() ([]LocalDoltServer, error) {
+			rescans++
+			if rescans == 1 {
+				return []LocalDoltServer{original}, nil
+			}
+			return []LocalDoltServer{changed}, nil
+		},
+		func(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error)) error {
+			return terminateSelectedTestLeakWith(selection, rescan, func(bool) error {
+				signals++
+				return nil
+			}, func(time.Duration) {})
+		})
+	if err == nil {
+		t.Fatal("reap accepted a changed process identity")
+	}
+	if stopped != 0 || signals != 0 {
+		t.Fatalf("stopped = %d, signals = %d, want no mutation", stopped, signals)
+	}
+}
+
+func TestReapOwnedTestServersWithPropagatesInventoryFailure(t *testing.T) {
+	want := errors.New("listener discovery failed")
+	stopped, err := reapOwnedTestServersWith(t.TempDir(),
+		func() ([]LocalDoltServer, error) { return nil, want },
+		func(TestLeakSelection, func() ([]LocalDoltServer, error)) error {
+			t.Fatal("terminate called after inventory failure")
+			return nil
+		})
+	if !errors.Is(err, want) || stopped != 0 {
+		t.Fatalf("stopped = %d, error = %v, want 0 and %v", stopped, err, want)
+	}
+}
+
 func TestReapOwnedTestServersIgnoresNonDoltPID(t *testing.T) {
 	townRoot := t.TempDir()
 	config := DefaultConfig(townRoot)
@@ -5514,12 +5615,9 @@ func TestCountDoltDatabases(t *testing.T) {
 // refuses to delete databases with >1MB of data when the server is offline
 // and --force is not set. (gt-xvh)
 func TestRemoveDatabase_RefusesLargeDBWhenServerDown(t *testing.T) {
-	// Skip if a real Dolt server is running on the default port — IsRunning
-	// would detect it and take the SQL-check path instead of the size-check path.
-	if conn, err := net.DialTimeout("tcp", "127.0.0.1:3307", time.Second); err == nil {
-		conn.Close()
-		t.Skip("skipping: real Dolt server running on port 3307 would bypass size check")
-	}
+	// Use the established unavailable route so ambient Dolt servers cannot
+	// switch this filesystem-only test onto the SQL path mid-run.
+	t.Setenv("GT_DOLT_PORT", "1")
 
 	townRoot := t.TempDir()
 	dataDir := filepath.Join(townRoot, ".dolt-data")

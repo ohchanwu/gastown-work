@@ -22,11 +22,6 @@ func requireDoltServer(t *testing.T) {
 	testutil.RequireDoltContainer(t)
 }
 
-// cleanupDoltServer delegates to testutil.TerminateDoltContainer.
-func cleanupDoltServer() {
-	testutil.TerminateDoltContainer()
-}
-
 // configureTestGitIdentity sets git global config in an isolated HOME directory
 // so that EnsureDoltIdentity (called during gt install preflight) can copy
 // identity from git to dolt.

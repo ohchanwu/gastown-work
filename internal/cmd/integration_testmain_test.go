@@ -24,12 +24,14 @@ func TestMain(m *testing.M) {
 	// preventing orphan accumulation in the shared production Dolt data dir.
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
 		fmt.Fprintf(os.Stderr, "integration TestMain: dolt setup: %v\n", err)
-		os.Exit(1)
+		os.Exit(testutil.DoltTestMainExitCode(0, err, nil))
 	}
 
 	code := m.Run()
 
-	// Clean up the shared Dolt container.
-	testutil.TerminateDoltContainer()
-	os.Exit(code)
+	cleanupErr := testutil.TerminateDoltContainer()
+	if cleanupErr != nil {
+		fmt.Fprintf(os.Stderr, "integration TestMain: dolt cleanup: %v\n", cleanupErr)
+	}
+	os.Exit(testutil.DoltTestMainExitCode(code, nil, cleanupErr))
 }

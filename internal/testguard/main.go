@@ -31,7 +31,11 @@ func main() {
 			break
 		}
 		var baseline []doltserver.DoltListener
-		baseline, err = doltserver.FindAllDoltListenersWithError()
+		var townRoot string
+		townRoot, err = workspace.FindFromCwdOrError()
+		if err == nil {
+			baseline, err = localDoltListenersWith(townRoot, doltserver.InventoryLocalDoltServersWithError)
+		}
 		if err == nil {
 			_, err = requiredBaselineListener(baseline, launcherPID)
 		}
@@ -182,6 +186,18 @@ func requiredBaselineListener(baseline []doltserver.DoltListener, launcherPID in
 	return doltserver.DoltListener{}, fmt.Errorf("launcher PID %d missing from listener inventory", launcherPID)
 }
 
+func localDoltListenersWith(townRoot string, inventory func(string) ([]doltserver.LocalDoltServer, error)) ([]doltserver.DoltListener, error) {
+	servers, err := inventory(townRoot)
+	if err != nil {
+		return nil, err
+	}
+	listeners := make([]doltserver.DoltListener, len(servers))
+	for i, server := range servers {
+		listeners[i] = server.DoltListener
+	}
+	return listeners, nil
+}
+
 func cleanupSinceBaseline(path string, launcherPID int, ownerRoot string) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -202,7 +218,11 @@ func cleanupSinceBaseline(path string, launcherPID int, ownerRoot string) error 
 	if err != nil {
 		return err
 	}
-	current, err := doltserver.FindAllDoltListenersWithError()
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("find Gas Town workspace: %w", err)
+	}
+	current, err := localDoltListenersWith(townRoot, doltserver.InventoryLocalDoltServersWithError)
 	if err != nil {
 		return err
 	}
@@ -215,10 +235,6 @@ func cleanupSinceBaseline(path string, launcherPID int, ownerRoot string) error 
 	}
 	if !found {
 		return fmt.Errorf("launcher listener PID %d port %d missing during cleanup", required.PID, required.Port)
-	}
-	townRoot, err := workspace.FindFromCwdOrError()
-	if err != nil {
-		return fmt.Errorf("find Gas Town workspace: %w", err)
 	}
 	return doltserver.CleanupOwnedLocalTestLeaks(townRoot, baseline, ownerRoot)
 }

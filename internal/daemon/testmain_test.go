@@ -26,10 +26,11 @@ func TestMain(m *testing.M) {
 	// preventing orphan accumulation in the shared production Dolt data dir.
 	//
 	// When Docker is unavailable, Dolt-needing tests self-skip via
-	// setupTestStore → beadsdk.Open failure. Non-Dolt tests (e.g.
-	// boot_spawn_frequency_test.go) still run. (fixes gt-kw4449)
-	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
-		fmt.Fprintf(os.Stderr, "daemon TestMain: Dolt container unavailable (%v), Dolt-dependent tests will skip\n", err)
+	// setupTestStore → beadsdk.Open failure. Non-Dolt tests still run, but the
+	// package remains failed because setup was incomplete. (fixes gt-kw4449)
+	setupErr := testutil.EnsureDoltContainerForTestMain()
+	if setupErr != nil {
+		fmt.Fprintf(os.Stderr, "daemon TestMain: Dolt container unavailable (%v), Dolt-dependent tests will skip\n", setupErr)
 	}
 
 	// Isolate tmux sessions on a package-specific socket.
@@ -50,8 +51,11 @@ func TestMain(m *testing.M) {
 		socketPath := filepath.Join(tmux.SocketDir(), tmuxSocket)
 		_ = os.Remove(socketPath)
 	}
-	testutil.TerminateDoltContainer()
-	os.Exit(code)
+	cleanupErr := testutil.TerminateDoltContainer()
+	if cleanupErr != nil {
+		fmt.Fprintf(os.Stderr, "daemon TestMain: Dolt cleanup failed: %v\n", cleanupErr)
+	}
+	os.Exit(testutil.DoltTestMainExitCode(code, setupErr, cleanupErr))
 }
 
 func runTestNudgePoller(session string) int {

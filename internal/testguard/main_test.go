@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,6 +10,29 @@ import (
 
 	"github.com/steveyegge/gastown/internal/doltserver"
 )
+
+func TestLocalDoltListenersWithPropagatesInventoryFailure(t *testing.T) {
+	want := errors.New("listener inventory failed")
+	listeners, err := localDoltListenersWith("/town", func(string) ([]doltserver.LocalDoltServer, error) {
+		return nil, want
+	})
+	if !errors.Is(err, want) || listeners != nil {
+		t.Fatalf("listeners = %v, error = %v, want nil and %v", listeners, err, want)
+	}
+}
+
+func TestLocalDoltListenersWithPreservesExactPIDAndPort(t *testing.T) {
+	want := []doltserver.DoltListener{{PID: 101, Port: 4401}, {PID: 202, Port: 4402}}
+	listeners, err := localDoltListenersWith("/town", func(string) ([]doltserver.LocalDoltServer, error) {
+		return []doltserver.LocalDoltServer{
+			{DoltListener: want[0], Class: doltserver.DoltServerCanonical},
+			{DoltListener: want[1], Class: doltserver.DoltServerOwnedTestLeak},
+		}, nil
+	})
+	if err != nil || !reflect.DeepEqual(listeners, want) {
+		t.Fatalf("listeners = %v, error = %v, want %v", listeners, err, want)
+	}
+}
 
 func TestWriteBaselineCreatesPrivateReceipt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "baseline.json")

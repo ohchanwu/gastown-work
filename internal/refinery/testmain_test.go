@@ -1,6 +1,7 @@
 package refinery
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -9,6 +10,9 @@ import (
 
 func TestMain(m *testing.M) {
 	code := m.Run()
-	testutil.TerminateDoltContainer()
-	os.Exit(code)
+	cleanupErr := testutil.TerminateDoltContainer()
+	if cleanupErr != nil {
+		fmt.Fprintf(os.Stderr, "refinery TestMain: Dolt cleanup failed: %v\n", cleanupErr)
+	}
+	os.Exit(testutil.DoltTestMainExitCode(code, nil, cleanupErr))
 }
