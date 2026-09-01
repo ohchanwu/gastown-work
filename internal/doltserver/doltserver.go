@@ -1729,6 +1729,31 @@ func hasTestLeakSelection(inventory []LocalDoltServer, selection TestLeakSelecti
 	return false
 }
 
+type revalidatedProcessState uint8
+
+const (
+	revalidatedProcessAbsent revalidatedProcessState = iota
+	revalidatedProcessOwned
+	revalidatedProcessChanged
+)
+
+func testLeakSelectionState(inventory []LocalDoltServer, selection TestLeakSelection) revalidatedProcessState {
+	pidFound := false
+	for _, server := range inventory {
+		if server.PID != selection.PID {
+			continue
+		}
+		pidFound = true
+		if newTestLeakSelection(server) == selection {
+			return revalidatedProcessOwned
+		}
+	}
+	if pidFound || processIsAlive(selection.PID) {
+		return revalidatedProcessChanged
+	}
+	return revalidatedProcessAbsent
+}
+
 func terminateSelectedTestLeak(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error)) error {
 	process, err := os.FindProcess(selection.PID)
 	if err != nil {
@@ -1743,49 +1768,61 @@ func terminateSelectedTestLeak(selection TestLeakSelection, rescan func() ([]Loc
 }
 
 func terminateSelectedTestLeakWith(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error), signal func(bool) error, pause func(time.Duration)) error {
-	return terminateRevalidatedProcess(selection.PID, func() (bool, error) {
+	return terminateRevalidatedProcess(selection.PID, func() (revalidatedProcessState, error) {
 		current, err := rescan()
-		return hasTestLeakSelection(current, selection), err
+		return testLeakSelectionState(current, selection), err
 	}, signal, pause)
 }
 
-func terminateRevalidatedProcess(pid int, stillOwned func() (bool, error), signal func(bool) error, pause func(time.Duration)) error {
-	owned, err := stillOwned()
+func terminateRevalidatedProcess(pid int, currentState func() (revalidatedProcessState, error), signal func(bool) error, pause func(time.Duration)) error {
+	state, err := currentState()
 	if err != nil {
 		return err
 	}
-	if !owned {
+	if state == revalidatedProcessChanged {
 		return fmt.Errorf("process identity changed for PID %d", pid)
+	}
+	if state == revalidatedProcessAbsent {
+		return fmt.Errorf("process PID %d is no longer present", pid)
 	}
 	if err := signal(false); err != nil {
 		return fmt.Errorf("sending termination signal to PID %d: %w", pid, err)
 	}
 	for i := 0; i < 10; i++ {
 		pause(500 * time.Millisecond)
-		owned, err = stillOwned()
+		state, err = currentState()
 		if err != nil {
 			return err
 		}
-		if !owned {
+		if state == revalidatedProcessChanged {
+			return fmt.Errorf("process identity changed for PID %d after termination signal", pid)
+		}
+		if state == revalidatedProcessAbsent {
 			return nil
 		}
 	}
-	owned, err = stillOwned()
+	state, err = currentState()
 	if err != nil {
 		return err
 	}
-	if !owned {
+	if state == revalidatedProcessChanged {
+		return fmt.Errorf("process identity changed for PID %d before kill", pid)
+	}
+	if state == revalidatedProcessAbsent {
 		return nil
 	}
 	if err := signal(true); err != nil {
 		return fmt.Errorf("killing PID %d: %w", pid, err)
 	}
 	pause(100 * time.Millisecond)
-	owned, err = stillOwned()
+	state, err = currentState()
 	if err != nil {
 		return err
 	}
-	if owned {
+	if state == revalidatedProcessChanged {
+		return fmt.Errorf("process identity changed for PID %d after kill", pid)
+	}
+	if state == revalidatedProcessOwned {
 		return fmt.Errorf("PID %d remained alive after kill", pid)
 	}
 	return nil
@@ -1800,8 +1837,14 @@ func TerminateTestProcessCustody(custody TestProcessCustody) error {
 	if err != nil {
 		return fmt.Errorf("finding test process %d: %w", custody.PID, err)
 	}
-	return terminateRevalidatedProcess(custody.PID, func() (bool, error) {
-		return currentTestProcessCustody(custody.PID, custody.ParentPID) == custody, nil
+	return terminateRevalidatedProcess(custody.PID, func() (revalidatedProcessState, error) {
+		if currentTestProcessCustody(custody.PID, custody.ParentPID) == custody {
+			return revalidatedProcessOwned, nil
+		}
+		if processIsAlive(custody.PID) {
+			return revalidatedProcessChanged, nil
+		}
+		return revalidatedProcessAbsent, nil
 	}, func(kill bool) error {
 		if kill {
 			return process.Kill()
@@ -2071,11 +2114,14 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 		if err != nil {
 			return stopped, fmt.Errorf("finding owned Dolt PID %d: %w", pid, err)
 		}
-		if err := terminateRevalidatedProcess(pid, func() (bool, error) {
+		if err := terminateRevalidatedProcess(pid, func() (revalidatedProcessState, error) {
 			if !processIsAlive(pid) {
-				return false, nil
+				return revalidatedProcessAbsent, nil
 			}
-			return getProcessStartToken(pid) == processToken && isDoltSQLServerProcess(pid) && doltProcessMatchesTown(absRoot, pid, config), nil
+			if getProcessStartToken(pid) == processToken && isDoltSQLServerProcess(pid) && doltProcessMatchesTown(absRoot, pid, config) {
+				return revalidatedProcessOwned, nil
+			}
+			return revalidatedProcessChanged, nil
 		}, func(kill bool) error {
 			if kill {
 				return proc.Kill()

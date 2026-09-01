@@ -738,8 +738,8 @@ func TestTerminateSelectedTestLeakSkipsKillAfterProcessIdentityChanges(t *testin
 		}
 		return nil
 	}, func(time.Duration) {})
-	if err != nil {
-		t.Fatalf("terminateSelectedTestLeakWith: %v", err)
+	if err == nil {
+		t.Fatal("terminateSelectedTestLeakWith accepted a changed identity after graceful termination")
 	}
 	if killed {
 		t.Fatal("cleanup killed a reused PID after graceful termination")
