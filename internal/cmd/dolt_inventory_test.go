@@ -3,8 +3,11 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -122,6 +125,69 @@ func TestRunDoltCleanupReturnsNonzeroOnRefusedOrphan(t *testing.T) {
 	}
 	if strings.Contains(output, "✓ Removed 0/1") {
 		t.Fatalf("partial cleanup rendered a success marker: %q", output)
+	}
+}
+
+func TestRunDoltCleanupStopsAfterWriteProbeFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX dolt stub")
+	}
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"testdb_a", "testdb_b"} {
+		noms := filepath.Join(townRoot, ".dolt-data", name, ".dolt", "noms")
+		if err := os.MkdirAll(noms, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(noms, "manifest"), []byte("test"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
+
+	binDir := t.TempDir()
+	stub := `#!/bin/sh
+case "$*" in
+  *"SHOW TABLES"*) exit 0 ;;
+  *"DROP DATABASE"*) exit 0 ;;
+  *"DELETE FROM dolt_branch_control"*) exit 0 ;;
+  *"__gt_health_probe"*) printf 'probe unavailable\n' >&2; exit 1 ;;
+esac
+printf 'unexpected dolt args: %s\n' "$*" >&2
+exit 2
+`
+	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	t.Chdir(townRoot)
+	oldDry, oldForce := doltCleanupDry, doltCleanupForce
+	doltCleanupDry, doltCleanupForce = false, false
+	t.Cleanup(func() { doltCleanupDry, doltCleanupForce = oldDry, oldForce })
+
+	var runErr error
+	output := captureStdout(t, func() { runErr = runDoltCleanup(nil, nil) })
+	if runErr == nil || !strings.Contains(runErr.Error(), "write probe") {
+		t.Fatalf("runDoltCleanup() error = %v, want write-probe failure", runErr)
+	}
+	if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", "testdb_a")); !os.IsNotExist(err) {
+		t.Fatalf("first orphan was not removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", "testdb_b")); err != nil {
+		t.Fatalf("later orphan was not preserved: %v", err)
+	}
+	if strings.Contains(output, "Removed 2/2") {
+		t.Fatalf("cleanup continued after an unverified write probe: %q", output)
 	}
 }
 

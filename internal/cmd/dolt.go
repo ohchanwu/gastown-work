@@ -1442,7 +1442,13 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		removed++
 
 		// Health check after each DROP to catch read-only early (gt-r1cyd)
-		if readOnly, _ := doltserver.CheckReadOnly(townRoot); readOnly {
+		readOnly, probeErr := doltserver.CheckReadOnly(townRoot)
+		if probeErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("verifying server writability after removing %s: %w", o.Name, probeErr))
+			fmt.Printf("  %s Could not verify server writability after DROP: %v\n", style.Bold.Render("✗"), probeErr)
+			break
+		}
+		if readOnly {
 			fmt.Printf("  %s Server went read-only after DROP — attempting recovery...\n", style.Bold.Render("!"))
 			if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr != nil {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("recovering read-only server: %w", recoverErr))

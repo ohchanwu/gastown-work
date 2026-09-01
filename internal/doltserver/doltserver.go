@@ -1761,12 +1761,35 @@ func testLeakSelectionState(inventory []LocalDoltServer, selection TestLeakSelec
 	return revalidatedProcessAbsent
 }
 
-func terminateSelectedTestLeak(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error)) error {
+func targetedTestLeakSelectionState(selection TestLeakSelection, expectedPort int, expectedDataDir string, listenerPID func(int) int, evidenceFor func(int) doltProcessEvidence, processAlive func(int) bool) revalidatedProcessState {
+	if listenerPID(selection.Port) != selection.PID {
+		if processAlive(selection.PID) {
+			return revalidatedProcessChanged
+		}
+		return revalidatedProcessAbsent
+	}
+	if expectedPort != 0 && expectedPort != selection.Port && listenerPID(expectedPort) == selection.PID {
+		return revalidatedProcessChanged
+	}
+	inventory := classifyLocalDoltServers(expectedPort, expectedDataDir, []DoltListener{{PID: selection.PID, Port: selection.Port}}, evidenceFor)
+	return testLeakSelectionState(inventory, selection)
+}
+
+func terminateSelectedTestLeak(townRoot string, selection TestLeakSelection) error {
 	process, err := os.FindProcess(selection.PID)
 	if err != nil {
 		return fmt.Errorf("finding Dolt process %d: %w", selection.PID, err)
 	}
-	return terminateSelectedTestLeakWith(selection, rescan, func(kill bool) error {
+	config := DefaultConfig(townRoot)
+	expectedPort, expectedDataDir := config.Port, config.DataDir
+	if config.IsRemote() {
+		expectedPort, expectedDataDir = 0, ""
+	}
+	return terminateRevalidatedProcess(selection.PID, func() (revalidatedProcessState, error) {
+		return targetedTestLeakSelectionState(selection, expectedPort, expectedDataDir, findDoltServerOnPort, func(pid int) doltProcessEvidence {
+			return processEvidence(townRoot, pid)
+		}, processIsAlive), nil
+	}, func(kill bool) error {
 		if kill {
 			return process.Kill()
 		}
@@ -1911,7 +1934,7 @@ func CleanupOwnedLocalTestLeaks(townRoot string, baseline []DoltListener, ownerR
 		return err
 	}
 	return remediateTestLeaksSince(initial, baselineListeners, func(selection TestLeakSelection) error {
-		return terminateSelectedTestLeak(selection, rescan)
+		return terminateSelectedTestLeak(townRoot, selection)
 	}, rescan)
 }
 
@@ -1933,9 +1956,7 @@ func RemediatePreviewedTestLeaks(townRoot string, preview []TestLeakSelection, a
 		return nil, inventoryErr
 	}
 	err := remediatePreviewedTestLeaks(initial, preview, apply, func(selection TestLeakSelection) error {
-		return terminateSelectedTestLeak(selection, func() ([]LocalDoltServer, error) {
-			return inventoryLocalDoltServers(townRoot)
-		})
+		return terminateSelectedTestLeak(townRoot, selection)
 	}, func() ([]LocalDoltServer, error) {
 		return inventoryLocalDoltServers(townRoot)
 	})
@@ -2095,7 +2116,7 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 		return InventoryLocalDoltServersWithError(absRoot)
 	}
 	stopped, err := reapOwnedTestServersWith(absRoot, rescan, func(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error)) error {
-		return terminateSelectedTestLeak(selection, rescan)
+		return terminateSelectedTestLeak(absRoot, selection)
 	})
 	if err != nil {
 		return 0, err
@@ -3996,21 +4017,28 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 		}
 	}
 
-	// If server is running, DROP the database first and clean up branch control entries.
+	// If server is running, clean up branch control entries and then DROP the database.
 	// In Dolt 1.81.x, DROP DATABASE does not automatically remove dolt_branch_control
 	// entries for the dropped database. These stale entries cause the database directory
 	// to be recreated when connections reference the database name (gt-zlv7l).
 	if running {
+		// dolt_branch_control is global but exposed through each Dolt database, so select
+		// the target while it is still loaded. Fail closed before DROP if cleanup is uncertain.
+		identifier := strings.ReplaceAll(dbName, "`", "``")
+		branchQuery := fmt.Sprintf("USE `%s`; DELETE FROM dolt_branch_control WHERE `database` = '%s'", identifier, EscapeSQL(dbName))
+		if err := serverExecSQL(townRoot, branchQuery); err != nil {
+			return fmt.Errorf("cleaning branch-control entries for database %q: %w", dbName, err)
+		}
+
 		// Try to DROP — capture errors for read-only detection (gt-r1cyd)
-		if dropErr := serverExecSQL(townRoot, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName)); dropErr != nil {
+		if dropErr := serverExecSQL(townRoot, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", identifier)); dropErr != nil {
 			if IsReadOnlyError(dropErr.Error()) {
 				return fmt.Errorf("DROP put server into read-only mode: %w", dropErr)
 			}
-			// Other errors (DB not loaded, etc.) — continue with filesystem removal
+			if !isDatabaseNotFoundError(dropErr) {
+				return fmt.Errorf("dropping database %q: %w", dbName, dropErr)
+			}
 		}
-		// Explicitly clean up branch control entries to prevent the database from being
-		// recreated on subsequent connections. `database` is a reserved word, so backtick-quote it.
-		_ = serverExecSQL(townRoot, fmt.Sprintf("DELETE FROM dolt_branch_control WHERE `database` = '%s'", dbName))
 	}
 
 	InvalidateDBCache() // Database removed — bust the cache.
@@ -4021,6 +4049,14 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 	}
 
 	return nil
+}
+
+func isDatabaseNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown database") || strings.Contains(msg, "database not found:")
 }
 
 // databaseHasUserTables checks if a database has tables beyond Dolt system tables.
@@ -4752,7 +4788,10 @@ func CheckReadOnly(townRoot string) (bool, error) {
 
 	// Need a database to test writes against
 	databases, err := ListDatabases(townRoot)
-	if err != nil || len(databases) == 0 {
+	if err != nil {
+		return false, fmt.Errorf("listing databases for write probe: %w", err)
+	}
+	if len(databases) == 0 {
 		return false, nil // Can't probe without a database
 	}
 

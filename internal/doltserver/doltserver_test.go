@@ -768,6 +768,52 @@ func TestTerminateSelectedTestLeakSkipsKillAfterProcessIdentityChanges(t *testin
 	}
 }
 
+func TestTargetedTestLeakSelectionState(t *testing.T) {
+	ownerPath := filepath.Join(os.TempDir(), "gastown-test-dolt.targeted", ".beads", "dolt")
+	original := LocalDoltServer{
+		DoltListener: DoltListener{PID: 661, Port: 4661},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    ownerPath,
+		ProcessToken: "original-start",
+	}
+	selection := newTestLeakSelection(original)
+	evidence := doltProcessEvidence{DataDir: ownerPath, ProcessToken: original.ProcessToken}
+
+	tests := []struct {
+		name         string
+		selectedPID  int
+		canonicalPID int
+		processAlive bool
+		processToken string
+		want         revalidatedProcessState
+	}{
+		{name: "exact owner", selectedPID: original.PID, processAlive: true, processToken: original.ProcessToken, want: revalidatedProcessOwned},
+		{name: "exited", want: revalidatedProcessAbsent},
+		{name: "stopped listening", processAlive: true, want: revalidatedProcessChanged},
+		{name: "canonical listener", selectedPID: original.PID, canonicalPID: original.PID, processAlive: true, processToken: original.ProcessToken, want: revalidatedProcessChanged},
+		{name: "process identity changed", selectedPID: original.PID, processAlive: true, processToken: "replacement-start", want: revalidatedProcessChanged},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := targetedTestLeakSelectionState(selection, 3307, "/town/.dolt-data", func(port int) int {
+				if port == selection.Port {
+					return tt.selectedPID
+				}
+				return tt.canonicalPID
+			}, func(int) doltProcessEvidence {
+				current := evidence
+				current.ProcessToken = tt.processToken
+				return current
+			}, func(int) bool {
+				return tt.processAlive
+			})
+			if got != tt.want {
+				t.Fatalf("state = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestContainsPathBoundary(t *testing.T) {
 	tests := []struct {
 		name string
@@ -3670,6 +3716,117 @@ func TestIsDoltRetryableError_IncludesReadOnly(t *testing.T) {
 	}
 }
 
+func TestCheckReadOnlyReturnsListDatabasesError(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(townRoot, ".dolt-data"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := CheckReadOnly(townRoot)
+	if err == nil || readOnly {
+		t.Fatalf("CheckReadOnly() = (%v, %v), want false and list error", readOnly, err)
+	}
+}
+
+func TestRemoveDatabasePreservesDirectoryOnDropFailure(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
+case "$*" in
+  *"DROP DATABASE"*) printf 'transport failure\n' >&2; exit 1 ;;
+esac
+exit 0
+`)
+
+	err := RemoveDatabase(townRoot, "testdb_remove", true)
+	if err == nil || !strings.Contains(err.Error(), "dropping database") {
+		t.Fatalf("RemoveDatabase() error = %v, want DROP failure", err)
+	}
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		t.Fatalf("database directory was not preserved: %v", statErr)
+	}
+}
+
+func TestRemoveDatabasePreservesDirectoryOnBranchControlFailure(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
+case "$*" in
+  *"DROP DATABASE"*) exit 0 ;;
+  *"DELETE FROM dolt_branch_control"*) printf 'permission denied\n' >&2; exit 1 ;;
+esac
+exit 0
+`)
+
+	err := RemoveDatabase(townRoot, "testdb_remove", true)
+	if err == nil || !strings.Contains(err.Error(), "branch-control") {
+		t.Fatalf("RemoveDatabase() error = %v, want branch-control failure", err)
+	}
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		t.Fatalf("database directory was not preserved: %v", statErr)
+	}
+}
+
+func TestRemoveDatabaseSelectsTargetForBranchControlCleanup(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
+case "$*" in
+  *"USE "*"DELETE FROM dolt_branch_control"*) exit 0 ;;
+  *"DELETE FROM dolt_branch_control"*) printf 'no database selected\n' >&2; exit 1 ;;
+  *"DROP DATABASE"*) exit 0 ;;
+esac
+exit 0
+`)
+
+	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
+		t.Fatalf("RemoveDatabase() error = %v, want target-selected branch cleanup", err)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("database directory still exists: %v", err)
+	}
+}
+
+func TestRemoveDatabaseAllowsAlreadyAbsentCatalogEntry(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
+case "$*" in
+  *"DROP DATABASE"*) printf "Unknown database 'testdb_remove'\n" >&2; exit 1 ;;
+  *"DELETE FROM dolt_branch_control"*) exit 0 ;;
+esac
+exit 0
+`)
+
+	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
+		t.Fatalf("RemoveDatabase() error = %v, want already-absent catalog entry tolerated", err)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("database directory still exists: %v", err)
+	}
+}
+
+func setupRemoveDatabaseSQLTest(t *testing.T, behavior string) (string, string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX dolt stub")
+	}
+
+	townRoot := t.TempDir()
+	dbPath := filepath.Join(townRoot, ".dolt-data", "testdb_remove")
+	if err := os.MkdirAll(filepath.Join(dbPath, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
+
+	binDir := t.TempDir()
+	stub := "#!/bin/sh\n" + behavior
+	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	return townRoot, dbPath
+}
+
 func TestRecoverReadOnly_NoServer(t *testing.T) {
 	// When no server is running, CheckReadOnly returns false (can't probe),
 	// so RecoverReadOnly should be a no-op.
@@ -4238,6 +4395,7 @@ func TestCollectReferencedDatabases_NoRigsJSON(t *testing.T) {
 }
 
 func TestRemoveDatabase_RemovesDirectory(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 	dataDir := filepath.Join(townRoot, ".dolt-data")
 
@@ -4347,6 +4505,7 @@ func TestDatabaseExists_FalseForMissing(t *testing.T) {
 }
 
 func TestFindOrphanedDatabases_EndToEnd(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	// Simulates the exact scenario from the bug report:
 	// .dolt-data/ contains beads_wy/ (old) and wyvern/ (new).
 	// Only wyvern is referenced. beads_wy should be detected as orphaned.
@@ -5670,6 +5829,7 @@ func TestRemoveDatabase_RefusesLargeDBWhenServerDown(t *testing.T) {
 // TestRemoveDatabase_AllowsSmallDBWhenServerDown verifies that small databases
 // (<1MB) can be removed even when the server is offline. (gt-xvh)
 func TestRemoveDatabase_AllowsSmallDBWhenServerDown(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 	dataDir := filepath.Join(townRoot, ".dolt-data")
 	setupDoltDB(t, dataDir, "small_orphan")
