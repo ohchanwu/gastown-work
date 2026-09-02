@@ -3704,6 +3704,7 @@ var (
 	databaseMigrationBeforeIrreversibleMutation = func() {}
 	databaseMigrationBeforeCleanupRemoval       = func() {}
 	databaseMigrationBeforeClaimPublication     = func() {}
+	databaseMigrationAfterClaimTokenRead        = func() {}
 )
 
 func databaseMigrationReceiptPath(townRoot, rigName string) string {
@@ -4648,6 +4649,7 @@ func verifyDatabaseMigrationClaimTokenAt(claimRoot *os.Root, token string) error
 	if err != nil {
 		return err
 	}
+	databaseMigrationAfterClaimTokenRead()
 	if string(data) != token+"\n" {
 		return fmt.Errorf("migration claim token mismatch")
 	}
@@ -4718,6 +4720,9 @@ func ensureDatabaseMigrationTargetClaim(root *os.Root, targetRel, token string) 
 	}
 	databaseMigrationBeforeTargetMutation()
 	revalidatePreparedClaim := func() error {
+		if err := verifyDatabaseMigrationClaimTokenAt(claimRoot, token); err != nil {
+			return fmt.Errorf("verifying prepared migration target claim: %w", err)
+		}
 		targetExists, _, err = databaseMigrationRootPathState(root, targetRel)
 		if err != nil {
 			return err
@@ -4728,9 +4733,6 @@ func ensureDatabaseMigrationTargetClaim(root *os.Root, targetRel, token string) 
 		currentClaimInfo, err := root.Stat(claimRel)
 		if err != nil || !os.SameFile(claimInfo, currentClaimInfo) {
 			return fmt.Errorf("prepared migration target claim identity changed")
-		}
-		if err := verifyDatabaseMigrationClaimTokenAt(claimRoot, token); err != nil {
-			return fmt.Errorf("verifying prepared migration target claim: %w", err)
 		}
 		return nil
 	}

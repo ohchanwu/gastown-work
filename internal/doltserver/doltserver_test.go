@@ -2122,18 +2122,26 @@ func TestMigrateRigFromBeadsPreservesReplacementPreparedTargetClaim(t *testing.T
 }
 
 func TestMigrateRigFromBeadsPreservesPreparedTargetClaimReplacedAtPublication(t *testing.T) {
+	testMigrateRigFromBeadsPreservesPreparedTargetClaimReplacement(t, "prepared-claim-publication-swap", &databaseMigrationBeforeClaimPublication)
+}
+
+func TestMigrateRigFromBeadsPreservesPreparedTargetClaimReplacedDuringTokenRead(t *testing.T) {
+	testMigrateRigFromBeadsPreservesPreparedTargetClaimReplacement(t, "prepared-claim-token-read-swap", &databaseMigrationAfterClaimTokenRead)
+}
+
+func testMigrateRigFromBeadsPreservesPreparedTargetClaimReplacement(t *testing.T, rigName string, hook *func()) {
+	t.Helper()
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
-	rigName := "prepared-claim-publication-swap"
 	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
 	receiptPath := databaseMigrationReceiptPath(townRoot, rigName)
 	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
-	previous := databaseMigrationBeforeClaimPublication
+	previous := *hook
 	var once sync.Once
 	var hookErr error
 	var originalClaimPath string
 	var replacementClaimPath string
-	databaseMigrationBeforeClaimPublication = func() {
+	*hook = func() {
 		once.Do(func() {
 			receipt, err := readDatabaseMigrationReceipt(townRoot, receiptPath)
 			if err != nil {
@@ -2153,7 +2161,7 @@ func TestMigrateRigFromBeadsPreservesPreparedTargetClaimReplacedAtPublication(t 
 			hookErr = os.WriteFile(filepath.Join(replacementClaimPath, "foreign"), []byte("preserve"), 0o600)
 		})
 	}
-	t.Cleanup(func() { databaseMigrationBeforeClaimPublication = previous })
+	t.Cleanup(func() { *hook = previous })
 
 	err := MigrateRigFromBeads(townRoot, rigName, sourcePath)
 	if hookErr != nil {
