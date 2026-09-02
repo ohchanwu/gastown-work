@@ -3699,7 +3699,10 @@ type databaseMigrationReceipt struct {
 	Phase        databaseMigrationPhase `json:"phase"`
 }
 
-var databaseMigrationBeforeTargetMutation = func() {}
+var (
+	databaseMigrationBeforeTargetMutation       = func() {}
+	databaseMigrationBeforeIrreversibleMutation = func() {}
+)
 
 func databaseMigrationReceiptPath(townRoot, rigName string) string {
 	return filepath.Join(townRoot, ".runtime", "dolt-database-migrations", canonicalDatabaseName(rigName)+".json")
@@ -4446,8 +4449,12 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if !cleanupComplete {
 				return fmt.Errorf("migration cleanup claim is incomplete")
 			}
-			if err := withVerifiedDatabaseMigrationRoot(root, targetRel, receipt.SourceDigest, receipt.TargetToken, func() error {
+			if err := withVerifiedDatabaseMigrationRoot(root, targetRel, receipt.SourceDigest, receipt.TargetToken, func(revalidate func() error) error {
 				if err := verifyDatabaseMigrationClaim(root, cleanupRel, receipt.SourceDigest, receipt.CleanupToken); err != nil {
+					return err
+				}
+				databaseMigrationBeforeIrreversibleMutation()
+				if err := revalidate(); err != nil {
 					return err
 				}
 				if err := root.RemoveAll(cleanupRel); err != nil {
@@ -4472,13 +4479,21 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if sourceExists || cleanupExists {
 				return fmt.Errorf("source-cleaned migration still has source data")
 			}
-			if err := withVerifiedDatabaseMigrationRoot(root, targetRel, receipt.SourceDigest, receipt.TargetToken, func() error {
+			if err := withVerifiedDatabaseMigrationRoot(root, targetRel, receipt.SourceDigest, receipt.TargetToken, func(revalidate func() error) error {
 				beadsDir, err := FindOrCreateRigBeadsDir(townRoot, receipt.RigName)
-				if err == nil {
-					err = ensureMetadataForBeadsDirLocked(townRoot, beadsDir, receipt.RigName)
-				}
 				if err != nil {
 					return fmt.Errorf("publishing migrated database ownership: %w", err)
+				}
+				databaseMigrationBeforeIrreversibleMutation()
+				if err := revalidate(); err != nil {
+					return err
+				}
+				if err := ensureMetadataForBeadsDirLocked(townRoot, beadsDir, receipt.RigName); err != nil {
+					return fmt.Errorf("publishing migrated database ownership: %w", err)
+				}
+				databaseMigrationBeforeIrreversibleMutation()
+				if err := revalidate(); err != nil {
+					return err
 				}
 				if err := clearDatabaseCleanupReceipt(receiptPath); err != nil {
 					return fmt.Errorf("clearing database migration receipt: %w", err)
@@ -4509,41 +4524,45 @@ func verifyDatabaseMigrationDigestAt(root *os.Root, rel, want string) error {
 	return nil
 }
 
-func withVerifiedDatabaseMigrationRoot(root *os.Root, rel, want, token string, operation func() error) error {
-	return withDatabaseMigrationTargetRoot(root, rel, want, token, func(_ *os.Root) error {
-		return operation()
+func withVerifiedDatabaseMigrationRoot(root *os.Root, rel, want, token string, operation func(func() error) error) error {
+	return withDatabaseMigrationTargetRoot(root, rel, want, token, func(_ *os.Root, revalidate func() error) error {
+		return operation(revalidate)
 	})
 }
 
 func withClaimedDatabaseMigrationRoot(root *os.Root, rel, token string, operation func(*os.Root) error) error {
-	return withDatabaseMigrationTargetRoot(root, rel, "", token, operation)
+	return withDatabaseMigrationTargetRoot(root, rel, "", token, func(databaseRoot *os.Root, _ func() error) error {
+		return operation(databaseRoot)
+	})
 }
 
-func withDatabaseMigrationTargetRoot(root *os.Root, rel, want, token string, operation func(*os.Root) error) (result error) {
+func withDatabaseMigrationTargetRoot(root *os.Root, rel, want, token string, operation func(*os.Root, func() error) error) (result error) {
 	databaseRoot, err := root.OpenRoot(rel)
 	if err != nil {
 		return err
 	}
 	defer func() { result = errors.Join(result, databaseRoot.Close()) }()
-	if want == "" {
-		err = verifyDatabaseMigrationClaimTokenAt(databaseRoot, token)
-	} else {
-		err = verifyDatabaseMigrationClaimAt(databaseRoot, want, token)
-	}
-	if err != nil {
-		return fmt.Errorf("verifying migration target claim: %w", err)
-	}
 	openedInfo, err := databaseRoot.Stat(".")
 	if err != nil {
 		return err
 	}
 	databaseMigrationBeforeTargetMutation()
-	if err := verifyDatabaseMigrationTargetIdentity(root, rel, openedInfo); err != nil {
+	revalidate := func() error {
+		if want == "" {
+			err = verifyDatabaseMigrationClaimTokenAt(databaseRoot, token)
+		} else {
+			err = verifyDatabaseMigrationClaimAt(databaseRoot, want, token)
+		}
+		if err != nil {
+			return fmt.Errorf("verifying migration target claim: %w", err)
+		}
+		return verifyDatabaseMigrationTargetIdentity(root, rel, openedInfo)
+	}
+	if err := revalidate(); err != nil {
 		return err
 	}
-	operationErr := operation(databaseRoot)
-	identityErr := verifyDatabaseMigrationTargetIdentity(root, rel, openedInfo)
-	return errors.Join(operationErr, identityErr)
+	operationErr := operation(databaseRoot, revalidate)
+	return errors.Join(operationErr, revalidate())
 }
 
 func verifyDatabaseMigrationTargetIdentity(root *os.Root, rel string, openedInfo fs.FileInfo) error {
@@ -4650,11 +4669,7 @@ func ensureDatabaseMigrationTargetClaim(root *os.Root, targetRel, token string) 
 	if err != nil {
 		return err
 	}
-	if claimExists {
-		if err := verifyDatabaseMigrationClaimToken(root, claimRel, token); err != nil {
-			return fmt.Errorf("verifying prepared migration target claim: %w", err)
-		}
-	} else {
+	if !claimExists {
 		if err := root.MkdirAll(filepath.Dir(targetRel), 0o755); err != nil {
 			return fmt.Errorf("creating data directory: %w", err)
 		}
@@ -4665,16 +4680,29 @@ func ensureDatabaseMigrationTargetClaim(root *os.Root, targetRel, token string) 
 			return err
 		}
 	}
+	claimRoot, err := root.OpenRoot(claimRel)
+	if err != nil {
+		return err
+	}
+	defer claimRoot.Close()
+	claimInfo, err := claimRoot.Stat(".")
+	if err != nil {
+		return err
+	}
 	databaseMigrationBeforeTargetMutation()
 	targetExists, _, err = databaseMigrationRootPathState(root, targetRel)
 	if err != nil {
 		return err
 	}
 	if targetExists {
-		if err := verifyDatabaseMigrationClaimToken(root, targetRel, token); err != nil {
-			return fmt.Errorf("verifying migration target claim: %w", err)
-		}
-		return nil
+		return fmt.Errorf("migration target appeared during claim publication")
+	}
+	currentClaimInfo, err := root.Stat(claimRel)
+	if err != nil || !os.SameFile(claimInfo, currentClaimInfo) {
+		return fmt.Errorf("prepared migration target claim identity changed")
+	}
+	if err := verifyDatabaseMigrationClaimTokenAt(claimRoot, token); err != nil {
+		return fmt.Errorf("verifying prepared migration target claim: %w", err)
 	}
 	if err := root.Rename(claimRel, targetRel); err != nil {
 		return fmt.Errorf("publishing migration target claim: %w", err)
@@ -4682,7 +4710,11 @@ func ensureDatabaseMigrationTargetClaim(root *os.Root, targetRel, token string) 
 	if err := syncDatabaseMigrationDirectory(root, filepath.Dir(targetRel)); err != nil {
 		return err
 	}
-	if err := verifyDatabaseMigrationClaimToken(root, targetRel, token); err != nil {
+	currentTargetInfo, err := root.Stat(targetRel)
+	if err != nil || !os.SameFile(claimInfo, currentTargetInfo) {
+		return fmt.Errorf("migration target identity changed during claim publication")
+	}
+	if err := verifyDatabaseMigrationClaimTokenAt(claimRoot, token); err != nil {
 		return fmt.Errorf("verifying migration target claim: %w", err)
 	}
 	return nil

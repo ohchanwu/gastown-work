@@ -2069,6 +2069,58 @@ func TestMigrateRigFromBeadsPreservesMismatchedPartialTargetClaim(t *testing.T) 
 	}
 }
 
+func TestMigrateRigFromBeadsPreservesReplacementPreparedTargetClaim(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "prepared-claim-swap"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	receiptPath := databaseMigrationReceiptPath(townRoot, rigName)
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	previous := databaseMigrationBeforeTargetMutation
+	var once sync.Once
+	var hookErr error
+	var originalClaimPath string
+	var replacementClaimPath string
+	databaseMigrationBeforeTargetMutation = func() {
+		once.Do(func() {
+			receipt, err := readDatabaseMigrationReceipt(townRoot, receiptPath)
+			if err != nil {
+				hookErr = err
+				return
+			}
+			replacementClaimPath = targetPath + ".migration-target-" + receipt.TargetToken
+			originalClaimPath = replacementClaimPath + ".original"
+			if err := os.Rename(replacementClaimPath, originalClaimPath); err != nil {
+				hookErr = err
+				return
+			}
+			if err := os.MkdirAll(replacementClaimPath, 0o700); err != nil {
+				hookErr = err
+				return
+			}
+			hookErr = os.WriteFile(filepath.Join(replacementClaimPath, "foreign"), []byte("preserve"), 0o600)
+		})
+	}
+	t.Cleanup(func() { databaseMigrationBeforeTargetMutation = previous })
+
+	err := MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "claim identity changed") {
+		t.Fatalf("migration error = %v, want prepared-claim identity refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetPath, "foreign")); !os.IsNotExist(err) {
+		t.Fatalf("replacement claim was published as target: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(replacementClaimPath, "foreign")); err != nil || string(got) != "preserve" {
+		t.Fatalf("replacement prepared claim changed: data = %q, err = %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(originalClaimPath, databaseMigrationCleanupClaimName)); err != nil || len(got) == 0 {
+		t.Fatalf("original prepared claim was not preserved: data = %q, err = %v", got, err)
+	}
+}
+
 func TestMigrateRigFromBeadsRestartsPartialStagePromotion(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
@@ -2380,11 +2432,20 @@ func TestMigrateRigFromBeadsPreservesClaimWhenTargetChangesBeforeRemoval(t *test
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(targetPath, ".dolt", "noms", "manifest"), []byte("changed"), 0o644); err != nil {
-		t.Fatal(err)
+	previous := databaseMigrationBeforeIrreversibleMutation
+	var once sync.Once
+	var mutationErr error
+	databaseMigrationBeforeIrreversibleMutation = func() {
+		once.Do(func() {
+			mutationErr = os.WriteFile(filepath.Join(targetPath, ".dolt", "noms", "manifest"), []byte("changed"), 0o644)
+		})
 	}
+	t.Cleanup(func() { databaseMigrationBeforeIrreversibleMutation = previous })
 
 	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if mutationErr != nil {
+		t.Fatal(mutationErr)
+	}
 	if err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 		t.Fatalf("resume migration error = %v, want changed-target refusal", err)
 	}
@@ -2422,7 +2483,7 @@ func TestMigrateRigFromBeadsPreservesClaimAtTargetRemovalBarrier(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, swapErr := swapDatabaseMigrationTargetAtNextMutation(t, targetPath)
+	_, swapErr := swapDatabaseMigrationTargetAtNextIrreversibleMutation(t, targetPath)
 
 	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
 	if *swapErr != nil {
@@ -2463,7 +2524,7 @@ func TestMigrateRigFromBeadsPreservesReceiptAtPublicationBarrier(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, swapErr := swapDatabaseMigrationTargetAtNextMutation(t, targetPath)
+	_, swapErr := swapDatabaseMigrationTargetAtNextIrreversibleMutation(t, targetPath)
 
 	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
 	if *swapErr != nil {
@@ -5911,12 +5972,20 @@ func setupDatabaseMigrationTargetClaim(t *testing.T, targetPath string) string {
 }
 
 func swapDatabaseMigrationTargetAtNextMutation(t *testing.T, targetPath string) (string, *error) {
+	return swapDatabaseMigrationTargetAtHook(t, targetPath, &databaseMigrationBeforeTargetMutation)
+}
+
+func swapDatabaseMigrationTargetAtNextIrreversibleMutation(t *testing.T, targetPath string) (string, *error) {
+	return swapDatabaseMigrationTargetAtHook(t, targetPath, &databaseMigrationBeforeIrreversibleMutation)
+}
+
+func swapDatabaseMigrationTargetAtHook(t *testing.T, targetPath string, hook *func()) (string, *error) {
 	t.Helper()
 	claimedPath := targetPath + ".claimed"
-	previous := databaseMigrationBeforeTargetMutation
+	previous := *hook
 	var once sync.Once
 	var swapErr error
-	databaseMigrationBeforeTargetMutation = func() {
+	*hook = func() {
 		once.Do(func() {
 			if err := os.Rename(targetPath, claimedPath); err != nil {
 				swapErr = err
@@ -5929,7 +5998,7 @@ func swapDatabaseMigrationTargetAtNextMutation(t *testing.T, targetPath string) 
 			swapErr = os.WriteFile(filepath.Join(targetPath, "foreign"), []byte("preserve"), 0o644)
 		})
 	}
-	t.Cleanup(func() { databaseMigrationBeforeTargetMutation = previous })
+	t.Cleanup(func() { *hook = previous })
 	return claimedPath, &swapErr
 }
 
