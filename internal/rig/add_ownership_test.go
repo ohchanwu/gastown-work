@@ -1,6 +1,8 @@
 package rig
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -80,6 +82,59 @@ func TestRecoverInterruptedAddPreservesPathWhenDatabaseIdentityChanged(t *testin
 	}
 	if _, err := os.Stat(filepath.Join(rigPath, addOwnershipStampFile)); err != nil {
 		t.Fatalf("recovery evidence was not preserved: %v", err)
+	}
+}
+
+func TestRecoverInterruptedAddPreservesUnprovenDatabaseAndRetriesUnowned(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "ambiguous"
+	token := "ambiguous-database-token"
+	dbPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	if err := os.MkdirAll(filepath.Join(dbPath, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{
+		Owner: "owner-token", DatabaseToken: token,
+		RoutePrefix: "am-", RoutePath: rigName, RouteToken: "route-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(token))
+	intentDir := filepath.Join(townRoot, ".runtime", "dolt-database-creations")
+	if err := os.MkdirAll(intentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	intent := `{"version":3,"database":"` + rigName + `","token":"` + token + `","prepared_unix_nano":1,"generation":"` + hex.EncodeToString(sum[:16]) + `"}`
+	intentPath := filepath.Join(intentDir, rigName+".json")
+	if err := os.WriteFile(intentPath, []byte(intent+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := removeAddDatabase
+	t.Cleanup(func() { removeAddDatabase = previous })
+	removeAddDatabase = func(string, string, string, bool) error {
+		t.Fatal("unproven database was selected for destructive cleanup")
+		return nil
+	}
+	recovered, err := recoverInterruptedAdd(townRoot, rigName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered {
+		t.Fatal("ambiguous add was not made retryable")
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("unproven database was not preserved: %v", err)
+	}
+	if _, err := os.Stat(intentPath); !os.IsNotExist(err) {
+		t.Fatalf("unproven creation intent remains: %v", err)
 	}
 }
 

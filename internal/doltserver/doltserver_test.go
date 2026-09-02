@@ -2,7 +2,9 @@ package doltserver
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -5868,7 +5870,7 @@ func TestRemoveDatabaseIfCreationTokenRemovesReferencedIncompleteRig(t *testing.
 	}
 }
 
-func TestRemoveDatabaseIfRootIncarnationMigratesLegacyReferencedRig(t *testing.T) {
+func TestRemoveDatabaseIfRootIncarnationPreservesUnprovenLegacyRig(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
@@ -5877,21 +5879,77 @@ func TestRemoveDatabaseIfRootIncarnationMigratesLegacyReferencedRig(t *testing.T
 		t.Fatal(err)
 	}
 	root := "dolt-root:0123456789abcdefghijklmnopqrstuv"
-	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", root, true); err != nil {
-		t.Fatalf("RemoveDatabaseIfRootIncarnation() error = %v", err)
+	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", root, true); !errors.Is(err, ErrLegacyDatabaseIdentityUnproven) {
+		t.Fatalf("RemoveDatabaseIfRootIncarnation() error = %v, want unproven identity", err)
 	}
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("legacy owned database remains: %v", err)
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("unproven legacy database was mutated: %v", err)
 	}
 }
 
 func TestRemoveDatabaseIfRootIncarnationPreservesReplacement(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
-	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", "dolt-root:replacement", true); err == nil || !strings.Contains(err.Error(), "root incarnation") {
+	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", "dolt-root:replacement", true); !errors.Is(err, ErrLegacyDatabaseIdentityUnproven) {
 		t.Fatalf("replacement root error = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
 		t.Fatalf("legacy replacement was mutated: %v", err)
+	}
+}
+
+func TestRemoveDatabaseIfRootIncarnationUpgradesClaimedVersionThreeReceipt(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	t.Setenv("GT_DOLT_PORT", "1")
+	incarnation, err := databaseCleanupIncarnation(townRoot, "testdb_remove", dbPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := databaseCleanupReceiptPath(townRoot, "testdb_remove")
+	receipt := databaseCleanupReceipt{
+		Version: 3, Database: "testdb_remove", Force: true,
+		Phase: databaseCleanupOfflineReady, Incarnation: incarnation,
+	}
+	if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
+		t.Fatal(err)
+	}
+	claimedPath, err := claimDatabaseCleanupDirectory(townRoot, "testdb_remove", dbPath, incarnation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimedPath == "" {
+		t.Fatal("database was not claimed")
+	}
+	root := databaseCleanupRootIdentity(incarnation)
+	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", root, true); err != nil {
+		t.Fatalf("resuming claimed version-3 cleanup: %v", err)
+	}
+	if _, err := os.Stat(claimedPath); !os.IsNotExist(err) {
+		t.Fatalf("claimed legacy database remains: %v", err)
+	}
+	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
+		t.Fatalf("upgraded legacy cleanup receipt remains: %v", err)
+	}
+}
+
+func TestRemoveDatabaseIfRootIncarnationRejectsLiveVersionFourLegacyReceipt(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	incarnation, err := databaseCleanupIncarnation(townRoot, "testdb_remove", dbPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := databaseCleanupRootIdentity(incarnation)
+	receipt := databaseCleanupReceipt{
+		Version: databaseCleanupReceiptVersion, Database: "testdb_remove", Force: true,
+		Phase: databaseCleanupPrepared, Incarnation: incarnation, LegacyRoot: root,
+	}
+	if err := writeDatabaseCleanupReceipt(databaseCleanupReceiptPath(townRoot, "testdb_remove"), receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", root, true); !errors.Is(err, ErrLegacyDatabaseIdentityUnproven) {
+		t.Fatalf("live legacy receipt error = %v, want unproven identity", err)
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("live legacy database was mutated: %v", err)
 	}
 }
 
@@ -5909,6 +5967,25 @@ func TestMigrateLegacyDatabaseCreationReleasePreservesReplacement(t *testing.T) 
 	}
 }
 
+func TestMigrateLegacyDatabaseCreationReleaseResumesAfterGenerationInstall(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	token := "legacy-release-retry"
+	incarnation, err := databaseCreationIncarnation(townRoot, "testdb_remove", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := databaseCleanupRootIdentity(incarnation)
+	if err := installDatabaseGeneration(townRoot, "testdb_remove", dbPath, databaseGenerationID(token)); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLegacyDatabaseCreationRelease(townRoot, "testdb_remove", token, root); err != nil {
+		t.Fatalf("resuming release after generation install: %v", err)
+	}
+	if err := DatabaseCreationTokenReleased(townRoot, "testdb_remove", token); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestVerifyLegacyDatabaseRootAcceptsExactManifestFallback(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
 	manifest, err := os.ReadFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"))
@@ -5919,6 +5996,70 @@ func TestVerifyLegacyDatabaseRootAcceptsExactManifestFallback(t *testing.T) {
 	root := fmt.Sprintf("manifest-root:%x", sum[:])
 	if err := verifyLegacyDatabaseRoot(townRoot, "testdb_remove", dbPath, root); err != nil {
 		t.Fatalf("verifyLegacyDatabaseRoot() error = %v", err)
+	}
+}
+
+func TestDatabaseCreationTokenReleasedMigratesVersionOneReceipt(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	token := "version-one-release"
+	incarnation, err := databaseCreationIncarnation(townRoot, "testdb_remove", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := databaseCreationReleaseReceiptPath(townRoot, "testdb_remove", token)
+	if err := ensurePrivateDatabaseCleanupDirectory(filepath.Dir(receiptPath)); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(databaseCreationReleaseReceipt{
+		Version: 1, Database: "testdb_remove", Token: token, Incarnation: incarnation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseCleanupFileDurable(receiptPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := DatabaseCreationTokenReleased(townRoot, "testdb_remove", token); err != nil {
+		t.Fatalf("migrating version-1 release receipt: %v", err)
+	}
+	migrated, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt databaseCreationReleaseReceipt
+	if err := json.Unmarshal(migrated, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Version != 3 || receipt.Generation != databaseGenerationID(token) || receipt.Incarnation != "" {
+		t.Fatalf("migrated receipt = %#v", receipt)
+	}
+	if err := verifyDatabaseGeneration(townRoot, "testdb_remove", dbPath, receipt.Generation); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDatabaseCreationTokenReleasedRejectsVersionTwoWithoutPrivateAnchor(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	token := "version-two-release"
+	receiptPath := databaseCreationReleaseReceiptPath(townRoot, "testdb_remove", token)
+	if err := ensurePrivateDatabaseCleanupDirectory(filepath.Dir(receiptPath)); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(databaseCreationReleaseReceipt{
+		Version: 2, Database: "testdb_remove", Token: token, Generation: databaseGenerationID(token),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseCleanupFileDurable(receiptPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DatabaseCreationTokenReleased(townRoot, "testdb_remove", token); !errors.Is(err, ErrDatabaseGenerationUnproven) {
+		t.Fatalf("version-2 release error = %v, want missing private generation anchor", err)
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("ambiguous version-2 release mutated database: %v", err)
 	}
 }
 
@@ -5938,12 +6079,14 @@ func TestRecoverDatabaseCreationTokenAfterCreateBeforeStamp(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"), []byte("created"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	setupDatabaseGenerationQueryStub(t, databaseGenerationID(token))
+	if err := installDatabaseGeneration(townRoot, dbName, dbPath, databaseGenerationID(token)); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := RecoverDatabaseCreationToken(townRoot, dbName, token); err != nil {
 		t.Fatalf("RecoverDatabaseCreationToken() error = %v", err)
 	}
-	if err := verifyDatabaseCreationToken(dbPath, token); err != nil {
+	if err := verifyDatabaseCreationToken(townRoot, dbName, dbPath, token); err != nil {
 		t.Fatalf("recovered token not stamped: %v", err)
 	}
 	if _, err := os.Stat(databaseCreationIntentPath(townRoot, dbName)); !os.IsNotExist(err) {
@@ -5990,6 +6133,9 @@ func TestRecoverDatabaseCreationTokenRejectsSameServerDropRecreate(t *testing.T)
 	if err := serverExecSQL(townRoot, ownedDatabaseCreateQuery(dbName, intent.Generation)); err != nil {
 		t.Fatal(err)
 	}
+	if err := installDatabaseGeneration(townRoot, dbName, filepath.Join(DefaultConfig(townRoot).DataDir, dbName), intent.Generation); err != nil {
+		t.Fatal(err)
+	}
 	if err := serverExecSQL(townRoot, "DROP DATABASE `same_server_replacement`; CREATE DATABASE `same_server_replacement`"); err != nil {
 		t.Fatal(err)
 	}
@@ -6008,10 +6154,10 @@ func TestRecoverDatabaseCreationTokenRejectsSameServerDropRecreate(t *testing.T)
 
 func TestInitRigOwnedPreservesAmbiguousCreateForRecovery(t *testing.T) {
 	townRoot, _ := startOwnedDatabaseTestServer(t)
-	previous := createOwnedDatabaseOnServer
-	t.Cleanup(func() { createOwnedDatabaseOnServer = previous })
-	createOwnedDatabaseOnServer = func(root, query string) error {
-		if err := serverExecSQL(root, query); err != nil {
+	previous := createOwnedDatabaseStatement
+	t.Cleanup(func() { createOwnedDatabaseStatement = previous })
+	createOwnedDatabaseStatement = func(ctx context.Context, conn *sql.Conn, query string) error {
+		if _, err := conn.ExecContext(ctx, query); err != nil {
 			return err
 		}
 		return errors.New("lost create acknowledgement")
@@ -6027,11 +6173,20 @@ func TestInitRigOwnedPreservesAmbiguousCreateForRecovery(t *testing.T) {
 	if _, err := os.Stat(databaseCreationIntentPath(townRoot, "ambiguous_create")); err != nil {
 		t.Fatalf("ambiguous creation intent was erased: %v", err)
 	}
-	if err := RecoverDatabaseCreationToken(townRoot, "ambiguous_create", token); err != nil {
-		t.Fatalf("recovering completed ambiguous create: %v", err)
+	if err := RecoverDatabaseCreationToken(townRoot, "ambiguous_create", token); !errors.Is(err, ErrDatabaseGenerationUnproven) {
+		t.Fatalf("ambiguous create recovery error = %v, want missing generation proof", err)
+	}
+	if _, err := os.Stat(databaseCreationIntentPath(townRoot, "ambiguous_create")); err != nil {
+		t.Fatalf("ambiguous creation intent was not preserved: %v", err)
+	}
+	if err := RetireUnprovenDatabaseCreationIntent(townRoot, "ambiguous_create", token); err != nil {
+		t.Fatalf("retiring unproven creation intent: %v", err)
 	}
 	if _, err := os.Stat(databaseCreationIntentPath(townRoot, "ambiguous_create")); !os.IsNotExist(err) {
-		t.Fatalf("recovered creation intent remains: %v", err)
+		t.Fatalf("retired creation intent remains: %v", err)
+	}
+	if !DatabaseExists(townRoot, "ambiguous_create") {
+		t.Fatal("ambiguous database was not preserved")
 	}
 }
 
@@ -6098,6 +6253,31 @@ func TestRemoveDatabaseIfCreationTokenPreservesWrongGeneration(t *testing.T) {
 	}
 }
 
+func TestRemoveDatabaseIfCreationTokenRejectsReplayedGenerationFile(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	token := "replayed-file-generation"
+	generation := databaseGenerationID(token)
+	if err := installDatabaseGeneration(townRoot, "testdb_remove", dbPath, generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseCreationOwner(dbPath, token, generation); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dbPath, databaseGenerationFile)
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte(generation+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveDatabaseIfCreationToken(townRoot, "testdb_remove", token, true); err == nil {
+		t.Fatal("replayed generation file was accepted for destructive cleanup")
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("replacement database was mutated: %v", err)
+	}
+}
+
 func TestRemoveDatabaseCannotResumeCreationOwnedCleanupWithoutToken(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
 	receipt := databaseCleanupReceipt{
@@ -6120,8 +6300,10 @@ func TestReleaseDatabaseCreationTokenIsGenerationBoundAndIdempotent(t *testing.T
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
 	token := "release-generation"
 	generation := databaseGenerationID(token)
-	t.Setenv("GT_TEST_DATABASE_GENERATION_JSON", fmt.Sprintf(`{"rows":[{"generation_tag":%q}]}`, databaseGenerationTag(generation)))
 	marker := filepath.Join(dbPath, databaseCreationOwnerFile)
+	if err := installDatabaseGeneration(townRoot, "testdb_remove", dbPath, generation); err != nil {
+		t.Fatal(err)
+	}
 	if err := writeDatabaseCreationOwner(dbPath, token, generation); err != nil {
 		t.Fatal(err)
 	}
@@ -6140,24 +6322,15 @@ func TestReleaseDatabaseCreationTokenIsGenerationBoundAndIdempotent(t *testing.T
 	if err := DatabaseCreationTokenReleased(townRoot, "testdb_remove", token); err != nil {
 		t.Fatalf("normal commit invalidated immutable generation: %v", err)
 	}
-	t.Setenv("GT_TEST_DATABASE_GENERATION_JSON", `{}`)
+	if err := os.Remove(filepath.Join(dbPath, databaseGenerationFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dbPath, databaseGenerationFile), []byte(generation+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := DatabaseCreationTokenReleased(townRoot, "testdb_remove", token); err == nil {
 		t.Fatal("replacement generation accepted release receipt")
 	}
-}
-
-func setupDatabaseGenerationQueryStub(t *testing.T, generation string) {
-	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses a POSIX dolt stub")
-	}
-	binDir := t.TempDir()
-	stub := fmt.Sprintf("#!/bin/sh\ncase \"$*\" in *\"FROM dolt_tags\"*) printf '%%s\\n' '%s'; exit 0;; esac\nexit 1\n",
-		fmt.Sprintf(`{"rows":[{"generation_tag":%q}]}`, databaseGenerationTag(generation)))
-	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func TestRemoveDatabaseQuarantinesIncarnationMismatch(t *testing.T) {

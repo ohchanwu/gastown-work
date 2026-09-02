@@ -1,7 +1,7 @@
 # Dolt Storage Architecture
 
 > **Status**: Current reference for Gas Town agents
-> **Updated**: 2026-09-02
+> **Updated**: 2026-09-03
 > **Context**: Dolt is the sole storage backend for Beads and Gas Town
 
 ---
@@ -54,6 +54,18 @@ same-filesystem rename is verified against the recorded source digest; an
 `.dolt` last. Retries reconcile the receipt phase with source, stage, target,
 and metadata state. Cleanup treats valid pending receipts as ownership and
 fails closed on malformed receipts.
+
+New rig databases receive rollback authority only after Gas Town publishes a
+private filesystem generation anchor. The anchor is one regular-file inode
+hard-linked inside the database root and under town `.runtime`; normal commits
+and server restarts preserve it, while `DROP DATABASE`, name reuse, and copied
+database directories cannot reproduce it. Creation uses a server advisory lock
+so intent cancellation waits for an in-flight `CREATE DATABASE` to finish. If a
+crash leaves a database before the anchor is published, recovery preserves and
+adopts it without destructive rollback authority. Legacy root hashes alone are
+never sufficient to start a new destructive cleanup; an older cleanup receipt
+may be upgraded only after its target has already been atomically claimed or
+removed.
 
 ## Environment Variables
 

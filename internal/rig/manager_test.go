@@ -1750,10 +1750,7 @@ func TestReconcilePendingAddAfterOwnershipRetirement(t *testing.T) {
 	}
 }
 
-func TestReconcileAfterDatabaseMarkerRetiredBeforePathMarker(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test uses a POSIX dolt stub")
-	}
+func TestReconcileAfterVersionOneDatabaseOwnerRetiredBeforePathMarker(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	root, rigsConfig := setupTestTown(t)
 	rigName := "partial_retirement"
@@ -1772,16 +1769,9 @@ func TestReconcileAfterDatabaseMarkerRetiredBeforePathMarker(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"), []byte("test"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ownerJSON := `{"version":2,"token":"database-generation","generation":"03b771a4cef3e984dbff1fa93f01ae6d"}`
-	if err := os.WriteFile(filepath.Join(dbPath, ".gastown-creation-owner"), []byte(ownerJSON+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dbPath, ".gastown-creation-owner"), []byte(token+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	binDir := t.TempDir()
-	stub := "#!/bin/sh\nprintf '{\"rows\":[{\"generation_tag\":\"gastown-db-generation-03b771a4cef3e984dbff1fa93f01ae6d\"}]}\\n'\n"
-	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	if err := doltserver.ReleaseDatabaseCreationToken(root, rigName, token); err != nil {
 		t.Fatal(err)
 	}

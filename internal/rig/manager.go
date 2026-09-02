@@ -1473,14 +1473,18 @@ func recoverInterruptedAdd(townRoot, name string) (bool, error) {
 		}
 		if doltserver.DatabaseExists(townRoot, name) {
 			if databaseOwnership.LegacyRoot != "" {
-				if err := removeLegacyAddDatabase(townRoot, name, databaseOwnership.LegacyRoot, true); err != nil {
+				if err := removeLegacyAddDatabase(townRoot, name, databaseOwnership.LegacyRoot, true); err != nil && !errors.Is(err, doltserver.ErrLegacyDatabaseIdentityUnproven) {
 					return false, fmt.Errorf("removing exact legacy interrupted rig database: %w", err)
 				}
 			} else {
 				if err := doltserver.RecoverDatabaseCreationToken(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
-					return false, fmt.Errorf("recovering interrupted database creation custody: %w", err)
-				}
-				if err := removeAddDatabase(townRoot, name, databaseOwnership.DatabaseToken, true); err != nil {
+					if !errors.Is(err, doltserver.ErrDatabaseGenerationUnproven) {
+						return false, fmt.Errorf("recovering interrupted database creation custody: %w", err)
+					}
+					if err := doltserver.RetireUnprovenDatabaseCreationIntent(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
+						return false, fmt.Errorf("retiring unproven database creation custody: %w", err)
+					}
+				} else if err := removeAddDatabase(townRoot, name, databaseOwnership.DatabaseToken, true); err != nil {
 					return false, fmt.Errorf("removing exact interrupted rig database: %w", err)
 				}
 			}
