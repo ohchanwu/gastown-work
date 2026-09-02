@@ -186,6 +186,10 @@ const (
 // same process (the same process may acquire the same flock twice without blocking).
 var metadataMu sync.Map // map[string]*sync.Mutex
 
+// doltLifecycleMu complements daemon/dolt.lock for same-process callers.
+// flock is inter-process and is not a reliable goroutine mutex on every OS.
+var doltLifecycleMu sync.Mutex
+
 // getMetadataMu returns a mutex for the given metadata file path, creating one if needed.
 func getMetadataMu(path string) *sync.Mutex {
 	mu, _ := metadataMu.LoadOrStore(path, &sync.Mutex{})
@@ -2404,8 +2408,31 @@ behavior:
 	return os.WriteFile(configPath, []byte(content), 0600)
 }
 
+func doltLifecycleLockPath(townRoot string) string {
+	return filepath.Join(filepath.Dir(DefaultConfig(townRoot).LogFile), "dolt.lock")
+}
+
+func tryLockDoltLifecycle(townRoot string) (*flock.Flock, error) {
+	lockPath := doltLifecycleLockPath(townRoot)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, fmt.Errorf("creating Dolt daemon directory: %w", err)
+	}
+	lock := flock.New(lockPath)
+	locked, err := lock.TryLock()
+	if err != nil {
+		return nil, fmt.Errorf("acquiring Dolt lifecycle lock: %w", err)
+	}
+	if !locked {
+		return nil, fmt.Errorf("Dolt start is in progress")
+	}
+	return lock, nil
+}
+
 // Start starts the Dolt SQL server.
 func Start(townRoot string) error {
+	doltLifecycleMu.Lock()
+	defer doltLifecycleMu.Unlock()
+
 	config := DefaultConfig(townRoot)
 
 	// Ensure daemon directory exists
@@ -2417,7 +2444,7 @@ func Start(townRoot string) error {
 	// Acquire exclusive lock to prevent concurrent starts (same pattern as gt daemon).
 	// If the lock is held, retry briefly — the holder may be finishing up. If still
 	// held after retries, check if the holding process is alive. (gt-tosjp)
-	lockFile := filepath.Join(daemonDir, "dolt.lock")
+	lockFile := doltLifecycleLockPath(townRoot)
 	fileLock := flock.New(lockFile)
 	locked, err := fileLock.TryLock()
 	if err != nil {
@@ -2450,22 +2477,14 @@ func Start(townRoot string) error {
 			}
 		}
 		if !locked {
-			// Still locked after the full timeout. Before force-removing the lock,
-			// check if Dolt is already running — the lock holder may have finished
+			// Still locked after the full timeout. The holder may have finished
 			// starting Dolt successfully. If so, return nil instead of spawning a
-			// duplicate server. (gt-nkn: fix thundering herd)
+			// duplicate server. Never unlink a contended flock: cleanup uses the
+			// same lifecycle lock, and POSIX releases it automatically on death.
 			if already, _, _ := IsRunning(townRoot); already {
 				return nil
 			}
-			// POSIX flocks auto-release on process death. We timed out waiting,
-			// so forcibly remove the stale lock and retry once. (gt-tosjp)
-			fmt.Fprintf(os.Stderr, "Warning: dolt.lock held for >%s — removing stale lock\n", lockTimeout.Round(time.Second))
-			_ = os.Remove(lockFile)
-			fileLock = flock.New(lockFile)
-			locked, err = fileLock.TryLock()
-			if err != nil || !locked {
-				return fmt.Errorf("another gt dolt start is in progress (lock held after recovery attempt)")
-			}
+			return fmt.Errorf("another gt dolt start or cleanup is in progress (lock held for %s)", lockTimeout.Round(time.Second))
 		}
 	}
 	defer func() { _ = fileLock.Unlock() }()
@@ -3735,10 +3754,14 @@ func protectedSharedServerDatabases() map[string]string {
 	}
 }
 
+func canonicalDatabaseName(dbName string) string {
+	return strings.ToLower(dbName)
+}
+
 // isProtectedSharedServerDatabase reports databases that are intentionally
 // hosted by the shared Dolt server but are not referenced by rig metadata.
 func isProtectedSharedServerDatabase(dbName string) bool {
-	_, ok := protectedSharedServerDatabases()[dbName]
+	_, ok := protectedSharedServerDatabases()[canonicalDatabaseName(dbName)]
 	return ok
 }
 
@@ -3755,13 +3778,16 @@ func FindOrphanedDatabases(townRoot string) ([]OrphanedDatabase, error) {
 	}
 
 	// Collect all referenced database names from metadata.json files
-	referenced := collectReferencedDatabases(townRoot)
+	referenced, err := collectReferencedDatabases(townRoot)
+	if err != nil {
+		return nil, fmt.Errorf("collecting database ownership: %w", err)
+	}
 
 	// Find databases that exist on disk but aren't referenced
 	config := DefaultConfig(townRoot)
 	var orphans []OrphanedDatabase
 	for _, dbName := range databases {
-		if referenced[dbName] || isProtectedSharedServerDatabase(dbName) {
+		if referenced[canonicalDatabaseName(dbName)] || isProtectedSharedServerDatabase(dbName) {
 			continue
 		}
 		dbPath := filepath.Join(config.DataDir, dbName)
@@ -3777,21 +3803,30 @@ func FindOrphanedDatabases(townRoot string) ([]OrphanedDatabase, error) {
 }
 
 // readExistingDoltDatabase reads the dolt_database field from an existing metadata.json.
-// Returns empty string if the file doesn't exist or can't be read.
-func readExistingDoltDatabase(beadsDir string) string {
+// A missing file or field is not an error; unreadable or malformed ownership
+// metadata is, because cleanup must not translate uncertainty into "unowned."
+func readExistingDoltDatabase(beadsDir string) (string, error) {
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("reading %s: %w", metadataPath, err)
 	}
 	var meta map[string]interface{}
 	if err := json.Unmarshal(data, &meta); err != nil {
-		return ""
+		return "", fmt.Errorf("parsing %s: %w", metadataPath, err)
 	}
-	if db, ok := meta["dolt_database"].(string); ok {
-		return db
+	value, exists := meta["dolt_database"]
+	if !exists || value == nil {
+		return "", nil
 	}
-	return ""
+	db, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("parsing %s: dolt_database must be a string", metadataPath)
+	}
+	return db, nil
 }
 
 // collectReferencedDatabases returns a set of database names referenced by
@@ -3801,13 +3836,23 @@ func readExistingDoltDatabase(beadsDir string) string {
 //   - all rigs from rigs.json
 //   - all routes from routes.jsonl (catches rigs not yet in rigs.json)
 //   - broad scan of metadata.json files under town root
-func collectReferencedDatabases(townRoot string) map[string]bool {
+func collectReferencedDatabases(townRoot string) (map[string]bool, error) {
 	referenced := make(map[string]bool)
+	addReference := func(beadsDir string) error {
+		db, err := readExistingDoltDatabase(beadsDir)
+		if err != nil {
+			return err
+		}
+		if db != "" {
+			referenced[canonicalDatabaseName(db)] = true
+		}
+		return nil
+	}
 
 	// Check town-level beads (hq)
 	townBeadsDir := filepath.Join(townRoot, ".beads")
-	if db := readExistingDoltDatabase(townBeadsDir); db != "" {
-		referenced[db] = true
+	if err := addReference(townBeadsDir); err != nil {
+		return nil, err
 	}
 
 	// Check all rigs from rigs.json
@@ -3823,8 +3868,8 @@ func collectReferencedDatabases(townRoot string) map[string]bool {
 				if beadsDir == "" {
 					continue
 				}
-				if db := readExistingDoltDatabase(beadsDir); db != "" {
-					referenced[db] = true
+				if err := addReference(beadsDir); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -3847,8 +3892,8 @@ func collectReferencedDatabases(townRoot string) map[string]bool {
 			}
 			// route.Path is relative to town root, e.g., "hop", "beads/mayor/rig"
 			beadsDir := filepath.Join(townRoot, route.Path, ".beads")
-			if db := readExistingDoltDatabase(beadsDir); db != "" {
-				referenced[db] = true
+			if err := addReference(beadsDir); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -3861,12 +3906,12 @@ func collectReferencedDatabases(townRoot string) map[string]bool {
 				continue
 			}
 			// Check <rig>/.beads/metadata.json
-			if db := readExistingDoltDatabase(filepath.Join(townRoot, entry.Name(), ".beads")); db != "" {
-				referenced[db] = true
+			if err := addReference(filepath.Join(townRoot, entry.Name(), ".beads")); err != nil {
+				return nil, err
 			}
 			// Check <rig>/mayor/rig/.beads/metadata.json
-			if db := readExistingDoltDatabase(filepath.Join(townRoot, entry.Name(), "mayor", "rig", ".beads")); db != "" {
-				referenced[db] = true
+			if err := addReference(filepath.Join(townRoot, entry.Name(), "mayor", "rig", ".beads")); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -3876,10 +3921,10 @@ func collectReferencedDatabases(townRoot string) map[string]bool {
 	// "gt" for gastown). If metadata.json is missing or corrupted, the prefix-named
 	// DB would appear orphaned without this fallback. (gt-85w7)
 	for _, prefix := range configpkg.AllRigPrefixes(townRoot) {
-		referenced[prefix] = true
+		referenced[canonicalDatabaseName(prefix)] = true
 	}
 
-	return referenced
+	return referenced, nil
 }
 
 // CollectDatabaseOwners returns a map from database name to a human-readable
@@ -3891,8 +3936,8 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 
 	// Check town-level beads (hq)
 	townBeadsDir := filepath.Join(townRoot, ".beads")
-	if db := readExistingDoltDatabase(townBeadsDir); db != "" {
-		owners[db] = "town beads"
+	if db, err := readExistingDoltDatabase(townBeadsDir); err == nil && db != "" {
+		owners[canonicalDatabaseName(db)] = "town beads"
 	}
 
 	// Check all rigs from rigs.json
@@ -3908,8 +3953,8 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 				if beadsDir == "" {
 					continue
 				}
-				if db := readExistingDoltDatabase(beadsDir); db != "" {
-					owners[db] = rigName + " rig beads"
+				if db, err := readExistingDoltDatabase(beadsDir); err == nil && db != "" {
+					owners[canonicalDatabaseName(db)] = rigName + " rig beads"
 				}
 			}
 		}
@@ -3931,11 +3976,12 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 				continue
 			}
 			beadsDir := filepath.Join(townRoot, route.Path, ".beads")
-			if db := readExistingDoltDatabase(beadsDir); db != "" {
-				if _, already := owners[db]; !already {
+			if db, err := readExistingDoltDatabase(beadsDir); err == nil && db != "" {
+				canonical := canonicalDatabaseName(db)
+				if _, already := owners[canonical]; !already {
 					// Derive a name from the route path
 					parts := strings.Split(route.Path, "/")
-					owners[db] = parts[0] + " rig beads"
+					owners[canonical] = parts[0] + " rig beads"
 				}
 			}
 		}
@@ -3948,14 +3994,16 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 				continue
 			}
 			dirName := entry.Name()
-			if db := readExistingDoltDatabase(filepath.Join(townRoot, dirName, ".beads")); db != "" {
-				if _, already := owners[db]; !already {
-					owners[db] = dirName + " rig beads"
+			if db, err := readExistingDoltDatabase(filepath.Join(townRoot, dirName, ".beads")); err == nil && db != "" {
+				canonical := canonicalDatabaseName(db)
+				if _, already := owners[canonical]; !already {
+					owners[canonical] = dirName + " rig beads"
 				}
 			}
-			if db := readExistingDoltDatabase(filepath.Join(townRoot, dirName, "mayor", "rig", ".beads")); db != "" {
-				if _, already := owners[db]; !already {
-					owners[db] = dirName + " rig beads"
+			if db, err := readExistingDoltDatabase(filepath.Join(townRoot, dirName, "mayor", "rig", ".beads")); err == nil && db != "" {
+				canonical := canonicalDatabaseName(db)
+				if _, already := owners[canonical]; !already {
+					owners[canonical] = dirName + " rig beads"
 				}
 			}
 		}
@@ -3966,12 +4014,23 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 	// otherwise we'd advertise a phantom owner. Never overwrites a rig-derived
 	// label if one is already present.
 	config := DefaultConfig(townRoot)
-	for dbName, label := range protectedSharedServerDatabases() {
-		if _, already := owners[dbName]; already {
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(config.DataDir, dbName, ".dolt")); err == nil {
-			owners[dbName] = label
+	if entries, err := os.ReadDir(config.DataDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			canonical := canonicalDatabaseName(entry.Name())
+			label, protected := protectedSharedServerDatabases()[canonical]
+			if !protected {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(config.DataDir, entry.Name(), ".dolt")); err != nil {
+				continue
+			}
+			if _, already := owners[canonical]; already {
+				continue
+			}
+			owners[canonical] = label
 		}
 	}
 
@@ -3997,10 +4056,29 @@ type databaseCleanupReceipt struct {
 }
 
 var (
+	// databaseCleanupMu serializes ownership publication with cleanup in this
+	// process; ownership.lock provides the matching cross-process fence.
 	databaseCleanupMu       sync.Mutex
 	databaseCleanupFileSync = func(f *os.File) error { return f.Sync() }
 	databaseCleanupDirSync  = func(f *os.File) error { return f.Sync() }
 )
+
+func lockDatabaseCleanupOwnership(townRoot string) (*flock.Flock, error) {
+	lockDir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup")
+	if err := ensurePrivateDatabaseCleanupDirectory(lockDir); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(lockDir, "ownership.lock")
+	lock := flock.New(lockPath)
+	if err := lock.Lock(); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(lockPath, 0o600); err != nil {
+		_ = lock.Unlock()
+		return nil, err
+	}
+	return lock, nil
+}
 
 // RemoveDatabase removes an orphaned database directory from .dolt-data/.
 // The caller should verify the database is actually orphaned before calling this.
@@ -4014,18 +4092,32 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 		return fmt.Errorf("database %q is a protected shared-server database", dbName)
 	}
 
+	doltLifecycleMu.Lock()
+	defer doltLifecycleMu.Unlock()
+	lifecycleLock, err := tryLockDoltLifecycle(townRoot)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lifecycleLock.Unlock() }()
+
 	databaseCleanupMu.Lock()
 	defer databaseCleanupMu.Unlock()
+	ownershipLock, err := lockDatabaseCleanupOwnership(townRoot)
+	if err != nil {
+		return fmt.Errorf("locking database ownership for cleanup: %w", err)
+	}
+	defer func() { _ = ownershipLock.Unlock() }()
 	lockDir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup")
 	if err := ensurePrivateDatabaseCleanupDirectory(lockDir); err != nil {
 		return fmt.Errorf("creating database cleanup lock directory: %w", err)
 	}
-	fileLock := flock.New(filepath.Join(lockDir, dbName+".lock"))
+	databaseLockPath := filepath.Join(lockDir, canonicalDatabaseName(dbName)+".lock")
+	fileLock := flock.New(databaseLockPath)
 	if err := fileLock.Lock(); err != nil {
 		return fmt.Errorf("locking database cleanup for %q: %w", dbName, err)
 	}
 	defer func() { _ = fileLock.Unlock() }()
-	if err := os.Chmod(filepath.Join(lockDir, dbName+".lock"), 0o600); err != nil {
+	if err := os.Chmod(databaseLockPath, 0o600); err != nil {
 		return fmt.Errorf("tightening database cleanup lock for %q: %w", dbName, err)
 	}
 
@@ -4038,7 +4130,7 @@ func removeDatabaseLocked(townRoot, dbName string, force bool) error {
 	receiptPath := databaseCleanupReceiptPath(townRoot, dbName)
 	receipt, receiptErr := readDatabaseCleanupReceipt(receiptPath)
 	if receiptErr == nil {
-		if receipt.Database != dbName {
+		if !strings.EqualFold(receipt.Database, dbName) {
 			return fmt.Errorf("database cleanup receipt does not match %q", dbName)
 		}
 		if receipt.Force && !force {
@@ -4163,10 +4255,19 @@ func PendingDatabaseCleanupNames(townRoot string) ([]string, error) {
 		}
 		receipt, err := readDatabaseCleanupReceipt(filepath.Join(dir, entry.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("reading pending database cleanup %q: %w", entry.Name(), err)
+			if quarantineErr := moveDatabaseCleanupReceiptToQuarantine(filepath.Join(dir, entry.Name())); quarantineErr != nil {
+				return nil, errors.Join(
+					fmt.Errorf("reading pending database cleanup %q: %w", entry.Name(), err),
+					fmt.Errorf("quarantining invalid pending database cleanup: %w", quarantineErr),
+				)
+			}
+			continue
 		}
-		if entry.Name() != receipt.Database+".json" {
-			return nil, fmt.Errorf("pending database cleanup %q does not match receipt database", entry.Name())
+		if entry.Name() != canonicalDatabaseName(receipt.Database)+".json" {
+			if err := moveDatabaseCleanupReceiptToQuarantine(filepath.Join(dir, entry.Name())); err != nil {
+				return nil, fmt.Errorf("quarantining mismatched pending database cleanup %q: %w", entry.Name(), err)
+			}
+			continue
 		}
 		names = append(names, receipt.Database)
 	}
@@ -4263,11 +4364,11 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 	}
 	if claimedPath != "" {
 		if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
-			return quarantineDatabaseCleanupReceipt(receiptPath, err)
+			return restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath, err)
 		}
 		claimedIncarnation, err := databaseCleanupIncarnation(townRoot, dbName, claimedPath, false)
 		if err != nil || claimedIncarnation != receipt.Incarnation {
-			return quarantineDatabaseCleanupReceipt(receiptPath,
+			return restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath,
 				fmt.Errorf("claimed database %q no longer matches cleanup incarnation", dbName))
 		}
 		if err := os.RemoveAll(claimedPath); err != nil {
@@ -4300,14 +4401,11 @@ func resumeOfflineDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 		return nil
 	}
 	if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
-		if restoreErr := restoreClaimedDatabaseCleanupDirectory(dbPath, claimedPath); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("restoring database after ownership changed: %w", restoreErr))
-		}
-		return quarantineDatabaseCleanupReceipt(receiptPath, err)
+		return restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath, err)
 	}
 	claimedIncarnation, err := databaseCleanupIncarnation(townRoot, dbName, claimedPath, false)
 	if err != nil || claimedIncarnation != receipt.Incarnation {
-		return quarantineDatabaseCleanupReceipt(receiptPath,
+		return restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath,
 			fmt.Errorf("claimed database %q no longer matches cleanup incarnation", dbName))
 	}
 	if err := os.RemoveAll(claimedPath); err != nil {
@@ -4329,7 +4427,7 @@ func liveBranchControlDatabase(townRoot, removedDB string) (controlDB string, ta
 		return "", false, fmt.Errorf("listing live databases for branch-control cleanup: %w", err)
 	}
 	for _, database := range databases {
-		if database == removedDB {
+		if strings.EqualFold(database, removedDB) {
 			targetLive = true
 			continue
 		}
@@ -4341,7 +4439,11 @@ func liveBranchControlDatabase(townRoot, removedDB string) (controlDB string, ta
 }
 
 func ensureDatabaseCleanupUnreferenced(townRoot, dbName string) error {
-	if collectReferencedDatabases(townRoot)[dbName] {
+	referenced, err := collectReferencedDatabases(townRoot)
+	if err != nil {
+		return fmt.Errorf("reading database ownership metadata: %w", err)
+	}
+	if referenced[canonicalDatabaseName(dbName)] {
 		return fmt.Errorf("database %q is referenced by current Gas Town ownership metadata", dbName)
 	}
 	return nil
@@ -4382,7 +4484,7 @@ func ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, wantIncarnation strin
 			return fmt.Errorf("listing live databases while validating database %q: %w", dbName, listErr)
 		}
 		for _, database := range databases {
-			if database == dbName {
+			if strings.EqualFold(database, dbName) {
 				targetLive = true
 				break
 			}
@@ -4449,7 +4551,7 @@ func databaseCleanupIncarnation(townRoot, dbName, dbPath string, targetLive bool
 
 func databaseCleanupClaimPath(townRoot, dbName, incarnation string) string {
 	sum := sha256.Sum256([]byte(incarnation))
-	return filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "claimed", fmt.Sprintf("%s-%x", dbName, sum[:8]))
+	return filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "claimed", fmt.Sprintf("%s-%x", canonicalDatabaseName(dbName), sum[:8]))
 }
 
 func claimDatabaseCleanupDirectory(townRoot, dbName, dbPath, incarnation string) (string, error) {
@@ -4505,8 +4607,15 @@ func restoreClaimedDatabaseCleanupDirectory(dbPath, claimedPath string) error {
 	)
 }
 
+func restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath string, reason error) error {
+	if err := restoreClaimedDatabaseCleanupDirectory(dbPath, claimedPath); err != nil {
+		return errors.Join(reason, fmt.Errorf("restoring claimed database; cleanup receipt preserved: %w", err))
+	}
+	return quarantineDatabaseCleanupReceipt(receiptPath, reason)
+}
+
 func databaseCleanupReceiptPath(townRoot, dbName string) string {
-	return filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", dbName+".json")
+	return filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", canonicalDatabaseName(dbName)+".json")
 }
 
 func writeDatabaseCleanupReceipt(path string, receipt databaseCleanupReceipt) error {
@@ -4611,14 +4720,18 @@ func readDatabaseCleanupReceipt(path string) (databaseCleanupReceipt, error) {
 }
 
 func quarantineDatabaseCleanupReceipt(path string, reason error) error {
-	quarantinePath := fmt.Sprintf("%s.%d.quarantine", path, time.Now().UnixNano())
-	if err := os.Rename(path, quarantinePath); err != nil {
+	if err := moveDatabaseCleanupReceiptToQuarantine(path); err != nil {
 		return errors.Join(reason, fmt.Errorf("quarantining stale database cleanup receipt: %w", err))
 	}
-	if err := syncDatabaseCleanupDirectory(filepath.Dir(path)); err != nil {
-		return errors.Join(reason, fmt.Errorf("syncing quarantined database cleanup receipt: %w", err))
-	}
 	return fmt.Errorf("%w; stale cleanup receipt quarantined", reason)
+}
+
+func moveDatabaseCleanupReceiptToQuarantine(path string) error {
+	quarantinePath := fmt.Sprintf("%s.%d.quarantine", path, time.Now().UnixNano())
+	if err := os.Rename(path, quarantinePath); err != nil {
+		return err
+	}
+	return syncDatabaseCleanupDirectory(filepath.Dir(path))
 }
 
 func clearUnmutatedDatabaseCleanupReceipt(path string, operationErr error) error {
@@ -4868,6 +4981,13 @@ func EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName string, doltDatabase 
 	}
 
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	databaseCleanupMu.Lock()
+	defer databaseCleanupMu.Unlock()
+	ownershipLock, err := lockDatabaseCleanupOwnership(townRoot)
+	if err != nil {
+		return fmt.Errorf("locking database ownership metadata: %w", err)
+	}
+	defer func() { _ = ownershipLock.Unlock() }()
 
 	// Acquire per-path mutex for goroutine synchronization.
 	// EnsureAllMetadata calls EnsureMetadata concurrently; flock (inter-process)

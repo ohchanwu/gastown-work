@@ -907,7 +907,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 				owners := doltserver.CollectDatabaseOwners(townRoot)
 				fmt.Printf("  Databases:\n")
 				for _, db := range state.Databases {
-					if owner, ok := owners[db]; ok {
+					if owner, ok := owners[strings.ToLower(db)]; ok {
 						fmt.Printf("    - %-20s (%s)\n", db, owner)
 					} else {
 						fmt.Printf("    - %s\n", db)
@@ -977,7 +977,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nAvailable databases in %s:\n", config.DataDir)
 			owners := doltserver.CollectDatabaseOwners(townRoot)
 			for _, db := range databases {
-				if owner, ok := owners[db]; ok {
+				if owner, ok := owners[strings.ToLower(db)]; ok {
 					fmt.Printf("  - %-20s (%s)\n", db, owner)
 				} else {
 					fmt.Printf("  - %s\n", db)
@@ -1520,7 +1520,7 @@ func runDoltList(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Rig databases in %s:\n\n", config.DataDir)
 	for _, db := range databases {
 		dbDir := doltserver.RigDatabaseDir(townRoot, db)
-		if owner, ok := owners[db]; ok {
+		if owner, ok := owners[strings.ToLower(db)]; ok {
 			fmt.Printf("  %s (%s)\n    %s\n", style.Bold.Render(db), owner, style.Dim.Render(dbDir))
 		} else {
 			fmt.Printf("  %s (orphan)\n    %s\n", style.Bold.Render(db), style.Dim.Render(dbDir))
