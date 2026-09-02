@@ -4951,9 +4951,20 @@ func GetHealthMetrics(townRoot string) *HealthMetrics {
 // Returns (true, nil) if read-only, (false, nil) if writable, (false, err) on probe failure.
 func CheckReadOnly(townRoot string) (bool, error) {
 	config := DefaultConfig(townRoot)
+	running, _, err := IsRunning(townRoot)
+	if err != nil {
+		return false, fmt.Errorf("checking Dolt server before write probe: %w", err)
+	}
+	if !running {
+		if _, err := ListDatabases(townRoot); err != nil {
+			return false, fmt.Errorf("listing databases for write probe: %w", err)
+		}
+		return false, nil
+	}
 
-	// Need a database to test writes against
-	databases, err := ListDatabases(townRoot)
+	// The probe runs against the server, so select its target from the server's
+	// live catalog. A valid directory can exist on disk without being loaded.
+	databases, err := listDatabasesRemote(config)
 	if err != nil {
 		return false, fmt.Errorf("listing databases for write probe: %w", err)
 	}

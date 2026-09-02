@@ -3933,6 +3933,9 @@ func TestRemoveDatabaseUsesLiveCatalogAgainstIsolatedServer(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dataDir, "a_disk_only", ".dolt")); err != nil {
 		t.Fatalf("filesystem-only database was mutated: %v", err)
 	}
+	if readOnly, err := CheckReadOnly(townRoot); err != nil || readOnly {
+		t.Fatalf("CheckReadOnly() with a filesystem-only database = (%v, %v), want writable live catalog", readOnly, err)
+	}
 	live, err := listDatabasesRemote(DefaultConfig(townRoot))
 	if err != nil {
 		t.Fatal(err)
