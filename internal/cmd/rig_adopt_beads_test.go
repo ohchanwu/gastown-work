@@ -76,7 +76,7 @@ func TestRigAdoptBeadsCandidateDetection(t *testing.T) {
 // and a prefix is available, the fallback init path is triggered.
 func TestRigAdoptFallbackInitNeeded(t *testing.T) {
 	tests := []struct {
-		name       string
+		name         string
 		hasDotBeads  bool
 		hasPrefix    bool
 		wantFallback bool
@@ -117,5 +117,29 @@ func TestRigAdoptFallbackInitNeeded(t *testing.T) {
 					needsFallback, tt.wantFallback, foundBeadsCandidate, beadsPrefix)
 			}
 		})
+	}
+}
+
+func TestDetectAdoptedRigBeadsPrefixBeforeRegistration(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, "adopted", ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt","dolt_database":"beads_source"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte("#!/bin/sh\nprintf 'source\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	prefix, found, err := detectAdoptedRigBeadsPrefix(townRoot, "adopted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || prefix != "source" {
+		t.Fatalf("detected prefix = %q, found = %v; want source, true", prefix, found)
 	}
 }

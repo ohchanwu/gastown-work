@@ -1636,6 +1636,76 @@ func TestRegisterRigPersistsCommittedRoute(t *testing.T) {
 	}
 }
 
+func TestReconcilePendingRigRegistrationCommitsRoute(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	rigName := "recovering"
+	if err := os.MkdirAll(filepath.Join(root, rigName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := beads.ReserveRoute(root, beads.Route{
+		Prefix: "rc-",
+		Path:   rigName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rigsPath := filepath.Join(root, "mayor", "rigs.json")
+	if err := config.SaveRigsConfig(rigsPath, &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{rigName: {
+			RegistrationToken:   reservation.Token,
+			RegistrationPending: true,
+			BeadsConfig:         &config.BeadsConfig{Prefix: "rc"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	recovered, err := manager.reconcileRigRegistration(rigName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered {
+		t.Fatal("pending registration was not recovered")
+	}
+
+	routes, err := beads.LoadRoutes(filepath.Join(root, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Prefix != "rc-" || routes[0].Path != rigName {
+		t.Fatalf("routes = %v, want recovered rc- route", routes)
+	}
+	persisted, err := config.LoadRigsConfig(rigsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := persisted.Rigs[rigName]
+	if entry.RegistrationPending || entry.RegistrationToken != reservation.Token {
+		t.Fatalf("registration state = %#v, want committed token %q", entry, reservation.Token)
+	}
+}
+
+func TestPersistPendingRigRegistrationRejectsDifferentToken(t *testing.T) {
+	root, _ := setupTestTown(t)
+	path := filepath.Join(root, "mayor", "rigs.json")
+	first := config.RigEntry{RegistrationToken: "first", RegistrationPending: true}
+	if _, err := persistPendingRigRegistration(path, "owned", first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistPendingRigRegistration(path, "owned", config.RigEntry{RegistrationToken: "second", RegistrationPending: true}); err == nil {
+		t.Fatal("different registration token overwrote durable owner")
+	}
+	persisted, err := config.LoadRigsConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := persisted.Rigs["owned"].RegistrationToken; got != "first" {
+		t.Fatalf("registration token = %q, want first", got)
+	}
+}
+
 func TestRegisterRig_DetectPushURLEmptyWhenPushEqualsFetch(t *testing.T) {
 	root, rigsConfig := setupTestTown(t)
 	manager := NewManager(root, rigsConfig, git.NewGit(root))

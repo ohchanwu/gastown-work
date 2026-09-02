@@ -21,6 +21,7 @@ import (
 type Route struct {
 	Prefix              string `json:"prefix"`                     // Issue ID prefix (e.g., "gt-")
 	Path                string `json:"path"`                       // Relative path to .beads directory from town root
+	PendingPath         string `json:"_gt_pending_path,omitempty"` // Unpublished replacement owned by pending reservations
 	PendingReservations string `json:"_gt_reservations,omitempty"` // Internal rollback ownership tokens
 }
 
@@ -36,6 +37,26 @@ const RoutesFileName = "routes.jsonl"
 // LoadRoutes loads routes from routes.jsonl in the given beads directory.
 // Returns an empty slice if the file doesn't exist.
 func LoadRoutes(beadsDir string) ([]Route, error) {
+	routes, err := loadRoutes(beadsDir)
+	if err != nil {
+		return nil, err
+	}
+	if routes == nil {
+		return nil, nil
+	}
+	published := make([]Route, 0, len(routes))
+	for _, route := range routes {
+		if route.Path == "" {
+			continue
+		}
+		route.PendingPath = ""
+		route.PendingReservations = ""
+		published = append(published, route)
+	}
+	return published, nil
+}
+
+func loadRoutes(beadsDir string) ([]Route, error) {
 	routesPath := filepath.Join(beadsDir, RoutesFileName)
 	file, err := os.Open(routesPath)
 	if err != nil {
@@ -61,7 +82,7 @@ func LoadRoutes(beadsDir string) ([]Route, error) {
 			fmt.Fprintf(os.Stderr, "Warning: skipping malformed route at %s:%d: %v\n", routesPath, lineNum, err)
 			continue
 		}
-		if route.Prefix != "" && route.Path != "" {
+		if route.Prefix != "" && (route.Path != "" || route.PendingPath != "") {
 			routes = append(routes, route)
 		}
 	}
@@ -111,23 +132,25 @@ func reserveRouteToDir(beadsDir string, route Route) (RouteReservation, error) {
 	err = UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
 		for i, existing := range routes {
 			if existing.Prefix == route.Prefix {
-				existingRig := strings.SplitN(existing.Path, "/", 2)[0]
+				existingPath := existing.Path
+				if existingPath == "" {
+					existingPath = existing.PendingPath
+				}
+				existingRig := strings.SplitN(existingPath, "/", 2)[0]
 				newRig := strings.SplitN(route.Path, "/", 2)[0]
 				if existingRig != newRig {
-					return nil, fmt.Errorf("prefix %q is already used by %s (path: %s); use --prefix to specify a different prefix", route.Prefix, existingRig, existing.Path)
+					return nil, fmt.Errorf("prefix %q is already used by %s (path: %s); use --prefix to specify a different prefix", route.Prefix, existingRig, existingPath)
 				}
-				if existing.Path == route.Path && existing.PendingReservations == "" {
-					reservation.Token = ""
-					return routes, nil
-				}
-				if existing.Path != route.Path && existing.PendingReservations != "" {
+				if existing.PendingReservations != "" && existing.PendingPath != route.Path {
 					return nil, fmt.Errorf("prefix %q has a route registration in progress", route.Prefix)
 				}
-				routes[i].Path = route.Path
+				routes[i].PendingPath = route.Path
 				routes[i].PendingReservations = appendRouteReservation(existing.PendingReservations, token)
 				return routes, nil
 			}
 		}
+		route.Path = ""
+		route.PendingPath = reservation.Route.Path
 		route.PendingReservations = token
 		return append(routes, route), nil
 	})
@@ -146,7 +169,13 @@ func commitRouteReservationToDir(beadsDir string, reservation RouteReservation) 
 	}
 	return UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
 		for i, route := range routes {
-			if route.Prefix != reservation.Route.Prefix || route.Path != reservation.Route.Path {
+			if route.Prefix != reservation.Route.Prefix {
+				continue
+			}
+			if route.Path == reservation.Route.Path && route.PendingReservations == "" {
+				return routes, nil
+			}
+			if route.PendingPath != reservation.Route.Path {
 				continue
 			}
 			if route.PendingReservations == "" {
@@ -155,6 +184,8 @@ func commitRouteReservationToDir(beadsDir string, reservation RouteReservation) 
 			if !hasRouteReservation(route.PendingReservations, reservation.Token) {
 				return nil, fmt.Errorf("route reservation for prefix %q is no longer owned by this registration", route.Prefix)
 			}
+			routes[i].Path = route.PendingPath
+			routes[i].PendingPath = ""
 			routes[i].PendingReservations = ""
 			return routes, nil
 		}
@@ -174,7 +205,7 @@ func releaseRouteReservationToDir(beadsDir string, reservation RouteReservation)
 	}
 	return UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
 		for i, route := range routes {
-			if route.Prefix != reservation.Route.Prefix || route.Path != reservation.Route.Path || route.PendingReservations == "" {
+			if route.Prefix != reservation.Route.Prefix || route.PendingPath != reservation.Route.Path || route.PendingReservations == "" {
 				continue
 			}
 			remaining := removeRouteReservation(route.PendingReservations, reservation.Token)
@@ -182,7 +213,12 @@ func releaseRouteReservationToDir(beadsDir string, reservation RouteReservation)
 				return routes, nil
 			}
 			if remaining == "" {
-				return slices.Delete(routes, i, i+1), nil
+				if route.Path == "" {
+					return slices.Delete(routes, i, i+1), nil
+				}
+				routes[i].PendingPath = ""
+				routes[i].PendingReservations = ""
+				return routes, nil
 			}
 			routes[i].PendingReservations = remaining
 			return routes, nil
@@ -241,7 +277,7 @@ func UpdateRoutes(beadsDir string, update func([]Route) ([]Route, error)) error 
 		return fmt.Errorf("routes update is required")
 	}
 	return withRoutesOwnership(beadsDir, func() error {
-		routes, err := LoadRoutes(beadsDir)
+		routes, err := loadRoutes(beadsDir)
 		if err != nil {
 			return fmt.Errorf("loading routes: %w", err)
 		}

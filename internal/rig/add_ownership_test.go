@@ -1,10 +1,72 @@
 package rig
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestRecoverInterruptedAddRemovesExactCreatedDatabase(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "recovering")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{Owner: "owner-token", Root: "dolt-root:exact", RoutePrefix: "rc-", RoutePath: "recovering", RouteToken: "route-token"}); err != nil {
+		t.Fatal(err)
+	}
+	previous := removeAddDatabase
+	t.Cleanup(func() { removeAddDatabase = previous })
+	called := false
+	removeAddDatabase = func(gotTown, gotName, gotRoot string, force bool) error {
+		called = true
+		if gotTown != townRoot || gotName != "recovering" || gotRoot != "dolt-root:exact" || !force {
+			t.Fatalf("cleanup args = %q, %q, %q, %v", gotTown, gotName, gotRoot, force)
+		}
+		return nil
+	}
+
+	recovered, err := recoverInterruptedAdd(townRoot, "recovering")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered || !called {
+		t.Fatalf("recovered = %v, cleanup called = %v; want true, true", recovered, called)
+	}
+	if _, err := os.Stat(rigPath); !os.IsNotExist(err) {
+		t.Fatalf("interrupted rig path remains: %v", err)
+	}
+}
+
+func TestRecoverInterruptedAddPreservesPathWhenDatabaseIdentityChanged(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "recovering")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{Owner: "owner-token", Root: "dolt-root:old", RoutePrefix: "rc-", RoutePath: "recovering", RouteToken: "route-token"}); err != nil {
+		t.Fatal(err)
+	}
+	previous := removeAddDatabase
+	t.Cleanup(func() { removeAddDatabase = previous })
+	removeAddDatabase = func(string, string, string, bool) error {
+		return errors.New("database no longer matches owning root incarnation")
+	}
+
+	if _, err := recoverInterruptedAdd(townRoot, "recovering"); err == nil {
+		t.Fatal("recovery succeeded after database identity changed")
+	}
+	if _, err := os.Stat(filepath.Join(rigPath, addOwnershipStampFile)); err != nil {
+		t.Fatalf("recovery evidence was not preserved: %v", err)
+	}
+}
 
 func TestRemoveRigPathIfOwned_MatchingStampRemovesPath(t *testing.T) {
 	rigPath := t.TempDir()

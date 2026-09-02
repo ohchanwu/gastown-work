@@ -162,6 +162,67 @@ func TestReleaseRouteReservationRemovesOnlyOwnedPendingRoute(t *testing.T) {
 	}
 }
 
+func TestPendingRouteIsNotPublishedBeforeCommit(t *testing.T) {
+	townRoot := t.TempDir()
+	reservation, err := ReserveRoute(townRoot, Route{Prefix: "zz-", Path: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reservation.Token == "" {
+		t.Fatal("pending route did not receive a reservation token")
+	}
+
+	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 0 {
+		t.Fatalf("pending routes = %v, want no published routes", routes)
+	}
+
+	if err := CommitRouteReservation(townRoot, reservation); err != nil {
+		t.Fatal(err)
+	}
+	routes, err = LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0] != reservation.Route {
+		t.Fatalf("committed routes = %v, want %v", routes, reservation.Route)
+	}
+}
+
+func TestRouteReleaseRestoresCommittedPredecessor(t *testing.T) {
+	townRoot := t.TempDir()
+	committed := Route{Prefix: "zz-", Path: "alpha/old"}
+	if err := AppendRoute(townRoot, committed); err != nil {
+		t.Fatal(err)
+	}
+
+	reservation, err := ReserveRoute(townRoot, Route{Prefix: "zz-", Path: "alpha/new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0] != committed {
+		t.Fatalf("routes before commit = %v, want predecessor %v", routes, committed)
+	}
+	if err := ReleaseRouteReservation(townRoot, reservation); err != nil {
+		t.Fatal(err)
+	}
+
+	routes, err = LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0] != committed {
+		t.Fatalf("routes after release = %v, want predecessor %v", routes, committed)
+	}
+}
+
 func TestRouteReleasePreservesConcurrentReuse(t *testing.T) {
 	townRoot := t.TempDir()
 	route := Route{Prefix: "zz-", Path: "alpha"}
@@ -177,17 +238,17 @@ func TestRouteReleasePreservesConcurrentReuse(t *testing.T) {
 	if err := ReleaseRouteReservation(townRoot, first); err != nil {
 		t.Fatal(err)
 	}
-	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
+	routes, err := loadRoutes(filepath.Join(townRoot, ".beads"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(routes) != 1 || routes[0].Prefix != route.Prefix || routes[0].Path != route.Path {
-		t.Fatalf("routes = %v, want reused route preserved", routes)
+	if len(routes) != 1 || routes[0].Prefix != route.Prefix || routes[0].PendingPath != route.Path {
+		t.Fatalf("raw routes = %v, want reused pending route preserved", routes)
 	}
 	if err := ReleaseRouteReservation(townRoot, second); err != nil {
 		t.Fatal(err)
 	}
-	routes, err = LoadRoutes(filepath.Join(townRoot, ".beads"))
+	routes, err = loadRoutes(filepath.Join(townRoot, ".beads"))
 	if err != nil {
 		t.Fatal(err)
 	}

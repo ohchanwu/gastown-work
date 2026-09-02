@@ -1961,6 +1961,47 @@ func TestMigrateRigFromBeadsUpgradesVersionOneReceipts(t *testing.T) {
 	}
 }
 
+func TestMigrateRigFromBeadsUpgradesPartialVersionOneCleanupRemoving(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "legacy-partial-removal"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	cleanupPath := setupDoltDB(t, filepath.Dir(sourcePath), filepath.Base(sourcePath)+".migration-cleanup")
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(cleanupPath, ".dolt", "noms", "manifest")); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      1,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		Phase:        databaseMigrationCleanupRemoving,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
+		t.Fatalf("resume partial version-one cleanup: %v", err)
+	}
+	if _, err := os.Stat(cleanupPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy cleanup path remains: %v", err)
+	}
+	if _, err := os.Stat(databaseMigrationReceiptPath(townRoot, rigName)); !os.IsNotExist(err) {
+		t.Fatalf("migration receipt remains: %v", err)
+	}
+}
+
 func TestMigrateRigFromBeadsResumesInterruptedVersionOneUpgrade(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()

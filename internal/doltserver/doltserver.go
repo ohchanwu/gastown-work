@@ -3485,8 +3485,15 @@ func jsonKeys(m map[string]json.RawMessage) []string {
 // Returns (serverWasRunning, created, err). created is false when the database
 // already existed on disk (idempotent no-op).
 func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err error) {
+	serverWasRunning, created, _, err = InitRigOwned(townRoot, rigName)
+	return serverWasRunning, created, err
+}
+
+// InitRigOwned also returns the stable root identity of a database it created.
+// Callers use that identity for exact compensating cleanup after later failure.
+func InitRigOwned(townRoot, rigName string) (serverWasRunning bool, created bool, rootIdentity string, err error) {
 	if rigName == "" {
-		return false, false, fmt.Errorf("rig name cannot be empty")
+		return false, false, "", fmt.Errorf("rig name cannot be empty")
 	}
 
 	config := DefaultConfig(townRoot)
@@ -3494,7 +3501,7 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 	// Validate rig name (simple alphanumeric + underscore/dash)
 	for _, r := range rigName {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
-			return false, false, fmt.Errorf("invalid rig name %q: must contain only alphanumeric, underscore, or dash", rigName)
+			return false, false, "", fmt.Errorf("invalid rig name %q: must contain only alphanumeric, underscore, or dash", rigName)
 		}
 	}
 
@@ -3551,6 +3558,13 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 			if err := ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName); err != nil {
 				return fmt.Errorf("publishing database ownership: %w", err)
 			}
+			if created {
+				incarnation, err := databaseCleanupIncarnation(townRoot, rigName, rigDir, serverWasRunning)
+				if err != nil {
+					return fmt.Errorf("capturing created database identity: %w", err)
+				}
+				rootIdentity = databaseCleanupRootIdentity(incarnation)
+			}
 			return nil
 		}); err != nil {
 			return err
@@ -3561,15 +3575,15 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 		return nil
 	})
 	if err != nil {
-		return serverWasRunning, created, err
+		return serverWasRunning, created, rootIdentity, err
 	}
 	if !serverWasRunning {
 		if err := EnsureRigIssuePrefix(townRoot, rigName, false); err != nil {
-			return serverWasRunning, created, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
+			return serverWasRunning, created, rootIdentity, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
 		}
 	}
 
-	return serverWasRunning, created, nil
+	return serverWasRunning, created, rootIdentity, nil
 }
 
 // EnsureRigIssuePrefix initializes the beads schema for a rig database and
@@ -3794,7 +3808,7 @@ func validateDatabaseMigrationReceipt(townRoot, receiptPath string, receipt data
 	}
 	validPhase := receipt.Phase == databaseMigrationPrepared || receipt.Phase == databaseMigrationStaged || receipt.Phase == databaseMigrationTargetReady || receipt.Phase == databaseMigrationCleanupReady || receipt.Phase == databaseMigrationCleanupRemoving || receipt.Phase == databaseMigrationCleanupEmpty || receipt.Phase == databaseMigrationSourceCleaned
 	if receipt.Version == 1 {
-		validPhase = receipt.Phase == databaseMigrationPrepared || receipt.Phase == databaseMigrationStaged || receipt.Phase == databaseMigrationTargetReady
+		validPhase = receipt.Phase == databaseMigrationPrepared || receipt.Phase == databaseMigrationStaged || receipt.Phase == databaseMigrationTargetReady || receipt.Phase == databaseMigrationCleanupRemoving
 	}
 	if !validPhase {
 		return fmt.Errorf("invalid database migration receipt phase %q", receipt.Phase)
@@ -4267,6 +4281,12 @@ func upgradeDatabaseMigrationReceipt(townRoot, receiptPath string, receipt datab
 		}
 		receipt.Version = databaseMigrationReceiptVersion
 		receipt.TargetToken = token
+		if receipt.Phase == databaseMigrationCleanupRemoving {
+			receipt.CleanupToken, err = newDatabaseMigrationCleanupToken()
+			if err != nil {
+				return receipt, err
+			}
+		}
 		receipt.LegacyUpgrade = true
 		if err := writeDatabaseMigrationReceipt(receiptPath, receipt); err != nil {
 			return receipt, err
@@ -4343,14 +4363,17 @@ func upgradeDatabaseMigrationReceipt(townRoot, receiptPath string, receipt datab
 		}
 		claimPath := filepath.Join(claimRel, databaseMigrationCleanupClaimName)
 		if _, err := root.Lstat(claimPath); os.IsNotExist(err) {
-			if !claimComplete {
+			partialLegacyRemoval := wasVersionOne && receipt.Phase == databaseMigrationCleanupRemoving
+			if !claimComplete && !partialLegacyRemoval {
 				return receipt, fmt.Errorf("legacy migration cleanup claim is incomplete")
 			}
 			if !allowLegacyClaim {
 				return receipt, fmt.Errorf("migration cleanup claim has no durable identity")
 			}
-			if err := verifyDatabaseMigrationDigestAt(root, claimRel, receipt.SourceDigest); err != nil {
-				return receipt, err
+			if !partialLegacyRemoval {
+				if err := verifyDatabaseMigrationDigestAt(root, claimRel, receipt.SourceDigest); err != nil {
+					return receipt, err
+				}
 			}
 			if err := writeDatabaseMigrationClaim(root, claimRel, receipt.CleanupToken); err != nil {
 				return receipt, err
@@ -4732,7 +4755,14 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if sourceExists {
 				return fmt.Errorf("migration source reappeared during cleanup")
 			}
-			emptyRel := cleanupRel + ".empty-" + receipt.CleanupToken
+			emptyPath := filepath.Join(townRoot, ".runtime", "dolt-database-migrations", "empty", canonicalDatabaseName(receipt.RigName)+"-"+receipt.CleanupToken)
+			if err := ensurePrivateDatabaseCleanupDirectory(filepath.Dir(emptyPath)); err != nil {
+				return err
+			}
+			emptyRel, err := databaseMigrationRootRelativePath(townRoot, emptyPath)
+			if err != nil {
+				return err
+			}
 			if err := validateDatabaseMigrationPathCustody(root, emptyRel); err != nil {
 				return err
 			}
@@ -5024,18 +5054,38 @@ func removeEmptyDatabaseMigrationQuarantine(root *os.Root, emptyRel string) erro
 	if err != nil {
 		return err
 	}
+	emptyInfo, err := emptyRoot.Stat(".")
+	if err != nil {
+		_ = emptyRoot.Close()
+		return err
+	}
+	currentInfo, err := root.Stat(emptyRel)
+	if err != nil || !os.SameFile(emptyInfo, currentInfo) {
+		_ = emptyRoot.Close()
+		return fmt.Errorf("migration empty quarantine identity changed")
+	}
+	entries, err := fs.ReadDir(emptyRoot.FS(), ".")
+	if err != nil {
+		_ = emptyRoot.Close()
+		return err
+	}
+	if len(entries) != 0 {
+		_ = emptyRoot.Close()
+		return fmt.Errorf("migration empty quarantine contains unclaimed data")
+	}
+	if err := root.Remove(emptyRel); err != nil {
+		_ = emptyRoot.Close()
+		return fmt.Errorf("removing empty migration cleanup quarantine: %w", err)
+	}
 	entries, readErr := fs.ReadDir(emptyRoot.FS(), ".")
 	closeErr := emptyRoot.Close()
 	if err := errors.Join(readErr, closeErr); err != nil {
 		return err
 	}
 	if len(entries) != 0 {
-		return fmt.Errorf("migration empty quarantine contains unclaimed data")
+		return fmt.Errorf("removed migration quarantine identity gained data")
 	}
-	if err := root.Remove(emptyRel); err != nil {
-		return fmt.Errorf("removing empty migration cleanup quarantine: %w", err)
-	}
-	return nil
+	return syncDatabaseMigrationDirectory(root, filepath.Dir(emptyRel))
 }
 
 func verifyDatabaseMigrationDigestAt(root *os.Root, rel, want string) error {
@@ -5713,11 +5763,15 @@ func collectReferencedDatabases(townRoot string) (map[string]bool, error) {
 				continue
 			}
 			var route struct {
-				Prefix string `json:"prefix"`
-				Path   string `json:"path"`
+				Prefix      string `json:"prefix"`
+				Path        string `json:"path"`
+				PendingPath string `json:"_gt_pending_path"`
 			}
 			if err := json.Unmarshal([]byte(line), &route); err != nil {
 				return nil, fmt.Errorf("parsing route ownership registry %s:%d: %w", routesPath, lineNumber+1, err)
+			}
+			if route.Path == "" && route.PendingPath != "" {
+				continue
 			}
 			cleanPath := filepath.Clean(route.Path)
 			if route.Path == "" || filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
@@ -5811,8 +5865,9 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 				continue
 			}
 			var route struct {
-				Prefix string `json:"prefix"`
-				Path   string `json:"path"`
+				Prefix      string `json:"prefix"`
+				Path        string `json:"path"`
+				PendingPath string `json:"_gt_pending_path"`
 			}
 			if json.Unmarshal([]byte(line), &route) != nil || route.Path == "" {
 				continue
@@ -5913,6 +5968,19 @@ func WithDatabaseOwnershipTransaction(townRoot string, operation func() error) e
 // If the Dolt server is running, it will DROP the database first.
 // If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
 func RemoveDatabase(townRoot, dbName string, force bool) error {
+	return removeDatabase(townRoot, dbName, force, "")
+}
+
+// RemoveDatabaseIfRootIncarnation removes dbName only when it is still the
+// database created by the owning operation.
+func RemoveDatabaseIfRootIncarnation(townRoot, dbName, rootIdentity string, force bool) error {
+	if rootIdentity == "" {
+		return fmt.Errorf("database root identity is required")
+	}
+	return removeDatabase(townRoot, dbName, force, rootIdentity)
+}
+
+func removeDatabase(townRoot, dbName string, force bool, rootIdentity string) error {
 	if _, err := DatabasePath(townRoot, dbName); err != nil {
 		return err
 	}
@@ -5943,11 +6011,11 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 			return fmt.Errorf("tightening database cleanup lock for %q: %w", dbName, err)
 		}
 
-		return removeDatabaseLocked(townRoot, dbName, force)
+		return removeDatabaseLocked(townRoot, dbName, force, rootIdentity)
 	})
 }
 
-func removeDatabaseLocked(townRoot, dbName string, force bool) error {
+func removeDatabaseLocked(townRoot, dbName string, force bool, rootIdentity string) error {
 	config := DefaultConfig(townRoot)
 	dbPath := filepath.Join(config.DataDir, dbName)
 	receiptPath := databaseCleanupReceiptPath(townRoot, dbName)
@@ -5958,6 +6026,9 @@ func removeDatabaseLocked(townRoot, dbName string, force bool) error {
 		}
 		if receipt.Force && !force {
 			return fmt.Errorf("database %q has a pending forced cleanup — rerun with --force", dbName)
+		}
+		if rootIdentity != "" && databaseCleanupRootIdentity(receipt.Incarnation) != rootIdentity {
+			return fmt.Errorf("database %q no longer matches owning root incarnation", dbName)
 		}
 		running, _, runningErr := IsRunning(townRoot)
 		if runningErr != nil {
@@ -6034,6 +6105,9 @@ func removeDatabaseLocked(townRoot, dbName string, force bool) error {
 		if err != nil {
 			return fmt.Errorf("identifying database %q before cleanup: %w", dbName, err)
 		}
+		if rootIdentity != "" && databaseCleanupRootIdentity(incarnation) != rootIdentity {
+			return fmt.Errorf("database %q no longer matches owning root incarnation", dbName)
+		}
 		receipt = databaseCleanupReceipt{
 			Version: databaseCleanupReceiptVersion, Database: dbName, Force: force,
 			Phase: databaseCleanupPrepared, Incarnation: incarnation,
@@ -6047,6 +6121,9 @@ func removeDatabaseLocked(townRoot, dbName string, force bool) error {
 	incarnation, err := databaseCleanupIncarnation(townRoot, dbName, dbPath, false)
 	if err != nil {
 		return fmt.Errorf("identifying offline database %q before cleanup: %w", dbName, err)
+	}
+	if rootIdentity != "" && databaseCleanupRootIdentity(incarnation) != rootIdentity {
+		return fmt.Errorf("database %q no longer matches owning root incarnation", dbName)
 	}
 	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, incarnation, false); err != nil {
 		return err
@@ -6370,6 +6447,11 @@ func databaseCleanupIncarnation(townRoot, dbName, dbPath string, targetLive bool
 	}
 	state := sha256.Sum256(manifest)
 	return fmt.Sprintf("%s/manifest-sha256:%x", rootIdentity, state[:]), nil
+}
+
+func databaseCleanupRootIdentity(incarnation string) string {
+	root, _, _ := strings.Cut(incarnation, "/")
+	return root
 }
 
 func databaseCleanupClaimPath(townRoot, dbName, incarnation string) string {
