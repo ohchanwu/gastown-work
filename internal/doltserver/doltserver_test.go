@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -1856,6 +1855,7 @@ func TestMigrateRigFromBeadsResumesPreparedReceiptAfterRename(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		Phase:        databaseMigrationPrepared,
 	}
 	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), receipt); err != nil {
@@ -1897,6 +1897,7 @@ func TestMigrateRigFromBeadsResumesStagedCopy(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    stagePath,
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		Phase:        databaseMigrationStaged,
 	}
 	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), receipt); err != nil {
@@ -1926,16 +1927,16 @@ func TestMigrateRigFromBeadsCrossFilesystemStagesBeforePromotion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	previousRename := databaseMigrationRename
-	databaseMigrationRename = func(_ *os.Root, _, _ string) error { return syscall.EXDEV }
-	t.Cleanup(func() { databaseMigrationRename = previousRename })
-
 	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
 		t.Fatalf("cross-filesystem migration: %v", err)
 	}
 	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
 	if got, err := databaseMigrationTreeDigest(targetPath); err != nil || got != digest {
 		t.Fatalf("target digest = %q, err = %v; want %q", got, err, digest)
+	}
+	claim, err := os.Lstat(filepath.Join(targetPath, databaseMigrationCleanupClaimName))
+	if err != nil || !claim.Mode().IsRegular() || claim.Mode().Perm() != 0o600 {
+		t.Fatalf("durable target claim mode = %v, err = %v; want private regular file", claim, err)
 	}
 	if _, err := os.Stat(sourcePath); !os.IsNotExist(err) {
 		t.Fatalf("verified source remains after migration: %v", err)
@@ -1970,6 +1971,7 @@ func TestMigrateRigFromBeadsReplacesReceiptOwnedPartialCopy(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    stagePath,
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		Phase:        databaseMigrationPrepared,
 	}
 	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), receipt); err != nil {
@@ -1981,6 +1983,89 @@ func TestMigrateRigFromBeadsReplacesReceiptOwnedPartialCopy(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(targetPath, "partial")); !os.IsNotExist(err) {
 		t.Fatalf("partial copy survived recovery: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsPreservesUnclaimedPartialTarget(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "unclaimed-partial"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	if err := os.MkdirAll(targetPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	partialPath := filepath.Join(targetPath, "foreign")
+	if err := os.WriteFile(partialPath, []byte("preserve"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		TargetToken:  strings.Repeat("c", 64),
+		Phase:        databaseMigrationPrepared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if err == nil || !strings.Contains(err.Error(), "target claim") {
+		t.Fatalf("resume migration error = %v, want unclaimed-target refusal", err)
+	}
+	if got, err := os.ReadFile(partialPath); err != nil || string(got) != "preserve" {
+		t.Fatalf("unclaimed partial target changed: data = %q, err = %v", got, err)
+	}
+}
+
+func TestMigrateRigFromBeadsPreservesMismatchedPartialTargetClaim(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "mismatched-partial"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	if err := os.MkdirAll(targetPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	partialPath := filepath.Join(targetPath, "foreign")
+	if err := os.WriteFile(partialPath, []byte("preserve"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetPath, databaseMigrationCleanupClaimName), []byte(strings.Repeat("d", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		TargetToken:  strings.Repeat("c", 64),
+		Phase:        databaseMigrationPrepared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if err == nil || !strings.Contains(err.Error(), "token mismatch") {
+		t.Fatalf("resume migration error = %v, want mismatched-target refusal", err)
+	}
+	if got, err := os.ReadFile(partialPath); err != nil || string(got) != "preserve" {
+		t.Fatalf("mismatched partial target changed: data = %q, err = %v", got, err)
 	}
 }
 
@@ -2016,6 +2101,7 @@ func TestMigrateRigFromBeadsRestartsPartialStagePromotion(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    stagePath,
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		Phase:        databaseMigrationStaged,
 	}); err != nil {
 		t.Fatal(err)
@@ -2057,6 +2143,7 @@ func TestMigrateRigFromBeadsPreservesIncompleteCleanupClaim(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		Phase:        databaseMigrationTargetReady,
 	}); err != nil {
 		t.Fatal(err)
@@ -2097,6 +2184,7 @@ func TestMigrateRigFromBeadsFinishesVerifiedClaimedSourceCleanup(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		CleanupToken: token,
 		Phase:        databaseMigrationCleanupReady,
 	}); err != nil {
@@ -2130,6 +2218,7 @@ func TestMigrateRigFromBeadsPreservesAbsentCleanupClaim(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		CleanupToken: strings.Repeat("a", 64),
 		Phase:        databaseMigrationCleanupReady,
 	}); err != nil {
@@ -2164,6 +2253,7 @@ func TestMigrateRigFromBeadsPreservesIdentityFreeCleanupClaim(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		CleanupToken: strings.Repeat("a", 64),
 		Phase:        databaseMigrationCleanupReady,
 	}); err != nil {
@@ -2201,6 +2291,7 @@ func TestMigrateRigFromBeadsPreservesMismatchedCleanupClaim(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		CleanupToken: strings.Repeat("a", 64),
 		Phase:        databaseMigrationCleanupReady,
 	}); err != nil {
@@ -2239,6 +2330,7 @@ func TestMigrateRigFromBeadsPreservesClaimWhenTargetChangesBeforeRemoval(t *test
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		CleanupToken: token,
 		Phase:        databaseMigrationCleanupRemoving,
 	}); err != nil {
@@ -2279,6 +2371,7 @@ func TestMigrateRigFromBeadsRejectsSymlinkedSourceAncestorOnResume(t *testing.T)
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		Phase:        databaseMigrationTargetReady,
 	}); err != nil {
 		t.Fatal(err)
@@ -2328,6 +2421,7 @@ func TestMigrateRigFromBeadsRejectsSymlinkedTargetAncestorOnResume(t *testing.T)
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		CleanupToken: token,
 		Phase:        databaseMigrationCleanupRemoving,
 	}); err != nil {
@@ -2383,6 +2477,7 @@ func TestMigrateRigFromBeadsKeepsSourceWhenTargetDigestDiffers(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		Phase:        databaseMigrationTargetReady,
 	}); err != nil {
 		t.Fatal(err)
@@ -2418,6 +2513,7 @@ func TestPendingMigrationReceiptIsDiscoverableAndProtectsTarget(t *testing.T) {
 		TargetPath:   targetPath,
 		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
 		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
 		Phase:        databaseMigrationPrepared,
 	}); err != nil {
 		t.Fatal(err)
@@ -5672,6 +5768,15 @@ func setupDoltDB(t *testing.T, dataDir, dbName string) string {
 		t.Fatalf("writing manifest for %s: %v", dbName, err)
 	}
 	return dbPath
+}
+
+func setupDatabaseMigrationTargetClaim(t *testing.T, targetPath string) string {
+	t.Helper()
+	token := strings.Repeat("c", 64)
+	if err := os.WriteFile(filepath.Join(targetPath, databaseMigrationCleanupClaimName), []byte(token+"\n"), 0o600); err != nil {
+		t.Fatalf("writing migration target claim: %v", err)
+	}
+	return token
 }
 
 // setupRigsJSON creates a rigs.json with the given rig names.
