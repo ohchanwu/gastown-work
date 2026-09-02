@@ -3699,6 +3699,8 @@ type databaseMigrationReceipt struct {
 	Phase        databaseMigrationPhase `json:"phase"`
 }
 
+var databaseMigrationBeforeTargetMutation = func() {}
+
 func databaseMigrationReceiptPath(townRoot, rigName string) string {
 	return filepath.Join(townRoot, ".runtime", "dolt-database-migrations", canonicalDatabaseName(rigName)+".json")
 }
@@ -4225,7 +4227,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 		if err != nil {
 			return err
 		}
-		targetExists, targetComplete, err := databaseMigrationRootPathState(root, targetRel)
+		_, targetComplete, err := databaseMigrationRootPathState(root, targetRel)
 		if err != nil {
 			return err
 		}
@@ -4236,7 +4238,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 				if sourceComplete {
 					return fmt.Errorf("ambiguous prepared migration: source and target both contain Dolt databases")
 				}
-				if err := removeEmptyDatabaseMigrationStage(root, stageRel); err != nil {
+				if err := removeEmptyDatabaseMigrationStage(root, targetRel, receipt.TargetToken); err != nil {
 					return err
 				}
 				if err := verifyDatabaseMigrationClaim(root, targetRel, receipt.SourceDigest, receipt.TargetToken); err != nil {
@@ -4254,21 +4256,10 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if err := verifyDatabaseMigrationDigestAt(root, sourceRel, receipt.SourceDigest); err != nil {
 				return err
 			}
-			if targetExists {
-				if err := verifyDatabaseMigrationClaimToken(root, targetRel, receipt.TargetToken); err != nil {
-					return fmt.Errorf("verifying migration target claim: %w", err)
-				}
-				if err := root.RemoveAll(targetRel); err != nil {
-					return fmt.Errorf("removing receipt-owned partial migration target: %w", err)
-				}
-				if err := syncDatabaseMigrationDirectory(root, filepath.Dir(targetRel)); err != nil {
-					return err
-				}
-			}
 			if err := ensureDatabaseMigrationTargetClaim(root, targetRel, receipt.TargetToken); err != nil {
 				return err
 			}
-			if err := copyDatabaseMigrationToStage(root, sourceRel, targetRel, stageRel, receipt.SourceDigest); err != nil {
+			if err := copyDatabaseMigrationToStage(root, sourceRel, targetRel, receipt.SourceDigest, receipt.TargetToken); err != nil {
 				return err
 			}
 			receipt.Phase = databaseMigrationStaged
@@ -4278,7 +4269,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 
 		case databaseMigrationStaged:
 			if targetComplete {
-				if err := removeEmptyDatabaseMigrationStage(root, stageRel); err != nil {
+				if err := removeEmptyDatabaseMigrationStage(root, targetRel, receipt.TargetToken); err != nil {
 					return err
 				}
 				if err := verifyDatabaseMigrationClaim(root, targetRel, receipt.SourceDigest, receipt.TargetToken); err != nil {
@@ -4298,40 +4289,26 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 				if !sourceComplete {
 					return fmt.Errorf("staged migration has neither a complete stage nor source")
 				}
-				if targetExists {
-					if err := verifyDatabaseMigrationClaimToken(root, targetRel, receipt.TargetToken); err != nil {
-						return fmt.Errorf("verifying migration target claim: %w", err)
-					}
-					if err := root.RemoveAll(targetRel); err != nil {
-						return err
-					}
-				}
 				receipt.Phase = databaseMigrationPrepared
 				if err := writeDatabaseMigrationReceipt(receiptPath, receipt); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := verifyDatabaseMigrationDigestAt(root, stageRel, receipt.SourceDigest); err != nil {
+			if err := verifyDatabaseMigrationStage(root, targetRel, receipt.SourceDigest, receipt.TargetToken); err != nil {
 				if !sourceComplete {
 					return err
 				}
 				if sourceErr := verifyDatabaseMigrationDigestAt(root, sourceRel, receipt.SourceDigest); sourceErr != nil {
 					return errors.Join(err, sourceErr)
 				}
-				if err := verifyDatabaseMigrationClaimToken(root, targetRel, receipt.TargetToken); err != nil {
-					return fmt.Errorf("verifying migration target claim: %w", err)
-				}
-				if err := root.RemoveAll(targetRel); err != nil {
-					return err
-				}
 				receipt.Phase = databaseMigrationPrepared
 				if err := writeDatabaseMigrationReceipt(receiptPath, receipt); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := promoteDatabaseMigrationStage(root, targetRel, stageRel); err != nil {
+			if err := promoteDatabaseMigrationStage(root, targetRel, receipt.SourceDigest, receipt.TargetToken); err != nil {
 				return err
 			}
 			if err := verifyDatabaseMigrationClaim(root, targetRel, receipt.SourceDigest, receipt.TargetToken); err != nil {
@@ -4346,7 +4323,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if !targetComplete {
 				return fmt.Errorf("target-ready migration target is missing or incomplete")
 			}
-			if err := removeEmptyDatabaseMigrationStage(root, stageRel); err != nil {
+			if err := removeEmptyDatabaseMigrationStage(root, targetRel, receipt.TargetToken); err != nil {
 				return err
 			}
 			if err := verifyDatabaseMigrationClaim(root, targetRel, receipt.SourceDigest, receipt.TargetToken); err != nil {
@@ -4533,25 +4510,48 @@ func verifyDatabaseMigrationDigestAt(root *os.Root, rel, want string) error {
 }
 
 func withVerifiedDatabaseMigrationRoot(root *os.Root, rel, want, token string, operation func() error) error {
+	return withDatabaseMigrationTargetRoot(root, rel, want, token, func(_ *os.Root) error {
+		return operation()
+	})
+}
+
+func withClaimedDatabaseMigrationRoot(root *os.Root, rel, token string, operation func(*os.Root) error) error {
+	return withDatabaseMigrationTargetRoot(root, rel, "", token, operation)
+}
+
+func withDatabaseMigrationTargetRoot(root *os.Root, rel, want, token string, operation func(*os.Root) error) (result error) {
 	databaseRoot, err := root.OpenRoot(rel)
 	if err != nil {
 		return err
 	}
-	if err := verifyDatabaseMigrationClaimAt(databaseRoot, want, token); err != nil {
-		_ = databaseRoot.Close()
+	defer func() { result = errors.Join(result, databaseRoot.Close()) }()
+	if want == "" {
+		err = verifyDatabaseMigrationClaimTokenAt(databaseRoot, token)
+	} else {
+		err = verifyDatabaseMigrationClaimAt(databaseRoot, want, token)
+	}
+	if err != nil {
 		return fmt.Errorf("verifying migration target claim: %w", err)
 	}
 	openedInfo, err := databaseRoot.Stat(".")
 	if err != nil {
-		_ = databaseRoot.Close()
 		return err
 	}
+	databaseMigrationBeforeTargetMutation()
+	if err := verifyDatabaseMigrationTargetIdentity(root, rel, openedInfo); err != nil {
+		return err
+	}
+	operationErr := operation(databaseRoot)
+	identityErr := verifyDatabaseMigrationTargetIdentity(root, rel, openedInfo)
+	return errors.Join(operationErr, identityErr)
+}
+
+func verifyDatabaseMigrationTargetIdentity(root *os.Root, rel string, openedInfo fs.FileInfo) error {
 	currentInfo, err := root.Stat(rel)
 	if err != nil || !os.SameFile(openedInfo, currentInfo) {
-		_ = databaseRoot.Close()
 		return fmt.Errorf("migration target identity changed")
 	}
-	return errors.Join(operation(), databaseRoot.Close())
+	return nil
 }
 
 func newDatabaseMigrationCleanupToken() (string, error) {
@@ -4665,6 +4665,17 @@ func ensureDatabaseMigrationTargetClaim(root *os.Root, targetRel, token string) 
 			return err
 		}
 	}
+	databaseMigrationBeforeTargetMutation()
+	targetExists, _, err = databaseMigrationRootPathState(root, targetRel)
+	if err != nil {
+		return err
+	}
+	if targetExists {
+		if err := verifyDatabaseMigrationClaimToken(root, targetRel, token); err != nil {
+			return fmt.Errorf("verifying migration target claim: %w", err)
+		}
+		return nil
+	}
 	if err := root.Rename(claimRel, targetRel); err != nil {
 		return fmt.Errorf("publishing migration target claim: %w", err)
 	}
@@ -4677,7 +4688,7 @@ func ensureDatabaseMigrationTargetClaim(root *os.Root, targetRel, token string) 
 	return nil
 }
 
-func copyDatabaseMigrationToStage(root *os.Root, sourceRel, targetRel, stageRel, digest string) error {
+func copyDatabaseMigrationToStage(root *os.Root, sourceRel, targetRel, digest, token string) error {
 	sourceRoot, err := root.OpenRoot(sourceRel)
 	if err != nil {
 		return err
@@ -4687,58 +4698,80 @@ func copyDatabaseMigrationToStage(root *os.Root, sourceRel, targetRel, stageRel,
 	if err != nil {
 		return err
 	}
-	if err := root.Mkdir(stageRel, sourceInfo.Mode().Perm()); err != nil {
-		return err
-	}
-	stageRoot, err := root.OpenRoot(stageRel)
-	if err != nil {
-		return err
-	}
-	defer stageRoot.Close()
-	err = fs.WalkDir(sourceRoot.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == "." {
-			return nil
-		}
-		info, err := entry.Info()
+	return withClaimedDatabaseMigrationRoot(root, targetRel, token, func(targetRoot *os.Root) error {
+		entries, err := fs.ReadDir(targetRoot.FS(), ".")
 		if err != nil {
 			return err
 		}
-		name := filepath.FromSlash(path)
-		switch {
-		case info.IsDir():
-			return stageRoot.Mkdir(name, info.Mode().Perm())
-		case info.Mode().IsRegular():
-			source, err := sourceRoot.Open(name)
-			if err != nil {
+		for _, entry := range entries {
+			if entry.Name() == databaseMigrationCleanupClaimName {
+				continue
+			}
+			if err := targetRoot.RemoveAll(entry.Name()); err != nil {
 				return err
 			}
-			target, err := stageRoot.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
-			if err != nil {
-				_ = source.Close()
-				return err
-			}
-			_, copyErr := io.Copy(target, source)
-			return errors.Join(copyErr, target.Sync(), target.Close(), source.Close())
-		case info.Mode()&os.ModeSymlink != 0:
-			target, err := sourceRoot.Readlink(name)
-			if err != nil {
-				return err
-			}
-			return stageRoot.Symlink(target, name)
-		default:
-			return fmt.Errorf("unsupported database migration entry %s", path)
 		}
+		if err := syncDatabaseMigrationDirectory(targetRoot, "."); err != nil {
+			return err
+		}
+		if err := targetRoot.Mkdir(databaseMigrationStageName, sourceInfo.Mode().Perm()); err != nil {
+			return err
+		}
+		stageRoot, err := targetRoot.OpenRoot(databaseMigrationStageName)
+		if err != nil {
+			return err
+		}
+		copyErr := fs.WalkDir(sourceRoot.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if path == "." {
+				return nil
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			name := filepath.FromSlash(path)
+			switch {
+			case info.IsDir():
+				return stageRoot.Mkdir(name, info.Mode().Perm())
+			case info.Mode().IsRegular():
+				source, err := sourceRoot.Open(name)
+				if err != nil {
+					return err
+				}
+				target, err := stageRoot.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+				if err != nil {
+					_ = source.Close()
+					return err
+				}
+				_, copyErr := io.Copy(target, source)
+				return errors.Join(copyErr, target.Sync(), target.Close(), source.Close())
+			case info.Mode()&os.ModeSymlink != 0:
+				target, err := sourceRoot.Readlink(name)
+				if err != nil {
+					return err
+				}
+				return stageRoot.Symlink(target, name)
+			default:
+				return fmt.Errorf("unsupported database migration entry %s", path)
+			}
+		})
+		if copyErr != nil {
+			_ = stageRoot.Close()
+			return fmt.Errorf("copying database to migration stage: %w", copyErr)
+		}
+		got, digestErr := databaseMigrationTreeDigestFromRoot(stageRoot, false)
+		if digestErr == nil && got != digest {
+			digestErr = fmt.Errorf("migrated database digest mismatch at %s", databaseMigrationStageName)
+		}
+		if digestErr != nil {
+			_ = stageRoot.Close()
+			return digestErr
+		}
+		return errors.Join(syncDatabaseMigrationTree(stageRoot), stageRoot.Close())
 	})
-	if err != nil {
-		return fmt.Errorf("copying database to migration stage: %w", err)
-	}
-	if err := verifyDatabaseMigrationDigestAt(root, stageRel, digest); err != nil {
-		return err
-	}
-	return syncDatabaseMigrationTree(stageRoot)
 }
 
 func syncDatabaseMigrationTree(root *os.Root) error {
@@ -4778,48 +4811,84 @@ func syncDatabaseMigrationTree(root *os.Root) error {
 	return nil
 }
 
-func promoteDatabaseMigrationStage(root *os.Root, targetRel, stageRel string) error {
-	stageRoot, err := root.OpenRoot(stageRel)
+func verifyDatabaseMigrationStage(root *os.Root, targetRel, digest, token string) error {
+	targetRoot, err := root.OpenRoot(targetRel)
 	if err != nil {
 		return err
 	}
-	entries, readErr := fs.ReadDir(stageRoot.FS(), ".")
-	closeErr := stageRoot.Close()
-	if err := errors.Join(readErr, closeErr); err != nil {
-		return err
+	defer targetRoot.Close()
+	if err := verifyDatabaseMigrationClaimTokenAt(targetRoot, token); err != nil {
+		return fmt.Errorf("verifying migration target claim: %w", err)
 	}
-	for _, entry := range entries {
-		if entry.Name() == ".dolt" {
-			continue
-		}
-		if entry.Name() == filepath.Base(stageRel) {
-			return fmt.Errorf("database contains reserved migration stage entry %q", entry.Name())
-		}
-		source := filepath.Join(stageRel, entry.Name())
-		target := filepath.Join(targetRel, entry.Name())
-		if err := root.RemoveAll(target); err != nil {
-			return err
-		}
-		if err := root.Rename(source, target); err != nil {
-			return err
-		}
-	}
-	if _, err := root.Lstat(filepath.Join(targetRel, ".dolt")); err == nil {
-		return fmt.Errorf("migration target became complete before stage promotion")
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	if err := root.Rename(filepath.Join(stageRel, ".dolt"), filepath.Join(targetRel, ".dolt")); err != nil {
-		return err
-	}
-	if err := syncDatabaseMigrationDirectory(root, targetRel); err != nil {
-		return err
-	}
-	return removeEmptyDatabaseMigrationStage(root, stageRel)
+	return verifyDatabaseMigrationStageAt(targetRoot, digest)
 }
 
-func removeEmptyDatabaseMigrationStage(root *os.Root, stageRel string) error {
-	stageRoot, err := root.OpenRoot(stageRel)
+func verifyDatabaseMigrationStageAt(targetRoot *os.Root, digest string) error {
+	stageRoot, err := targetRoot.OpenRoot(databaseMigrationStageName)
+	if err != nil {
+		return err
+	}
+	got, digestErr := databaseMigrationTreeDigestFromRoot(stageRoot, false)
+	closeErr := stageRoot.Close()
+	if err := errors.Join(digestErr, closeErr); err != nil {
+		return err
+	}
+	if got != digest {
+		return fmt.Errorf("migration stage digest mismatch")
+	}
+	return nil
+}
+
+func promoteDatabaseMigrationStage(root *os.Root, targetRel, digest, token string) error {
+	return withClaimedDatabaseMigrationRoot(root, targetRel, token, func(targetRoot *os.Root) error {
+		if err := verifyDatabaseMigrationStageAt(targetRoot, digest); err != nil {
+			return err
+		}
+		stageRoot, err := targetRoot.OpenRoot(databaseMigrationStageName)
+		if err != nil {
+			return err
+		}
+		entries, readErr := fs.ReadDir(stageRoot.FS(), ".")
+		closeErr := stageRoot.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.Name() == ".dolt" {
+				continue
+			}
+			if entry.Name() == databaseMigrationStageName {
+				return fmt.Errorf("database contains reserved migration stage entry %q", entry.Name())
+			}
+			source := filepath.Join(databaseMigrationStageName, entry.Name())
+			if err := targetRoot.RemoveAll(entry.Name()); err != nil {
+				return err
+			}
+			if err := targetRoot.Rename(source, entry.Name()); err != nil {
+				return err
+			}
+		}
+		if _, err := targetRoot.Lstat(".dolt"); err == nil {
+			return fmt.Errorf("migration target became complete before stage promotion")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := targetRoot.Rename(filepath.Join(databaseMigrationStageName, ".dolt"), ".dolt"); err != nil {
+			return err
+		}
+		if err := syncDatabaseMigrationDirectory(targetRoot, "."); err != nil {
+			return err
+		}
+		return removeEmptyDatabaseMigrationStageAt(targetRoot)
+	})
+}
+
+func removeEmptyDatabaseMigrationStage(root *os.Root, targetRel, token string) error {
+	return withClaimedDatabaseMigrationRoot(root, targetRel, token, removeEmptyDatabaseMigrationStageAt)
+}
+
+func removeEmptyDatabaseMigrationStageAt(targetRoot *os.Root) error {
+	stageRoot, err := targetRoot.OpenRoot(databaseMigrationStageName)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -4834,10 +4903,10 @@ func removeEmptyDatabaseMigrationStage(root *os.Root, stageRel string) error {
 	if len(entries) != 0 {
 		return fmt.Errorf("database migration stage is not empty")
 	}
-	if err := root.Remove(stageRel); err != nil {
+	if err := targetRoot.Remove(databaseMigrationStageName); err != nil {
 		return err
 	}
-	return syncDatabaseMigrationDirectory(root, filepath.Dir(stageRel))
+	return syncDatabaseMigrationDirectory(targetRoot, ".")
 }
 
 func syncDatabaseMigrationDirectory(root *os.Root, rel string) error {

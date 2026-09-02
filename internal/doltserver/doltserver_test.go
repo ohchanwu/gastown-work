@@ -2115,6 +2115,50 @@ func TestMigrateRigFromBeadsRestartsPartialStagePromotion(t *testing.T) {
 	}
 }
 
+func TestMigrateRigFromBeadsPreservesReplacementAtStagedPromotionBarrier(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "staged-target-swap"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	stagePath := setupDoltDB(t, targetPath, databaseMigrationStageName)
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    stagePath,
+		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
+		Phase:        databaseMigrationStaged,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimedPath, swapErr := swapDatabaseMigrationTargetAtNextMutation(t, targetPath)
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if *swapErr != nil {
+		t.Fatal(*swapErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("resume migration error = %v, want target-identity refusal", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(targetPath, "foreign")); err != nil || string(got) != "preserve" {
+		t.Fatalf("replacement target changed: data = %q, err = %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(claimedPath, databaseMigrationStageName, ".dolt")); err != nil {
+		t.Fatalf("claimed stage changed before promotion: %v", err)
+	}
+}
+
 func TestMigrateRigFromBeadsPreservesIncompleteCleanupClaim(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
@@ -2346,6 +2390,93 @@ func TestMigrateRigFromBeadsPreservesClaimWhenTargetChangesBeforeRemoval(t *test
 	}
 	if _, err := os.Stat(filepath.Join(cleanupPath, ".dolt")); err != nil {
 		t.Fatalf("cleanup claim was removed after target changed: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsPreservesClaimAtTargetRemovalBarrier(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "removal-target-swap"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	cleanupPath := setupDoltDB(t, filepath.Dir(sourcePath), filepath.Base(sourcePath)+".migration-cleanup")
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupToken := strings.Repeat("a", 64)
+	if err := os.WriteFile(filepath.Join(cleanupPath, databaseMigrationCleanupClaimName), []byte(cleanupToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		CleanupToken: cleanupToken,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
+		Phase:        databaseMigrationCleanupRemoving,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, swapErr := swapDatabaseMigrationTargetAtNextMutation(t, targetPath)
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if *swapErr != nil {
+		t.Fatal(*swapErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("resume migration error = %v, want target-identity refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(cleanupPath, ".dolt")); err != nil {
+		t.Fatalf("cleanup claim was removed after target replacement: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(targetPath, "foreign")); err != nil || string(got) != "preserve" {
+		t.Fatalf("replacement target changed: data = %q, err = %v", got, err)
+	}
+}
+
+func TestMigrateRigFromBeadsPreservesReceiptAtPublicationBarrier(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "publication-target-swap"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := databaseMigrationReceiptPath(townRoot, rigName)
+	if err := writeDatabaseMigrationReceipt(receiptPath, databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
+		Phase:        databaseMigrationSourceCleaned,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, swapErr := swapDatabaseMigrationTargetAtNextMutation(t, targetPath)
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if *swapErr != nil {
+		t.Fatal(*swapErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("resume migration error = %v, want target-identity refusal", err)
+	}
+	if _, err := os.Stat(receiptPath); err != nil {
+		t.Fatalf("migration receipt was removed after target replacement: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(targetPath, "foreign")); err != nil || string(got) != "preserve" {
+		t.Fatalf("replacement target changed: data = %q, err = %v", got, err)
 	}
 }
 
@@ -5777,6 +5908,29 @@ func setupDatabaseMigrationTargetClaim(t *testing.T, targetPath string) string {
 		t.Fatalf("writing migration target claim: %v", err)
 	}
 	return token
+}
+
+func swapDatabaseMigrationTargetAtNextMutation(t *testing.T, targetPath string) (string, *error) {
+	t.Helper()
+	claimedPath := targetPath + ".claimed"
+	previous := databaseMigrationBeforeTargetMutation
+	var once sync.Once
+	var swapErr error
+	databaseMigrationBeforeTargetMutation = func() {
+		once.Do(func() {
+			if err := os.Rename(targetPath, claimedPath); err != nil {
+				swapErr = err
+				return
+			}
+			if err := os.MkdirAll(targetPath, 0o755); err != nil {
+				swapErr = err
+				return
+			}
+			swapErr = os.WriteFile(filepath.Join(targetPath, "foreign"), []byte("preserve"), 0o644)
+		})
+	}
+	t.Cleanup(func() { databaseMigrationBeforeTargetMutation = previous })
+	return claimedPath, &swapErr
 }
 
 // setupRigsJSON creates a rigs.json with the given rig names.
