@@ -20,6 +20,7 @@ func TestCreateBatchConvoy_CreatesOneConvoyTrackingAllBeads(t *testing.T) {
 	}
 
 	townRoot := t.TempDir()
+	registerCmdTestDoltCustody(t, townRoot)
 
 	// Minimal workspace marker so workspace.FindFromCwd() succeeds.
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
@@ -131,6 +132,7 @@ func TestCreateBatchConvoy_OwnedLabel(t *testing.T) {
 	}
 
 	townRoot := t.TempDir()
+	registerCmdTestDoltCustody(t, townRoot)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -191,6 +193,7 @@ func TestCreateBatchConvoy_MergeStrategyInDescription(t *testing.T) {
 	}
 
 	townRoot := t.TempDir()
+	registerCmdTestDoltCustody(t, townRoot)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -264,6 +267,7 @@ func TestCreateBatchConvoy_TitleIncludesBeadCount(t *testing.T) {
 	}
 
 	townRoot := t.TempDir()
+	registerCmdTestDoltCustody(t, townRoot)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -328,6 +332,7 @@ func TestCreateBatchConvoy_PartialDepFailureContinues(t *testing.T) {
 	}
 
 	townRoot := t.TempDir()
+	registerCmdTestDoltCustody(t, townRoot)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -861,6 +866,7 @@ func setupTownWithBdStub(t *testing.T, bdScript string) (townRoot, logPath strin
 	t.Helper()
 
 	townRoot = canonicalTestTempDir(t)
+	registerCmdTestDoltCustody(t, townRoot)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir mayor/rig: %v", err)
 	}
@@ -1312,6 +1318,7 @@ func TestCreateBatchConvoy_ReturnsTrackedBeadSet(t *testing.T) {
 	}
 
 	townRoot := t.TempDir()
+	registerCmdTestDoltCustody(t, townRoot)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}

@@ -1259,14 +1259,22 @@ const addOwnershipStampFile = ".gt-add-owner"
 const addDatabaseOwnershipFile = ".gt-add-database"
 
 type addDatabaseOwnership struct {
+	Version       int    `json:"version"`
 	Owner         string `json:"owner"`
 	DatabaseToken string `json:"database_token"`
+	LegacyRoot    string `json:"root,omitempty"`
 	RoutePrefix   string `json:"route_prefix"`
 	RoutePath     string `json:"route_path"`
 	RouteToken    string `json:"route_token"`
 }
 
 var removeAddDatabase = doltserver.RemoveDatabaseIfCreationToken
+
+var removeLegacyAddDatabase = doltserver.RemoveDatabaseIfRootIncarnation
+
+var migrateLegacyAddDatabase = doltserver.MigrateLegacyDatabaseCreationRelease
+
+const addDatabaseOwnershipVersion = 2
 
 func newAddOwnershipStamp() (string, error) {
 	var buf [16]byte
@@ -1293,6 +1301,8 @@ func clearAddOwnershipStamp(rigPath string) error {
 }
 
 func writeAddDatabaseOwnership(rigPath string, ownership addDatabaseOwnership) error {
+	ownership.Version = addDatabaseOwnershipVersion
+	ownership.LegacyRoot = ""
 	data, err := json.Marshal(ownership)
 	if err != nil {
 		return err
@@ -1309,8 +1319,20 @@ func readAddDatabaseOwnership(rigPath string) (addDatabaseOwnership, error) {
 	if err := json.Unmarshal(data, &ownership); err != nil {
 		return addDatabaseOwnership{}, err
 	}
-	if ownership.Owner == "" || ownership.DatabaseToken == "" || ownership.RoutePrefix == "" || ownership.RoutePath == "" || ownership.RouteToken == "" {
+	if ownership.Owner == "" || ownership.RoutePrefix == "" || ownership.RoutePath == "" || ownership.RouteToken == "" {
 		return addDatabaseOwnership{}, fmt.Errorf("incomplete created database ownership")
+	}
+	switch ownership.Version {
+	case 0:
+		if (ownership.DatabaseToken == "") == (ownership.LegacyRoot == "") {
+			return addDatabaseOwnership{}, fmt.Errorf("incomplete legacy database ownership")
+		}
+	case addDatabaseOwnershipVersion:
+		if ownership.DatabaseToken == "" || ownership.LegacyRoot != "" {
+			return addDatabaseOwnership{}, fmt.Errorf("incomplete created database ownership")
+		}
+	default:
+		return addDatabaseOwnership{}, fmt.Errorf("unsupported created database ownership version %d", ownership.Version)
 	}
 	return ownership, nil
 }
@@ -1361,6 +1383,20 @@ func migrateAndValidateAddRegistration(townRoot, name string, route beads.Route,
 		databaseOwnership.RoutePath != route.Path ||
 		databaseOwnership.RouteToken != entry.RegistrationToken {
 		return fmt.Errorf("pending add ownership changed for %q", name)
+	}
+	if databaseOwnership.LegacyRoot != "" {
+		if err := migrateLegacyAddDatabase(townRoot, name, databaseOwnership.Owner, databaseOwnership.LegacyRoot); err != nil {
+			return fmt.Errorf("migrating legacy database ownership for %q: %w", name, err)
+		}
+		databaseOwnership.DatabaseToken = databaseOwnership.Owner
+		databaseOwnership.LegacyRoot = ""
+		if err := writeAddDatabaseOwnership(rigPath, databaseOwnership); err != nil {
+			return fmt.Errorf("persisting migrated database ownership for %q: %w", name, err)
+		}
+	} else if databaseOwnership.Version != addDatabaseOwnershipVersion {
+		if err := writeAddDatabaseOwnership(rigPath, databaseOwnership); err != nil {
+			return fmt.Errorf("versioning database ownership for %q: %w", name, err)
+		}
 	}
 	if entry.RegistrationDatabaseToken == "" {
 		entry.RegistrationDatabaseToken = databaseOwnership.DatabaseToken
@@ -1436,11 +1472,21 @@ func recoverInterruptedAdd(townRoot, name string) (bool, error) {
 			return false, fmt.Errorf("releasing interrupted route reservation: %w", err)
 		}
 		if doltserver.DatabaseExists(townRoot, name) {
-			if err := doltserver.RecoverDatabaseCreationToken(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
-				return false, fmt.Errorf("recovering interrupted database creation custody: %w", err)
+			if databaseOwnership.LegacyRoot != "" {
+				if err := removeLegacyAddDatabase(townRoot, name, databaseOwnership.LegacyRoot, true); err != nil {
+					return false, fmt.Errorf("removing exact legacy interrupted rig database: %w", err)
+				}
+			} else {
+				if err := doltserver.RecoverDatabaseCreationToken(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
+					return false, fmt.Errorf("recovering interrupted database creation custody: %w", err)
+				}
+				if err := removeAddDatabase(townRoot, name, databaseOwnership.DatabaseToken, true); err != nil {
+					return false, fmt.Errorf("removing exact interrupted rig database: %w", err)
+				}
 			}
-			if err := removeAddDatabase(townRoot, name, databaseOwnership.DatabaseToken, true); err != nil {
-				return false, fmt.Errorf("removing exact interrupted rig database: %w", err)
+		} else if databaseOwnership.DatabaseToken != "" {
+			if err := doltserver.CancelDatabaseCreationIntentIfAbsent(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
+				return false, fmt.Errorf("canceling absent database creation intent: %w", err)
 			}
 		}
 		if err := clearAddDatabaseOwnership(rigPath); err != nil && !os.IsNotExist(err) {

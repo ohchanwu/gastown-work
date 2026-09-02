@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -16,12 +17,20 @@ func TestNewListenerPIDsProvesPackageExitBaseline(t *testing.T) {
 	}
 }
 
-func TestCleanupStagedConvoyCustodyPropagatesForcedFailure(t *testing.T) {
+func TestCleanupCmdTestDoltRootsAttemptsEveryRegisteredRoot(t *testing.T) {
 	forced := errors.New("forced cleanup failure")
-	err := cleanupStagedConvoyDoltCustody("/test/town", nil, func(string, []doltserver.DoltListener) error {
-		return forced
+	var got []string
+	err := cleanupCmdTestDoltRoots([]string{"/test/a", "/test/b"}, func(root string) (int, error) {
+		got = append(got, root)
+		if root == "/test/a" {
+			return 0, forced
+		}
+		return 1, nil
 	})
 	if !errors.Is(err, forced) {
 		t.Fatalf("cleanup error = %v, want forced failure", err)
+	}
+	if !slices.Equal(got, []string{"/test/a", "/test/b"}) {
+		t.Fatalf("cleaned roots = %v", got)
 	}
 }

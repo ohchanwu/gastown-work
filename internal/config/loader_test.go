@@ -75,6 +75,46 @@ func TestLoadRigsConfigHidesPendingRegistrations(t *testing.T) {
 	}
 }
 
+func TestSaveRigsConfigUpgradesTransactionalRegistryVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mayor", "rigs.json")
+	cfg := &RigsConfig{Version: 1, Rigs: map[string]RigEntry{
+		"pending": {RegistrationPending: true, RegistrationToken: "token"},
+	}}
+	if err := SaveRigsConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Version != CurrentRigsVersion || stored.Version <= 1 {
+		t.Fatalf("stored rigs version = %d, want fail-closed transactional version %d", stored.Version, CurrentRigsVersion)
+	}
+}
+
+func TestLoadRigsConfigAcceptsLegacyVersionOne(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mayor", "rigs.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"rigs":{"legacy":{"git_url":"legacy"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadRigsConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Rigs["legacy"].GitURL != "legacy" {
+		t.Fatalf("legacy registry was not loaded: %#v", cfg.Rigs)
+	}
+}
+
 func TestUpdateRigsConfigSerializesReadModifyWrite(t *testing.T) {
 	townRoot := t.TempDir()
 	path := filepath.Join(townRoot, "mayor", "rigs.json")

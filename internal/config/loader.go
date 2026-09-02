@@ -176,12 +176,14 @@ func saveRigsConfig(path string, config *RigsConfig) error {
 	if err := validateRigsConfig(config); err != nil {
 		return err
 	}
+	stored := *config
+	stored.Version = CurrentRigsVersion
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
-	data, err := json.MarshalIndent(config, "", "  ")
+	data, err := json.MarshalIndent(&stored, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding config: %w", err)
 	}

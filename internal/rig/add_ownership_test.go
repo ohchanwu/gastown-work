@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 func TestRecoverInterruptedAddRemovesExactCreatedDatabase(t *testing.T) {
@@ -77,6 +80,140 @@ func TestRecoverInterruptedAddPreservesPathWhenDatabaseIdentityChanged(t *testin
 	}
 	if _, err := os.Stat(filepath.Join(rigPath, addOwnershipStampFile)); err != nil {
 		t.Fatalf("recovery evidence was not preserved: %v", err)
+	}
+}
+
+func TestRecoverInterruptedAddRetiresExactAbsentDatabaseIntent(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "never_created"
+	token := "database-token"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{
+		Owner: "owner-token", DatabaseToken: token,
+		RoutePrefix: "nc-", RoutePath: rigName, RouteToken: "route-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intentDir := filepath.Join(townRoot, ".runtime", "dolt-database-creations")
+	if err := os.MkdirAll(intentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Use a stable positive timestamp rather than coupling this recovery test to
+	// the creation-intent encoder.
+	intent := `{"version":2,"database":"` + rigName + `","token":"` + token + `","prepared_unix_nano":1,"generation":"cc5dfabe424c2f72e6bf7e7c6f13fbd3"}`
+	intentPath := filepath.Join(intentDir, rigName+".json")
+	if err := os.WriteFile(intentPath, []byte(intent+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := recoverInterruptedAdd(townRoot, rigName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered {
+		t.Fatal("absent database add was not recovered")
+	}
+	if _, err := os.Stat(intentPath); !os.IsNotExist(err) {
+		t.Fatalf("stale database creation intent remains: %v", err)
+	}
+}
+
+func TestReadAddDatabaseOwnershipAcceptsEcfRootShape(t *testing.T) {
+	rigPath := t.TempDir()
+	legacy := `{"owner":"owner-token","root":"dolt-root:legacy","route_prefix":"lg-","route_path":"legacy","route_token":"route-token"}`
+	if err := os.WriteFile(filepath.Join(rigPath, addDatabaseOwnershipFile), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := readAddDatabaseOwnership(rigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownership.LegacyRoot != "dolt-root:legacy" || ownership.DatabaseToken != "" {
+		t.Fatalf("legacy ownership decoded as %#v", ownership)
+	}
+}
+
+func TestRecoverInterruptedAddUsesLegacyRootProof(t *testing.T) {
+	townRoot := t.TempDir()
+	rigName := "legacy"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"owner":"owner-token","root":"dolt-root:legacy","route_prefix":"lg-","route_path":"legacy","route_token":"route-token"}`
+	if err := os.WriteFile(filepath.Join(rigPath, addDatabaseOwnershipFile), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", rigName, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := removeLegacyAddDatabase
+	t.Cleanup(func() { removeLegacyAddDatabase = previous })
+	called := false
+	removeLegacyAddDatabase = func(gotTown, gotName, gotRoot string, force bool) error {
+		called = true
+		if gotTown != townRoot || gotName != rigName || gotRoot != "dolt-root:legacy" || !force {
+			t.Fatalf("legacy cleanup args = %q, %q, %q, %v", gotTown, gotName, gotRoot, force)
+		}
+		return nil
+	}
+	recovered, err := recoverInterruptedAdd(townRoot, rigName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered || !called {
+		t.Fatalf("recovered=%v legacy cleanup called=%v", recovered, called)
+	}
+}
+
+func TestMigrateAndValidateAddRegistrationVersionsLegacyMarker(t *testing.T) {
+	townRoot := t.TempDir()
+	rigName := "legacy_pending"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"owner":"owner-token","root":"dolt-root:legacy","route_prefix":"lp-","route_path":"legacy_pending","route_token":"route-token"}`
+	if err := os.WriteFile(filepath.Join(rigPath, addDatabaseOwnershipFile), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := migrateLegacyAddDatabase
+	t.Cleanup(func() { migrateLegacyAddDatabase = previous })
+	migrateLegacyAddDatabase = func(gotTown, gotName, gotToken, gotRoot string) error {
+		if gotTown != townRoot || gotName != rigName || gotToken != "owner-token" || gotRoot != "dolt-root:legacy" {
+			t.Fatalf("legacy migration args = %q, %q, %q, %q", gotTown, gotName, gotToken, gotRoot)
+		}
+		return nil
+	}
+	entry := config.RigEntry{
+		RegistrationToken: "route-token", RegistrationPending: true,
+		RegistrationPathToken: "owner-token",
+	}
+	if err := migrateAndValidateAddRegistration(townRoot, rigName, beads.Route{Prefix: "lp-", Path: rigName}, false, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.RegistrationDatabaseToken != "owner-token" || entry.RegistrationDatabase != rigName {
+		t.Fatalf("migrated entry = %#v", entry)
+	}
+	ownership, err := readAddDatabaseOwnership(rigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownership.Version != addDatabaseOwnershipVersion || ownership.DatabaseToken != "owner-token" || ownership.LegacyRoot != "" {
+		t.Fatalf("migrated marker = %#v", ownership)
 	}
 }
 

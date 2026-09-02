@@ -651,7 +651,8 @@ type BeadsConfig struct {
 const CurrentTownVersion = 2
 
 // CurrentRigsVersion is the current schema version for RigsConfig.
-const CurrentRigsVersion = 1
+// Version 2 makes transactional registration fields fail closed for v1 readers.
+const CurrentRigsVersion = 2
 
 // CurrentRigConfigVersion is the current schema version for RigConfig.
 const CurrentRigConfigVersion = 1

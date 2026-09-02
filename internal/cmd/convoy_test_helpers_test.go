@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,11 +10,13 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -77,18 +80,42 @@ func newListenerPIDs(baseline, after []doltserver.DoltListener) []int {
 	return pids
 }
 
-func cleanupStagedConvoyDoltCustody(townRoot string, baseline []doltserver.DoltListener, cleanup func(string, []doltserver.DoltListener) error) error {
-	return cleanup(townRoot, baseline)
+func registerCmdTestDoltCustody(t *testing.T, townRoot string) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(townRoot)
+	if err != nil {
+		t.Fatalf("resolve command test root: %v", err)
+	}
+	cmdTestDoltRootsMu.Lock()
+	cmdTestDoltRoots[root] = true
+	cmdTestDoltRootsMu.Unlock()
+	testutil.ReapOwnedDoltOnCleanup(t, townRoot)
 }
 
-func registerStagedConvoyDoltCustody(t *testing.T, townRoot string) {
-	t.Helper()
-	baseline := doltserver.FindAllDoltListeners()
-	t.Cleanup(func() {
-		if err := cleanupStagedConvoyDoltCustody(townRoot, baseline, doltserver.CleanupOwnedLocalDoltLeaks); err != nil {
-			t.Errorf("staged-convoy Dolt cleanup failed: %v", err)
+var (
+	cmdTestDoltRootsMu sync.Mutex
+	cmdTestDoltRoots   = map[string]bool{}
+)
+
+func registeredCmdTestDoltRoots() []string {
+	cmdTestDoltRootsMu.Lock()
+	defer cmdTestDoltRootsMu.Unlock()
+	roots := make([]string, 0, len(cmdTestDoltRoots))
+	for root := range cmdTestDoltRoots {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+func cleanupCmdTestDoltRoots(roots []string, reap func(string) (int, error)) error {
+	var result error
+	for _, root := range roots {
+		if _, err := reap(root); err != nil {
+			result = errors.Join(result, fmt.Errorf("%s: %w", root, err))
 		}
-	})
+	}
+	return result
 }
 
 // Epic adds an epic bead to the DAG.
@@ -409,6 +436,7 @@ func (d *testDAG) Setup(t *testing.T) (townRoot, logPath string) {
 	t.Helper()
 
 	townRoot = t.TempDir()
+	registerCmdTestDoltCustody(t, townRoot)
 
 	// Create workspace marker directories.
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {

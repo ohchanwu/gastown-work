@@ -5,6 +5,8 @@ package doltserver
 import (
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -21,7 +23,15 @@ func processIsAlive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	return process.Signal(syscall.Signal(0)) == nil
+	if process.Signal(syscall.Signal(0)) != nil {
+		return false
+	}
+	output, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	return err != nil || processStatusIsAlive(string(output))
+}
+
+func processStatusIsAlive(status string) bool {
+	return !strings.HasPrefix(strings.TrimSpace(status), "Z")
 }
 
 // gracefulTerminate sends SIGTERM for graceful shutdown on Unix.

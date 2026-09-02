@@ -2,6 +2,7 @@ package doltserver
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -486,6 +488,21 @@ func TestOwnedTestCWDIncludesRunScopedDescendants(t *testing.T) {
 	}
 }
 
+func TestOwnedTestCWDWhenTempDirIsContextSandbox(t *testing.T) {
+	sandbox := filepath.Join(t.TempDir(), ".ctx-mode-owned")
+	if err := os.MkdirAll(sandbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", sandbox)
+	cwd := filepath.Join(sandbox, "TestServer123", "001", ".beads", "dolt")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !isOwnedTestCWD(cwd, false) {
+		t.Fatal("context sandbox test cwd was not recognized")
+	}
+}
+
 func TestRemediateInventoryIsDryRunFirstAndFailsIfActionableRemain(t *testing.T) {
 	actionable := LocalDoltServer{DoltListener: DoltListener{PID: 301, Port: 3307}, Class: DoltServerConfiguredPortImposter}
 	unknown := LocalDoltServer{DoltListener: DoltListener{PID: 302, Port: 4400}, Class: DoltServerUnknown}
@@ -825,14 +842,16 @@ func TestTargetedTestLeakSelectionState(t *testing.T) {
 		selectedPID  int
 		canonicalPID int
 		processAlive bool
+		processOwned bool
 		processToken string
 		want         revalidatedProcessState
 	}{
-		{name: "exact owner", selectedPID: original.PID, processAlive: true, processToken: original.ProcessToken, want: revalidatedProcessOwned},
+		{name: "exact owner", selectedPID: original.PID, processAlive: true, processOwned: true, processToken: original.ProcessToken, want: revalidatedProcessOwned},
 		{name: "exited", want: revalidatedProcessAbsent},
-		{name: "stopped listening", processAlive: true, want: revalidatedProcessChanged},
-		{name: "canonical listener", selectedPID: original.PID, canonicalPID: original.PID, processAlive: true, processToken: original.ProcessToken, want: revalidatedProcessChanged},
-		{name: "process identity changed", selectedPID: original.PID, processAlive: true, processToken: "replacement-start", want: revalidatedProcessChanged},
+		{name: "stopped listening while exiting", processAlive: true, processOwned: true, processToken: original.ProcessToken, want: revalidatedProcessOwned},
+		{name: "stopped listening after exec", processAlive: true, processToken: original.ProcessToken, want: revalidatedProcessChanged},
+		{name: "canonical listener", selectedPID: original.PID, canonicalPID: original.PID, processAlive: true, processOwned: true, processToken: original.ProcessToken, want: revalidatedProcessChanged},
+		{name: "process identity changed", selectedPID: original.PID, processAlive: true, processOwned: true, processToken: "replacement-start", want: revalidatedProcessChanged},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -847,6 +866,8 @@ func TestTargetedTestLeakSelectionState(t *testing.T) {
 				return current
 			}, func(int) bool {
 				return tt.processAlive
+			}, func(int) bool {
+				return tt.processOwned
 			})
 			if got != tt.want {
 				t.Fatalf("state = %v, want %v", got, tt.want)
@@ -941,9 +962,108 @@ func TestFindOwnedDoltTestServerCandidatesFromPS(t *testing.T) {
 	}
 }
 
+func TestFindDoltSQLServerCandidatesFromPSIncludesBareServers(t *testing.T) {
+	output := strings.Join([]string{
+		"101 dolt sql-server --config /tmp/gt/.dolt-data/config.yaml",
+		"102 /usr/bin/dolt sql-server -H 127.0.0.1 -P 4402",
+		"103 grep dolt sql-server",
+		"104 dolt status",
+	}, "\n")
+	if got, want := findDoltSQLServerCandidatesFromPS(output), []int{101, 102}; !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
 func TestReapOwnedTestServersRefusesNonTempRoot(t *testing.T) {
 	if _, err := ReapOwnedTestServers(string(filepath.Separator)); err == nil {
 		t.Fatal("expected non-temp root to be rejected")
+	}
+}
+
+func TestReapOwnedTestServersStopsBareContextCWDServer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test manages a native Dolt server")
+	}
+	doltPath, err := exec.LookPath("dolt")
+	if err != nil {
+		t.Skip("dolt binary not available")
+	}
+	sandbox := os.TempDir()
+	if base := filepath.Base(sandbox); !strings.HasPrefix(base, ".ctx-mode-") || len(base) == len(".ctx-mode-") {
+		sandbox, err = os.MkdirTemp(sandbox, ".ctx-mode-reap-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(sandbox) })
+	}
+	townRoot := filepath.Join(sandbox, "TestBareServer123", "001")
+	dbPath := filepath.Join(townRoot, ".beads", "dolt")
+	initRealDoltDatabaseForRemovalTest(t, doltPath, dbPath)
+	resolvedRoot, err := filepath.EvalSymlinks(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	cmd := exec.Command(doltPath, "sql-server", "-H", "127.0.0.1", "-P", strconv.Itoa(port), "--loglevel=warning")
+	cmd.Dir = dbPath
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		if !waited {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if findDoltServerOnPort(port) != cmd.Process.Pid {
+		t.Fatalf("bare test server did not own port %d", port)
+	}
+	if err := os.RemoveAll(townRoot); err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := InventoryLocalDoltServersWithError(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var classified *LocalDoltServer
+	for i := range inventory {
+		if inventory[i].PID == cmd.Process.Pid {
+			classified = &inventory[i]
+			break
+		}
+	}
+	if classified == nil || classified.Class != DoltServerOwnedTestLeak || !pathWithin(resolvedRoot, classified.OwnerPath) {
+		t.Fatalf("bare test server classification = %#v", classified)
+	}
+	if !slices.Contains(ownedDoltTestServerCandidates(townRoot, DefaultConfig(townRoot)), cmd.Process.Pid) {
+		t.Fatal("bare test server missing from process candidates")
+	}
+	stopped, err := ReapOwnedTestServers(resolvedRoot)
+	if err != nil {
+		t.Fatalf("ReapOwnedTestServers() error = %v", err)
+	}
+	if stopped != 1 {
+		t.Fatalf("ReapOwnedTestServers() stopped %d, want 1", stopped)
+	}
+	_ = cmd.Wait()
+	waited = true
+	if findDoltServerOnPort(port) != 0 {
+		t.Fatalf("bare test server still owns port %d", port)
 	}
 }
 
@@ -5748,6 +5868,60 @@ func TestRemoveDatabaseIfCreationTokenRemovesReferencedIncompleteRig(t *testing.
 	}
 }
 
+func TestRemoveDatabaseIfRootIncarnationMigratesLegacyReferencedRig(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "metadata.json"), []byte("{\"dolt_database\":\"testdb_remove\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := "dolt-root:0123456789abcdefghijklmnopqrstuv"
+	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", root, true); err != nil {
+		t.Fatalf("RemoveDatabaseIfRootIncarnation() error = %v", err)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy owned database remains: %v", err)
+	}
+}
+
+func TestRemoveDatabaseIfRootIncarnationPreservesReplacement(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", "dolt-root:replacement", true); err == nil || !strings.Contains(err.Error(), "root incarnation") {
+		t.Fatalf("replacement root error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("legacy replacement was mutated: %v", err)
+	}
+}
+
+func TestMigrateLegacyDatabaseCreationReleasePreservesReplacement(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	err := MigrateLegacyDatabaseCreationRelease(townRoot, "testdb_remove", "owner-token", "dolt-root:replacement")
+	if err == nil || !strings.Contains(err.Error(), "legacy root identity") {
+		t.Fatalf("replacement root error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("legacy replacement was mutated: %v", err)
+	}
+	if _, err := os.Stat(databaseCreationReleaseReceiptPath(townRoot, "testdb_remove", "owner-token")); !os.IsNotExist(err) {
+		t.Fatalf("replacement received release receipt: %v", err)
+	}
+}
+
+func TestVerifyLegacyDatabaseRootAcceptsExactManifestFallback(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	manifest, err := os.ReadFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(manifest)
+	root := fmt.Sprintf("manifest-root:%x", sum[:])
+	if err := verifyLegacyDatabaseRoot(townRoot, "testdb_remove", dbPath, root); err != nil {
+		t.Fatalf("verifyLegacyDatabaseRoot() error = %v", err)
+	}
+}
+
 func TestRecoverDatabaseCreationTokenAfterCreateBeforeStamp(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
@@ -5764,6 +5938,7 @@ func TestRecoverDatabaseCreationTokenAfterCreateBeforeStamp(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"), []byte("created"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	setupDatabaseGenerationQueryStub(t, databaseGenerationID(token))
 
 	if err := RecoverDatabaseCreationToken(townRoot, dbName, token); err != nil {
 		t.Fatalf("RecoverDatabaseCreationToken() error = %v", err)
@@ -5774,6 +5949,121 @@ func TestRecoverDatabaseCreationTokenAfterCreateBeforeStamp(t *testing.T) {
 	if _, err := os.Stat(databaseCreationIntentPath(townRoot, dbName)); !os.IsNotExist(err) {
 		t.Fatalf("creation intent remains after recovery: %v", err)
 	}
+}
+
+func TestRecoverDatabaseCreationTokenRejectsSameGenerationReplacement(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	dbName := "replaced_after_intent"
+	token := "stale-create-generation"
+	if err := prepareDatabaseCreationIntent(townRoot, dbName, token, 0); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	dbPath := filepath.Join(townRoot, ".dolt-data", dbName)
+	if err := os.MkdirAll(filepath.Join(dbPath, ".dolt", "noms"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"), []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverDatabaseCreationToken(townRoot, dbName, token); err == nil {
+		t.Fatal("same-generation replacement was accepted as the original creation")
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, databaseCreationOwnerFile)); !os.IsNotExist(err) {
+		t.Fatalf("replacement was stamped with stale ownership token: %v", err)
+	}
+}
+
+func TestRecoverDatabaseCreationTokenRejectsSameServerDropRecreate(t *testing.T) {
+	townRoot, pid := startOwnedDatabaseTestServer(t)
+	dbName := "same_server_replacement"
+	token := "same-server-operation"
+	if err := prepareDatabaseCreationIntent(townRoot, dbName, token, pid); err != nil {
+		t.Fatal(err)
+	}
+	intent, err := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, dbName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverExecSQL(townRoot, ownedDatabaseCreateQuery(dbName, intent.Generation)); err != nil {
+		t.Fatal(err)
+	}
+	if err := serverExecSQL(townRoot, "DROP DATABASE `same_server_replacement`; CREATE DATABASE `same_server_replacement`"); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForCatalog(townRoot, dbName); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverDatabaseCreationToken(townRoot, dbName, token); err == nil {
+		t.Fatal("same-server DROP/recreate was accepted as the original database")
+	}
+	dbPath := filepath.Join(townRoot, ".dolt-data", dbName)
+	if _, err := os.Stat(filepath.Join(dbPath, databaseCreationOwnerFile)); !os.IsNotExist(err) {
+		t.Fatalf("replacement was stamped with stale ownership token: %v", err)
+	}
+}
+
+func TestInitRigOwnedPreservesAmbiguousCreateForRecovery(t *testing.T) {
+	townRoot, _ := startOwnedDatabaseTestServer(t)
+	previous := createOwnedDatabaseOnServer
+	t.Cleanup(func() { createOwnedDatabaseOnServer = previous })
+	createOwnedDatabaseOnServer = func(root, query string) error {
+		if err := serverExecSQL(root, query); err != nil {
+			return err
+		}
+		return errors.New("lost create acknowledgement")
+	}
+	token := "ambiguous-create-operation"
+	_, created, owned, err := InitRigOwned(townRoot, "ambiguous_create", token)
+	if err == nil || !strings.Contains(err.Error(), "lost create acknowledgement") {
+		t.Fatalf("InitRigOwned() error = %v, want lost acknowledgement", err)
+	}
+	if !created || owned != "" {
+		t.Fatalf("InitRigOwned() = created %v, owner %q", created, owned)
+	}
+	if _, err := os.Stat(databaseCreationIntentPath(townRoot, "ambiguous_create")); err != nil {
+		t.Fatalf("ambiguous creation intent was erased: %v", err)
+	}
+	if err := RecoverDatabaseCreationToken(townRoot, "ambiguous_create", token); err != nil {
+		t.Fatalf("recovering completed ambiguous create: %v", err)
+	}
+	if _, err := os.Stat(databaseCreationIntentPath(townRoot, "ambiguous_create")); !os.IsNotExist(err) {
+		t.Fatalf("recovered creation intent remains: %v", err)
+	}
+}
+
+func startOwnedDatabaseTestServer(t *testing.T) (string, int) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("test manages a native Dolt server")
+	}
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt binary not available")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+	townRoot := t.TempDir()
+	if err := Start(townRoot); err != nil {
+		t.Fatalf("starting isolated Dolt server: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := Stop(townRoot); err != nil {
+			t.Errorf("stopping isolated Dolt server: %v", err)
+		}
+	})
+	running, pid, err := IsRunning(townRoot)
+	if err != nil || !running || pid <= 0 {
+		t.Fatalf("isolated Dolt server state = running %v pid %d err %v", running, pid, err)
+	}
+	return townRoot, pid
 }
 
 func TestRemoveDatabasePreservesPendingCreationIntent(t *testing.T) {
@@ -5829,8 +6119,10 @@ func TestRemoveDatabaseCannotResumeCreationOwnedCleanupWithoutToken(t *testing.T
 func TestReleaseDatabaseCreationTokenIsGenerationBoundAndIdempotent(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
 	token := "release-generation"
+	generation := databaseGenerationID(token)
+	t.Setenv("GT_TEST_DATABASE_GENERATION_JSON", fmt.Sprintf(`{"rows":[{"generation_tag":%q}]}`, databaseGenerationTag(generation)))
 	marker := filepath.Join(dbPath, databaseCreationOwnerFile)
-	if err := os.WriteFile(marker, []byte(token+"\n"), 0o600); err != nil {
+	if err := writeDatabaseCreationOwner(dbPath, token, generation); err != nil {
 		t.Fatal(err)
 	}
 	if err := ReleaseDatabaseCreationToken(townRoot, "testdb_remove", token); err != nil {
@@ -5845,9 +6137,27 @@ func TestReleaseDatabaseCreationTokenIsGenerationBoundAndIdempotent(t *testing.T
 	if err := os.WriteFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"), []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := DatabaseCreationTokenReleased(townRoot, "testdb_remove", token); err == nil || !strings.Contains(err.Error(), "generation changed") {
-		t.Fatalf("replacement generation accepted release receipt: %v", err)
+	if err := DatabaseCreationTokenReleased(townRoot, "testdb_remove", token); err != nil {
+		t.Fatalf("normal commit invalidated immutable generation: %v", err)
 	}
+	t.Setenv("GT_TEST_DATABASE_GENERATION_JSON", `{}`)
+	if err := DatabaseCreationTokenReleased(townRoot, "testdb_remove", token); err == nil {
+		t.Fatal("replacement generation accepted release receipt")
+	}
+}
+
+func setupDatabaseGenerationQueryStub(t *testing.T, generation string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX dolt stub")
+	}
+	binDir := t.TempDir()
+	stub := fmt.Sprintf("#!/bin/sh\ncase \"$*\" in *\"FROM dolt_tags\"*) printf '%%s\\n' '%s'; exit 0;; esac\nexit 1\n",
+		fmt.Sprintf(`{"rows":[{"generation_tag":%q}]}`, databaseGenerationTag(generation)))
+	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func TestRemoveDatabaseQuarantinesIncarnationMismatch(t *testing.T) {
@@ -6403,6 +6713,7 @@ func setupRemoveDatabaseSQLTest(t *testing.T, behavior string) (string, string) 
 	stub := `#!/bin/sh
 case "$*" in
   *"FROM dolt_log"*) printf '{"rows":[{"incarnation":"0123456789abcdefghijklmnopqrstuv"}]}\n'; exit 0 ;;
+  *"FROM dolt_tags"*) printf '%s\n' "$GT_TEST_DATABASE_GENERATION_JSON"; exit 0 ;;
   *"SHOW DATABASES"*)
     if [ -n "$GT_TEST_SHOW_DATABASES_FILE" ]; then
       cat "$GT_TEST_SHOW_DATABASES_FILE"

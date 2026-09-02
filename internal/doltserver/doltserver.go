@@ -1127,6 +1127,9 @@ func isOwnedTestCWD(path string, fromLsof bool) bool {
 		return false
 	}
 	components := strings.Split(lexicalRel, string(filepath.Separator))
+	if base := filepath.Base(tempRoot); strings.HasPrefix(base, ".ctx-mode-") && len(base) > len(".ctx-mode-") {
+		components = append([]string{base}, components...)
+	}
 	if len(components) < 5 || !strings.HasPrefix(components[0], ".ctx-mode-") || len(components[0]) == len(".ctx-mode-") ||
 		!isGoTestTempComponent(components[1]) || !allDecimalDigits(components[2]) ||
 		components[len(components)-2] != ".beads" || components[len(components)-1] != "dolt" {
@@ -1788,12 +1791,14 @@ func testLeakSelectionState(inventory []LocalDoltServer, selection TestLeakSelec
 	return revalidatedProcessAbsent
 }
 
-func targetedTestLeakSelectionState(selection TestLeakSelection, expectedPort int, expectedDataDir string, listenerPID func(int) int, evidenceFor func(int) doltProcessEvidence, processAlive func(int) bool) revalidatedProcessState {
+func targetedTestLeakSelectionState(selection TestLeakSelection, expectedPort int, expectedDataDir string, listenerPID func(int) int, evidenceFor func(int) doltProcessEvidence, processAlive, processOwned func(int) bool) revalidatedProcessState {
 	if listenerPID(selection.Port) != selection.PID {
-		if processAlive(selection.PID) {
+		if !processAlive(selection.PID) {
+			return revalidatedProcessAbsent
+		}
+		if !processOwned(selection.PID) {
 			return revalidatedProcessChanged
 		}
-		return revalidatedProcessAbsent
 	}
 	if expectedPort != 0 && expectedPort != selection.Port && listenerPID(expectedPort) == selection.PID {
 		return revalidatedProcessChanged
@@ -1815,7 +1820,7 @@ func terminateSelectedTestLeak(townRoot string, selection TestLeakSelection) err
 	return terminateRevalidatedProcess(selection.PID, func() (revalidatedProcessState, error) {
 		return targetedTestLeakSelectionState(selection, expectedPort, expectedDataDir, findDoltServerOnPort, func(pid int) doltProcessEvidence {
 			return processEvidence(townRoot, pid)
-		}, processIsAlive), nil
+		}, processIsAlive, isDoltSQLServerProcess), nil
 	}, func(kill bool) error {
 		if kill {
 			return process.Kill()
@@ -2130,9 +2135,15 @@ func ReapOwnedTestServers(townRoot string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("resolving town root: %w", err)
 	}
+	if resolved, resolveErr := filepath.EvalSymlinks(absRoot); resolveErr == nil {
+		absRoot = resolved
+	}
 	absTemp, err := filepath.Abs(os.TempDir())
 	if err != nil {
 		return 0, fmt.Errorf("resolving temp dir: %w", err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(absTemp); resolveErr == nil {
+		absTemp = resolved
 	}
 	rel, err := filepath.Rel(absTemp, absRoot)
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
@@ -2224,7 +2235,11 @@ func ownedDoltTestServerCandidates(townRoot string, config *Config) []int {
 	if info, err := readSQLServerInfo(config); err == nil {
 		add(info.PID)
 	}
-	for _, pid := range findOwnedDoltTestServerCandidatesFromPS(processList(), townRoot, config.DataDir) {
+	processes := processList()
+	for _, pid := range findOwnedDoltTestServerCandidatesFromPS(processes, townRoot, config.DataDir) {
+		add(pid)
+	}
+	for _, pid := range findDoltSQLServerCandidatesFromPS(processes) {
 		add(pid)
 	}
 	return pids
@@ -2261,6 +2276,21 @@ func findOwnedDoltTestServerCandidatesFromPS(output, townRoot, dataDir string) [
 			continue
 		}
 		if isDoltSQLServerArgs(fields[1:]) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+func findDoltSQLServerCandidatesFromPS(output string) []int {
+	var pids []int
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || !isDoltSQLServerArgs(fields[1:]) {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err == nil && pid > 0 {
 			pids = append(pids, pid)
 		}
 	}
@@ -3489,6 +3519,8 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 	return serverWasRunning, created, err
 }
 
+var createOwnedDatabaseOnServer = serverExecSQL
+
 // InitRigOwned durably stamps a newly created database with creationToken so
 // its caller can perform generation-bound compensating cleanup.
 func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning bool, created bool, ownedToken string, err error) {
@@ -3529,13 +3561,28 @@ func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning boo
 				return fmt.Errorf("checking existing rig database: %w", statErr)
 			} else {
 				if creationToken != "" {
+					if !serverWasRunning {
+						return fmt.Errorf("owned database creation requires the running Dolt server")
+					}
 					if err := prepareDatabaseCreationIntent(townRoot, rigName, creationToken, runningPID); err != nil {
 						return fmt.Errorf("recording database creation intent: %w", err)
 					}
 				}
 				created = true
 				if serverWasRunning {
-					if err := serverExecSQL(townRoot, fmt.Sprintf("CREATE DATABASE `%s`", rigName)); err != nil {
+					query := fmt.Sprintf("CREATE DATABASE `%s`", rigName)
+					if creationToken != "" {
+						intent, err := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, rigName))
+						if err != nil {
+							return fmt.Errorf("reading database creation intent: %w", err)
+						}
+						query = ownedDatabaseCreateQuery(rigName, intent.Generation)
+					}
+					createDatabase := serverExecSQL
+					if creationToken != "" {
+						createDatabase = createOwnedDatabaseOnServer
+					}
+					if err := createDatabase(townRoot, query); err != nil {
 						return fmt.Errorf("creating database on running server: %w", err)
 					}
 					if err := waitForCatalog(townRoot, rigName); err != nil {
@@ -3556,7 +3603,14 @@ func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning boo
 				InvalidateDBCache()
 			}
 			if created && creationToken != "" {
-				if err := writeDatabaseCleanupFileDurable(filepath.Join(rigDir, databaseCreationOwnerFile), []byte(creationToken+"\n"), 0o600); err != nil {
+				intent, err := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, rigName))
+				if err != nil {
+					return fmt.Errorf("reading database creation intent: %w", err)
+				}
+				if err := verifyDatabaseGeneration(townRoot, rigName, rigDir, intent.Generation); err != nil {
+					return fmt.Errorf("verifying created database generation: %w", err)
+				}
+				if err := writeDatabaseCreationOwner(rigDir, creationToken, intent.Generation); err != nil {
 					return fmt.Errorf("stamping created database ownership: %w", err)
 				}
 				ownedToken = creationToken
@@ -3582,15 +3636,6 @@ func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning boo
 		return nil
 	})
 	if err != nil {
-		if creationToken != "" {
-			cleanupErr := WithDatabaseOwnershipTransaction(townRoot, func() error {
-				if DatabaseExists(townRoot, rigName) {
-					return nil
-				}
-				return clearDatabaseCreationIntent(townRoot, rigName, creationToken)
-			})
-			err = errors.Join(err, cleanupErr)
-		}
 		return serverWasRunning, created, ownedToken, err
 	}
 	if !serverWasRunning {
@@ -5934,7 +5979,7 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 }
 
 const (
-	databaseCleanupReceiptVersion = 3
+	databaseCleanupReceiptVersion = 4
 	databaseCreationOwnerFile     = ".gastown-creation-owner"
 )
 
@@ -5953,6 +5998,7 @@ type databaseCleanupReceipt struct {
 	Phase         databaseCleanupPhase `json:"phase"`
 	Incarnation   string               `json:"incarnation"`
 	CreationToken string               `json:"creation_token,omitempty"`
+	LegacyRoot    string               `json:"legacy_root,omitempty"`
 }
 
 var (
@@ -5971,7 +6017,7 @@ func WithDatabaseOwnershipTransaction(townRoot string, operation func() error) e
 // If the Dolt server is running, it will DROP the database first.
 // If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
 func RemoveDatabase(townRoot, dbName string, force bool) error {
-	return removeDatabase(townRoot, dbName, force, "")
+	return removeDatabase(townRoot, dbName, force, "", "")
 }
 
 // RemoveDatabaseIfCreationToken removes dbName only when it still carries the
@@ -5980,10 +6026,19 @@ func RemoveDatabaseIfCreationToken(townRoot, dbName, creationToken string, force
 	if creationToken == "" {
 		return fmt.Errorf("database creation token is required")
 	}
-	return removeDatabase(townRoot, dbName, force, creationToken)
+	return removeDatabase(townRoot, dbName, force, creationToken, "")
 }
 
-func removeDatabase(townRoot, dbName string, force bool, creationToken string) error {
+// RemoveDatabaseIfRootIncarnation preserves compatibility with version-1 add
+// markers. It may remove only the exact pre-transaction root they recorded.
+func RemoveDatabaseIfRootIncarnation(townRoot, dbName, rootIdentity string, force bool) error {
+	if rootIdentity == "" {
+		return fmt.Errorf("database root identity is required")
+	}
+	return removeDatabase(townRoot, dbName, force, "", rootIdentity)
+}
+
+func removeDatabase(townRoot, dbName string, force bool, creationToken, legacyRoot string) error {
 	if _, err := DatabasePath(townRoot, dbName); err != nil {
 		return err
 	}
@@ -6014,11 +6069,11 @@ func removeDatabase(townRoot, dbName string, force bool, creationToken string) e
 			return fmt.Errorf("tightening database cleanup lock for %q: %w", dbName, err)
 		}
 
-		return removeDatabaseLocked(townRoot, dbName, force, creationToken)
+		return removeDatabaseLocked(townRoot, dbName, force, creationToken, legacyRoot)
 	})
 }
 
-func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken string) error {
+func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken, legacyRoot string) error {
 	config := DefaultConfig(townRoot)
 	dbPath := filepath.Join(config.DataDir, dbName)
 	if intent, intentErr := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, dbName)); intentErr == nil {
@@ -6037,7 +6092,7 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken str
 		if receipt.Force && !force {
 			return fmt.Errorf("database %q has a pending forced cleanup — rerun with --force", dbName)
 		}
-		if receipt.CreationToken != creationToken {
+		if receipt.CreationToken != creationToken || receipt.LegacyRoot != legacyRoot {
 			return fmt.Errorf("database %q no longer matches owning creation token", dbName)
 		}
 		running, _, runningErr := IsRunning(townRoot)
@@ -6067,7 +6122,7 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken str
 		if err := verifyDatabaseCreationToken(dbPath, creationToken); err != nil {
 			return fmt.Errorf("database %q no longer matches owning creation token: %w", dbName, err)
 		}
-	} else {
+	} else if legacyRoot == "" {
 		if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
 			return err
 		}
@@ -6121,9 +6176,12 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken str
 		if err != nil {
 			return fmt.Errorf("identifying database %q before cleanup: %w", dbName, err)
 		}
+		if legacyRoot != "" && databaseCleanupRootIdentity(incarnation) != legacyRoot {
+			return fmt.Errorf("database %q no longer matches owning root incarnation", dbName)
+		}
 		receipt = databaseCleanupReceipt{
 			Version: databaseCleanupReceiptVersion, Database: dbName, Force: force,
-			Phase: databaseCleanupPrepared, Incarnation: incarnation, CreationToken: creationToken,
+			Phase: databaseCleanupPrepared, Incarnation: incarnation, CreationToken: creationToken, LegacyRoot: legacyRoot,
 		}
 		if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
 			return fmt.Errorf("writing database cleanup receipt for %q: %w", dbName, err)
@@ -6135,12 +6193,15 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken str
 	if err != nil {
 		return fmt.Errorf("identifying offline database %q before cleanup: %w", dbName, err)
 	}
-	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, incarnation, false, creationToken != ""); err != nil {
+	if legacyRoot != "" && databaseCleanupRootIdentity(incarnation) != legacyRoot {
+		return fmt.Errorf("database %q no longer matches owning root incarnation", dbName)
+	}
+	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, incarnation, false, creationToken != "" || legacyRoot != ""); err != nil {
 		return err
 	}
 	receipt = databaseCleanupReceipt{
 		Version: databaseCleanupReceiptVersion, Database: dbName, Force: force,
-		Phase: databaseCleanupOfflineReady, Incarnation: incarnation, CreationToken: creationToken,
+		Phase: databaseCleanupOfflineReady, Incarnation: incarnation, CreationToken: creationToken, LegacyRoot: legacyRoot,
 	}
 	if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
 		return fmt.Errorf("writing offline database cleanup receipt for %q: %w", dbName, err)
@@ -6199,7 +6260,7 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 			return fmt.Errorf("checking claimed database directory: %w", err)
 		}
 	}
-	ownedCreation := receipt.CreationToken != ""
+	ownedCreation := receipt.CreationToken != "" || receipt.LegacyRoot != ""
 	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, allowMissing, ownedCreation); err != nil {
 		return quarantineDatabaseCleanupReceipt(receiptPath, err)
 	}
@@ -6299,7 +6360,7 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 }
 
 func resumeOfflineDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, receipt databaseCleanupReceipt) error {
-	ownedCreation := receipt.CreationToken != ""
+	ownedCreation := receipt.CreationToken != "" || receipt.LegacyRoot != ""
 	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, true, ownedCreation); err != nil {
 		return quarantineDatabaseCleanupReceipt(receiptPath, err)
 	}
@@ -6467,22 +6528,101 @@ func databaseCleanupIncarnation(townRoot, dbName, dbPath string, targetLive bool
 	return fmt.Sprintf("%s/manifest-sha256:%x", rootIdentity, state[:]), nil
 }
 
-func verifyDatabaseCreationToken(dbPath, want string) error {
-	data, err := os.ReadFile(filepath.Join(dbPath, databaseCreationOwnerFile))
+func databaseCleanupRootIdentity(incarnation string) string {
+	root, _, _ := strings.Cut(incarnation, "/")
+	return root
+}
+
+func verifyLegacyDatabaseRoot(townRoot, dbName, dbPath, want string) error {
+	if strings.HasPrefix(want, "manifest-root:") {
+		manifest, err := os.ReadFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"))
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(manifest)
+		if fmt.Sprintf("manifest-root:%x", sum[:]) != want {
+			return fmt.Errorf("database %q no longer matches legacy root identity", dbName)
+		}
+		return nil
+	}
+	if !strings.HasPrefix(want, "dolt-root:") {
+		return fmt.Errorf("invalid legacy database root identity")
+	}
+	running, _, err := IsRunning(townRoot)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(string(data)) != want {
+	targetLive := false
+	if running {
+		_, targetLive, err = liveBranchControlDatabase(townRoot, dbName)
+		if err != nil {
+			return err
+		}
+		if !targetLive {
+			return fmt.Errorf("legacy database %q is not loaded by the live server", dbName)
+		}
+	}
+	incarnation, err := databaseCleanupIncarnation(townRoot, dbName, dbPath, targetLive)
+	if err != nil {
+		return err
+	}
+	if databaseCleanupRootIdentity(incarnation) != want {
+		return fmt.Errorf("database %q no longer matches legacy root identity", dbName)
+	}
+	return nil
+}
+
+type databaseCreationOwner struct {
+	Version    int    `json:"version"`
+	Token      string `json:"token"`
+	Generation string `json:"generation"`
+}
+
+func writeDatabaseCreationOwner(dbPath, token, generation string) error {
+	data, err := json.Marshal(databaseCreationOwner{Version: 2, Token: token, Generation: generation})
+	if err != nil {
+		return err
+	}
+	return writeDatabaseCleanupFileDurable(filepath.Join(dbPath, databaseCreationOwnerFile), append(data, '\n'), 0o600)
+}
+
+func readDatabaseCreationOwner(dbPath string) (databaseCreationOwner, error) {
+	data, err := os.ReadFile(filepath.Join(dbPath, databaseCreationOwnerFile))
+	if err != nil {
+		return databaseCreationOwner{}, err
+	}
+	var owner databaseCreationOwner
+	if json.Unmarshal(data, &owner) == nil {
+		if owner.Version != 2 || owner.Token == "" || !validDatabaseGeneration(owner.Generation) {
+			return databaseCreationOwner{}, fmt.Errorf("invalid database creation owner")
+		}
+		return owner, nil
+	}
+	// Version 1 stored only the token as plain text. Keep cleanup compatibility,
+	// but do not use that mutable proof to issue a generation release receipt.
+	owner.Token = strings.TrimSpace(string(data))
+	if owner.Token == "" {
+		return databaseCreationOwner{}, fmt.Errorf("invalid database creation owner")
+	}
+	return owner, nil
+}
+
+func verifyDatabaseCreationToken(dbPath, want string) error {
+	owner, err := readDatabaseCreationOwner(dbPath)
+	if err != nil {
+		return err
+	}
+	if owner.Token != want {
 		return fmt.Errorf("creation token mismatch")
 	}
 	return nil
 }
 
 type databaseCreationReleaseReceipt struct {
-	Version     int    `json:"version"`
-	Database    string `json:"database"`
-	Token       string `json:"token"`
-	Incarnation string `json:"incarnation"`
+	Version    int    `json:"version"`
+	Database   string `json:"database"`
+	Token      string `json:"token"`
+	Generation string `json:"generation"`
 }
 
 type databaseCreationIntent struct {
@@ -6492,6 +6632,33 @@ type databaseCreationIntent struct {
 	ServerPID    int    `json:"server_pid,omitempty"`
 	ServerToken  string `json:"server_token,omitempty"`
 	PreparedNano int64  `json:"prepared_unix_nano"`
+	Generation   string `json:"generation"`
+}
+
+const databaseGenerationTagPrefix = "gastown-db-generation-"
+
+var errDatabaseGenerationMissing = errors.New("database generation tag is missing")
+
+func databaseGenerationID(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:16])
+}
+
+func validDatabaseGeneration(generation string) bool {
+	if len(generation) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(generation)
+	return err == nil
+}
+
+func databaseGenerationTag(generation string) string {
+	return databaseGenerationTagPrefix + generation
+}
+
+func ownedDatabaseCreateQuery(dbName, generation string) string {
+	identifier := strings.ReplaceAll(dbName, "`", "``")
+	return fmt.Sprintf("CREATE DATABASE `%s`; USE `%s`; CALL DOLT_TAG('%s')", identifier, identifier, databaseGenerationTag(generation))
 }
 
 func databaseCreationIntentPath(townRoot, dbName string) string {
@@ -6509,8 +6676,9 @@ func prepareDatabaseCreationIntent(townRoot, dbName, token string, serverPID int
 		return err
 	}
 	intent := databaseCreationIntent{
-		Version: 1, Database: dbName, Token: token, ServerPID: serverPID,
+		Version: 2, Database: dbName, Token: token, ServerPID: serverPID,
 		PreparedNano: time.Now().UnixNano(),
+		Generation:   databaseGenerationID(token),
 	}
 	if serverPID != 0 {
 		intent.ServerToken = getProcessStartToken(serverPID)
@@ -6537,10 +6705,135 @@ func readDatabaseCreationIntent(path string) (databaseCreationIntent, error) {
 	if err := json.Unmarshal(data, &intent); err != nil {
 		return databaseCreationIntent{}, err
 	}
-	if intent.Version != 1 || intent.Database == "" || intent.Token == "" || intent.PreparedNano <= 0 || (intent.ServerPID == 0) != (intent.ServerToken == "") {
+	if intent.Version != 2 || intent.Database == "" || intent.Token == "" || intent.PreparedNano <= 0 || intent.Generation != databaseGenerationID(intent.Token) || (intent.ServerPID == 0) != (intent.ServerToken == "") {
 		return databaseCreationIntent{}, fmt.Errorf("invalid database creation intent")
 	}
 	return intent, nil
+}
+
+func verifyDatabaseCreationServerGeneration(townRoot string, intent databaseCreationIntent) error {
+	running, pid, err := IsRunning(townRoot)
+	if err != nil {
+		return err
+	}
+	if intent.ServerPID == 0 {
+		if running {
+			return fmt.Errorf("Dolt server generation changed after offline database creation intent")
+		}
+		return nil
+	}
+	if !running || pid != intent.ServerPID || getProcessStartToken(pid) != intent.ServerToken {
+		return fmt.Errorf("Dolt server generation changed after database creation intent")
+	}
+	return nil
+}
+
+func verifyDatabaseGeneration(townRoot, dbName, dbPath, generation string) error {
+	if !validDatabaseGeneration(generation) {
+		return fmt.Errorf("invalid database generation")
+	}
+	tag := databaseGenerationTag(generation)
+	identifier := strings.ReplaceAll(dbName, "`", "``")
+	query := fmt.Sprintf("SELECT tag_name AS generation_tag FROM dolt_tags WHERE tag_name = '%s'", tag)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	running, _, err := IsRunning(townRoot)
+	if err != nil {
+		return err
+	}
+	var cmd *exec.Cmd
+	if running {
+		cmd = buildServerSQLCmd(ctx, DefaultConfig(townRoot), "-r", "json", "-q", fmt.Sprintf("USE `%s`; %s", identifier, query))
+	} else {
+		cmd = exec.CommandContext(ctx, "dolt", "sql", "-r", "json", "-q", query)
+		cmd.Dir = dbPath
+		setProcessGroup(cmd)
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("querying database generation: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	var result struct {
+		Rows []struct {
+			GenerationTag string `json:"generation_tag"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return fmt.Errorf("parsing database generation: %w", err)
+	}
+	if len(result.Rows) == 0 {
+		return errDatabaseGenerationMissing
+	}
+	if len(result.Rows) != 1 || result.Rows[0].GenerationTag != tag {
+		return fmt.Errorf("database generation tag changed")
+	}
+	return nil
+}
+
+func installDatabaseGeneration(townRoot, dbName, dbPath, generation string) error {
+	if err := verifyDatabaseGeneration(townRoot, dbName, dbPath, generation); err == nil {
+		return nil
+	} else if !errors.Is(err, errDatabaseGenerationMissing) {
+		return err
+	}
+	tag := databaseGenerationTag(generation)
+	running, _, err := IsRunning(townRoot)
+	if err != nil {
+		return err
+	}
+	if running {
+		if err := doltSQL(townRoot, dbName, fmt.Sprintf("CALL DOLT_TAG('%s')", tag)); err != nil {
+			return err
+		}
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "dolt", "tag", tag)
+		cmd.Dir = dbPath
+		setProcessGroup(cmd)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("creating database generation tag: %w (output: %s)", err, strings.TrimSpace(string(output)))
+		}
+	}
+	return verifyDatabaseGeneration(townRoot, dbName, dbPath, generation)
+}
+
+// CancelDatabaseCreationIntentIfAbsent retires only an exact intent after the
+// same server generation authoritatively reports that the database is absent.
+func CancelDatabaseCreationIntentIfAbsent(townRoot, dbName, token string) error {
+	return withDoltLifecycle(townRoot, func() error {
+		return WithDatabaseOwnershipTransaction(townRoot, func() error {
+			intent, err := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, dbName))
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if intent.Database != dbName || intent.Token != token {
+				return fmt.Errorf("database creation intent changed")
+			}
+			if err := verifyDatabaseCreationServerGeneration(townRoot, intent); err != nil {
+				return err
+			}
+			if DatabaseExists(townRoot, dbName) {
+				return fmt.Errorf("database %q exists; preserving creation intent", dbName)
+			}
+			if intent.ServerPID != 0 {
+				_, missing, err := VerifyExpectedDatabasesAtConfig(DefaultConfig(townRoot), []string{dbName})
+				if err != nil {
+					return fmt.Errorf("verifying absent database in live catalog: %w", err)
+				}
+				if len(missing) != 1 || missing[0] != dbName {
+					return fmt.Errorf("database %q remains in the live catalog", dbName)
+				}
+				if DatabaseExists(townRoot, dbName) {
+					return fmt.Errorf("database %q materialized while canceling creation intent", dbName)
+				}
+			}
+			return clearDatabaseCreationIntent(townRoot, dbName, token)
+		})
+	})
 }
 
 func clearDatabaseCreationIntent(townRoot, dbName, token string) error {
@@ -6571,40 +6864,50 @@ func RecoverDatabaseCreationToken(townRoot, dbName, token string) error {
 			if err != nil {
 				return err
 			}
-			if err := verifyDatabaseCreationToken(dbPath, token); err == nil {
-				return clearDatabaseCreationIntent(townRoot, dbName, token)
-			} else if !os.IsNotExist(err) {
-				return err
+			owner, ownerErr := readDatabaseCreationOwner(dbPath)
+			intent, intentErr := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, dbName))
+			if ownerErr == nil {
+				if owner.Token != token {
+					return fmt.Errorf("database creation owner changed")
+				}
+				if intentErr != nil {
+					if os.IsNotExist(intentErr) {
+						if owner.Generation != "" {
+							return verifyDatabaseGeneration(townRoot, dbName, dbPath, owner.Generation)
+						}
+						return nil
+					}
+					return intentErr
+				}
+			} else if !os.IsNotExist(ownerErr) {
+				return ownerErr
 			}
-			intent, err := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, dbName))
-			if err != nil {
-				return err
+			if intentErr != nil {
+				return intentErr
 			}
 			if intent.Database != dbName || intent.Token != token {
 				return fmt.Errorf("database creation intent changed")
 			}
-			running, pid, err := IsRunning(townRoot)
-			if err != nil {
+			if err := verifyDatabaseCreationServerGeneration(townRoot, intent); err != nil {
 				return err
 			}
-			if intent.ServerPID == 0 {
-				if running {
-					return fmt.Errorf("Dolt server generation changed after offline database creation intent")
+			if err := verifyDatabaseGeneration(townRoot, dbName, dbPath, intent.Generation); err != nil {
+				return err
+			}
+			if ownerErr == nil {
+				if owner.Generation != "" && owner.Generation != intent.Generation {
+					return fmt.Errorf("database creation owner changed")
 				}
-			} else if !running || pid != intent.ServerPID || getProcessStartToken(pid) != intent.ServerToken {
-				return fmt.Errorf("Dolt server generation changed after database creation intent")
 			}
-			doltInfo, err := os.Stat(filepath.Join(dbPath, ".dolt"))
-			if err != nil {
+			if ownerErr != nil || owner.Generation == "" {
+				if err := writeDatabaseCreationOwner(dbPath, token, intent.Generation); err != nil {
+					return err
+				}
+			}
+			if err := clearDatabaseCreationIntent(townRoot, dbName, token); err != nil {
 				return err
 			}
-			if doltInfo.ModTime().UnixNano() < intent.PreparedNano {
-				return fmt.Errorf("database generation predates creation intent")
-			}
-			if err := writeDatabaseCleanupFileDurable(filepath.Join(dbPath, databaseCreationOwnerFile), []byte(token+"\n"), 0o600); err != nil {
-				return err
-			}
-			return clearDatabaseCreationIntent(townRoot, dbName, token)
+			return nil
 		})
 	})
 }
@@ -6612,21 +6915,6 @@ func RecoverDatabaseCreationToken(townRoot, dbName, token string) error {
 func databaseCreationReleaseReceiptPath(townRoot, dbName, token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return filepath.Join(townRoot, ".runtime", "dolt-database-creation-released", fmt.Sprintf("%s-%x.json", canonicalDatabaseName(dbName), sum[:8]))
-}
-
-func databaseCreationIncarnation(townRoot, dbName, dbPath string) (string, error) {
-	running, _, err := IsRunning(townRoot)
-	if err != nil {
-		return "", err
-	}
-	targetLive := false
-	if running {
-		_, targetLive, err = liveBranchControlDatabase(townRoot, dbName)
-		if err != nil {
-			return "", err
-		}
-	}
-	return databaseCleanupIncarnation(townRoot, dbName, dbPath, targetLive)
 }
 
 // DatabaseCreationTokenReleased proves that rollback authority for the exact
@@ -6647,21 +6935,73 @@ func databaseCreationTokenReleasedLocked(townRoot, dbName, token string) error {
 	if err := json.Unmarshal(data, &receipt); err != nil {
 		return err
 	}
-	if receipt.Version != 1 || receipt.Database != dbName || receipt.Token != token || receipt.Incarnation == "" {
+	if receipt.Version != 2 || receipt.Database != dbName || receipt.Token != token || !validDatabaseGeneration(receipt.Generation) {
 		return fmt.Errorf("invalid database creation release receipt")
 	}
 	dbPath, err := DatabasePath(townRoot, dbName)
 	if err != nil {
 		return err
 	}
-	incarnation, err := databaseCreationIncarnation(townRoot, dbName, dbPath)
+	return verifyDatabaseGeneration(townRoot, dbName, dbPath, receipt.Generation)
+}
+
+func writeDatabaseCreationReleaseReceiptLocked(townRoot, dbName, token, generation string) error {
+	receiptPath := databaseCreationReleaseReceiptPath(townRoot, dbName, token)
+	if _, err := os.Stat(receiptPath); err == nil {
+		if err := databaseCreationTokenReleasedLocked(townRoot, dbName, token); err != nil {
+			return fmt.Errorf("existing database creation release receipt changed: %w", err)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := ensurePrivateDatabaseCleanupDirectory(filepath.Dir(receiptPath)); err != nil {
+		return err
+	}
+	data, err := json.Marshal(databaseCreationReleaseReceipt{
+		Version: 2, Database: dbName, Token: token, Generation: generation,
+	})
 	if err != nil {
 		return err
 	}
-	if incarnation != receipt.Incarnation {
-		return fmt.Errorf("released database generation changed")
+	return writeDatabaseCleanupFileDurable(receiptPath, append(data, '\n'), 0o600)
+}
+
+// MigrateLegacyDatabaseCreationRelease non-destructively binds a legacy
+// pending registration to a durable database tag and retires deletion authority.
+func MigrateLegacyDatabaseCreationRelease(townRoot, dbName, token, legacyRoot string) error {
+	if token == "" {
+		return fmt.Errorf("database creation token is required")
 	}
-	return nil
+	if legacyRoot == "" {
+		return fmt.Errorf("legacy database root identity is required")
+	}
+	return withDoltLifecycle(townRoot, func() error {
+		return WithDatabaseOwnershipTransaction(townRoot, func() error {
+			if err := databaseCreationTokenReleasedLocked(townRoot, dbName, token); err == nil {
+				return nil
+			} else if _, statErr := os.Stat(databaseCreationReleaseReceiptPath(townRoot, dbName, token)); statErr == nil {
+				return fmt.Errorf("legacy database release receipt changed: %w", err)
+			} else if !os.IsNotExist(statErr) {
+				return statErr
+			}
+			dbPath, err := DatabasePath(townRoot, dbName)
+			if err != nil {
+				return err
+			}
+			if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+				return err
+			}
+			if err := verifyLegacyDatabaseRoot(townRoot, dbName, dbPath, legacyRoot); err != nil {
+				return err
+			}
+			generation := databaseGenerationID(token)
+			if err := installDatabaseGeneration(townRoot, dbName, dbPath, generation); err != nil {
+				return err
+			}
+			return writeDatabaseCreationReleaseReceiptLocked(townRoot, dbName, token, generation)
+		})
+	})
 }
 
 // ReleaseDatabaseCreationToken retires destructive rollback authority after a
@@ -6675,27 +7015,20 @@ func ReleaseDatabaseCreationToken(townRoot, dbName, creationToken string) error 
 		if err != nil {
 			return err
 		}
-		if err := verifyDatabaseCreationToken(dbPath, creationToken); err != nil {
+		owner, err := readDatabaseCreationOwner(dbPath)
+		if err != nil {
 			if os.IsNotExist(err) {
 				return databaseCreationTokenReleasedLocked(townRoot, dbName, creationToken)
 			}
 			return err
 		}
-		incarnation, err := databaseCreationIncarnation(townRoot, dbName, dbPath)
-		if err != nil {
+		if owner.Token != creationToken || !validDatabaseGeneration(owner.Generation) {
+			return fmt.Errorf("database creation owner does not contain an immutable generation")
+		}
+		if err := verifyDatabaseGeneration(townRoot, dbName, dbPath, owner.Generation); err != nil {
 			return err
 		}
-		receiptPath := databaseCreationReleaseReceiptPath(townRoot, dbName, creationToken)
-		if err := ensurePrivateDatabaseCleanupDirectory(filepath.Dir(receiptPath)); err != nil {
-			return err
-		}
-		data, err := json.Marshal(databaseCreationReleaseReceipt{
-			Version: 1, Database: dbName, Token: creationToken, Incarnation: incarnation,
-		})
-		if err != nil {
-			return err
-		}
-		if err := writeDatabaseCleanupFileDurable(receiptPath, append(data, '\n'), 0o600); err != nil {
+		if err := writeDatabaseCreationReleaseReceiptLocked(townRoot, dbName, creationToken, owner.Generation); err != nil {
 			return err
 		}
 		path := filepath.Join(dbPath, databaseCreationOwnerFile)
@@ -6869,7 +7202,9 @@ func readDatabaseCleanupReceipt(path string) (databaseCleanupReceipt, error) {
 	}
 	validPhase := receipt.Phase == databaseCleanupPrepared || receipt.Phase == databaseCleanupDropAttempted ||
 		receipt.Phase == databaseCleanupOfflineReady
-	if receipt.Version != databaseCleanupReceiptVersion || !validSQLName(receipt.Database) || receipt.Database == "." || receipt.Database == ".." ||
+	validVersion := receipt.Version == databaseCleanupReceiptVersion || (receipt.Version == 3 && receipt.LegacyRoot == "")
+	validProof := receipt.CreationToken == "" || receipt.LegacyRoot == ""
+	if !validVersion || !validProof || !validSQLName(receipt.Database) || receipt.Database == "." || receipt.Database == ".." ||
 		!validPhase || !validIncarnation {
 		return databaseCleanupReceipt{}, fmt.Errorf("invalid database cleanup receipt")
 	}
