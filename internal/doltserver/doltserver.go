@@ -3702,6 +3702,8 @@ type databaseMigrationReceipt struct {
 var (
 	databaseMigrationBeforeTargetMutation       = func() {}
 	databaseMigrationBeforeIrreversibleMutation = func() {}
+	databaseMigrationBeforeCleanupRemoval       = func() {}
+	databaseMigrationBeforeClaimPublication     = func() {}
 )
 
 func databaseMigrationReceiptPath(townRoot, rigName string) string {
@@ -4449,19 +4451,44 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if !cleanupComplete {
 				return fmt.Errorf("migration cleanup claim is incomplete")
 			}
-			if err := withVerifiedDatabaseMigrationRoot(root, targetRel, receipt.SourceDigest, receipt.TargetToken, func(revalidate func() error) error {
-				if err := verifyDatabaseMigrationClaim(root, cleanupRel, receipt.SourceDigest, receipt.CleanupToken); err != nil {
+			if err := func() (result error) {
+				cleanupRoot, err := root.OpenRoot(cleanupRel)
+				if err != nil {
 					return err
 				}
-				databaseMigrationBeforeIrreversibleMutation()
-				if err := revalidate(); err != nil {
+				defer func() { result = errors.Join(result, cleanupRoot.Close()) }()
+				cleanupInfo, err := cleanupRoot.Stat(".")
+				if err != nil {
 					return err
 				}
-				if err := root.RemoveAll(cleanupRel); err != nil {
-					return fmt.Errorf("removing claimed migration source: %w", err)
+				revalidateCleanup := func() error {
+					if err := verifyDatabaseMigrationClaimAt(cleanupRoot, receipt.SourceDigest, receipt.CleanupToken); err != nil {
+						return err
+					}
+					currentInfo, err := root.Stat(cleanupRel)
+					if err != nil || !os.SameFile(cleanupInfo, currentInfo) {
+						return fmt.Errorf("migration cleanup identity changed")
+					}
+					return nil
 				}
-				return nil
-			}); err != nil {
+				if err := revalidateCleanup(); err != nil {
+					return err
+				}
+				return withVerifiedDatabaseMigrationRoot(root, targetRel, receipt.SourceDigest, receipt.TargetToken, func(revalidateTarget func() error) error {
+					databaseMigrationBeforeIrreversibleMutation()
+					if err := revalidateTarget(); err != nil {
+						return err
+					}
+					databaseMigrationBeforeCleanupRemoval()
+					if err := revalidateCleanup(); err != nil {
+						return err
+					}
+					if err := root.RemoveAll(cleanupRel); err != nil {
+						return fmt.Errorf("removing claimed migration source: %w", err)
+					}
+					return nil
+				})
+			}(); err != nil {
 				return err
 			}
 			if err := syncDatabaseMigrationDirectory(root, filepath.Dir(cleanupRel)); err != nil {
@@ -4690,19 +4717,29 @@ func ensureDatabaseMigrationTargetClaim(root *os.Root, targetRel, token string) 
 		return err
 	}
 	databaseMigrationBeforeTargetMutation()
-	targetExists, _, err = databaseMigrationRootPathState(root, targetRel)
-	if err != nil {
+	revalidatePreparedClaim := func() error {
+		targetExists, _, err = databaseMigrationRootPathState(root, targetRel)
+		if err != nil {
+			return err
+		}
+		if targetExists {
+			return fmt.Errorf("migration target appeared during claim publication")
+		}
+		currentClaimInfo, err := root.Stat(claimRel)
+		if err != nil || !os.SameFile(claimInfo, currentClaimInfo) {
+			return fmt.Errorf("prepared migration target claim identity changed")
+		}
+		if err := verifyDatabaseMigrationClaimTokenAt(claimRoot, token); err != nil {
+			return fmt.Errorf("verifying prepared migration target claim: %w", err)
+		}
+		return nil
+	}
+	if err := revalidatePreparedClaim(); err != nil {
 		return err
 	}
-	if targetExists {
-		return fmt.Errorf("migration target appeared during claim publication")
-	}
-	currentClaimInfo, err := root.Stat(claimRel)
-	if err != nil || !os.SameFile(claimInfo, currentClaimInfo) {
-		return fmt.Errorf("prepared migration target claim identity changed")
-	}
-	if err := verifyDatabaseMigrationClaimTokenAt(claimRoot, token); err != nil {
-		return fmt.Errorf("verifying prepared migration target claim: %w", err)
+	databaseMigrationBeforeClaimPublication()
+	if err := revalidatePreparedClaim(); err != nil {
+		return err
 	}
 	if err := root.Rename(claimRel, targetRel); err != nil {
 		return fmt.Errorf("publishing migration target claim: %w", err)

@@ -2121,6 +2121,58 @@ func TestMigrateRigFromBeadsPreservesReplacementPreparedTargetClaim(t *testing.T
 	}
 }
 
+func TestMigrateRigFromBeadsPreservesPreparedTargetClaimReplacedAtPublication(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "prepared-claim-publication-swap"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	receiptPath := databaseMigrationReceiptPath(townRoot, rigName)
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	previous := databaseMigrationBeforeClaimPublication
+	var once sync.Once
+	var hookErr error
+	var originalClaimPath string
+	var replacementClaimPath string
+	databaseMigrationBeforeClaimPublication = func() {
+		once.Do(func() {
+			receipt, err := readDatabaseMigrationReceipt(townRoot, receiptPath)
+			if err != nil {
+				hookErr = err
+				return
+			}
+			replacementClaimPath = targetPath + ".migration-target-" + receipt.TargetToken
+			originalClaimPath = replacementClaimPath + ".original"
+			if err := os.Rename(replacementClaimPath, originalClaimPath); err != nil {
+				hookErr = err
+				return
+			}
+			if err := os.MkdirAll(replacementClaimPath, 0o700); err != nil {
+				hookErr = err
+				return
+			}
+			hookErr = os.WriteFile(filepath.Join(replacementClaimPath, "foreign"), []byte("preserve"), 0o600)
+		})
+	}
+	t.Cleanup(func() { databaseMigrationBeforeClaimPublication = previous })
+
+	err := MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("migration error = %v, want prepared-claim identity refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetPath, "foreign")); !os.IsNotExist(err) {
+		t.Fatalf("replacement claim was published as target: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(replacementClaimPath, "foreign")); err != nil || string(got) != "preserve" {
+		t.Fatalf("replacement prepared claim changed: data = %q, err = %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(originalClaimPath, databaseMigrationCleanupClaimName)); err != nil || len(got) == 0 {
+		t.Fatalf("original prepared claim was not preserved: data = %q, err = %v", got, err)
+	}
+}
+
 func TestMigrateRigFromBeadsRestartsPartialStagePromotion(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
@@ -2451,6 +2503,69 @@ func TestMigrateRigFromBeadsPreservesClaimWhenTargetChangesBeforeRemoval(t *test
 	}
 	if _, err := os.Stat(filepath.Join(cleanupPath, ".dolt")); err != nil {
 		t.Fatalf("cleanup claim was removed after target changed: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsPreservesCleanupClaimReplacedAtRemoval(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "cleanup-removal-swap"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	cleanupPath := setupDoltDB(t, filepath.Dir(sourcePath), filepath.Base(sourcePath)+".migration-cleanup")
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupToken := strings.Repeat("a", 64)
+	if err := os.WriteFile(filepath.Join(cleanupPath, databaseMigrationCleanupClaimName), []byte(cleanupToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		CleanupToken: cleanupToken,
+		TargetToken:  setupDatabaseMigrationTargetClaim(t, targetPath),
+		Phase:        databaseMigrationCleanupRemoving,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimedPath := cleanupPath + ".original"
+	previous := databaseMigrationBeforeCleanupRemoval
+	var once sync.Once
+	var hookErr error
+	databaseMigrationBeforeCleanupRemoval = func() {
+		once.Do(func() {
+			if err := os.Rename(cleanupPath, claimedPath); err != nil {
+				hookErr = err
+				return
+			}
+			if err := os.MkdirAll(cleanupPath, 0o700); err != nil {
+				hookErr = err
+				return
+			}
+			hookErr = os.WriteFile(filepath.Join(cleanupPath, "foreign"), []byte("preserve"), 0o600)
+		})
+	}
+	t.Cleanup(func() { databaseMigrationBeforeCleanupRemoval = previous })
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "cleanup identity changed") {
+		t.Fatalf("migration error = %v, want cleanup-identity refusal", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(cleanupPath, "foreign")); err != nil || string(got) != "preserve" {
+		t.Fatalf("replacement cleanup claim changed: data = %q, err = %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(claimedPath, ".dolt")); err != nil {
+		t.Fatalf("original cleanup claim was not preserved: %v", err)
 	}
 }
 
