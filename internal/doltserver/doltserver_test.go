@@ -3821,6 +3821,175 @@ exit 0
 	}
 }
 
+func TestRemoveDatabaseUsesLiveCatalogForBranchControlCleanup(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
+case "$*" in
+  *"USE "*"control_db"*"DELETE FROM dolt_branch_control"*) exit 0 ;;
+  *"DELETE FROM dolt_branch_control"*) printf 'selected database is not live\n' >&2; exit 1 ;;
+  *"DROP DATABASE"*) exit 0 ;;
+esac
+exit 0
+`)
+	setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), "a_disk_only")
+
+	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
+		t.Fatalf("RemoveDatabase() error = %v, want live-catalog control database", err)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("database directory still exists: %v", err)
+	}
+}
+
+func TestRemoveDatabaseUsesLiveCatalogAgainstIsolatedServer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test manages a POSIX Dolt process")
+	}
+	doltPath, err := exec.LookPath("dolt")
+	if err != nil {
+		t.Skip("dolt binary not available")
+	}
+
+	portListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := portListener.Addr().(*net.TCPAddr).Port
+	_ = portListener.Close()
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	for _, name := range []string{"testdb_remove", "beads_global"} {
+		initRealDoltDatabaseForRemovalTest(t, doltPath, filepath.Join(dataDir, name))
+	}
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+
+	logFile, err := os.Create(filepath.Join(townRoot, "isolated-dolt.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(doltPath, "sql-server", "--host", "127.0.0.1", "--port", strconv.Itoa(port), "--data-dir", dataDir, "--loglevel", "error")
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	setProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = cmd.Wait()
+		close(done)
+	}()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			_ = cmd.Process.Signal(os.Interrupt)
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				_ = cmd.Process.Kill()
+				<-done
+			}
+			_ = logFile.Close()
+		})
+	}
+	t.Cleanup(stop)
+
+	ready := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			ready = true
+			break
+		}
+		select {
+		case <-done:
+			_ = logFile.Close()
+			data, _ := os.ReadFile(logFile.Name())
+			t.Fatalf("isolated Dolt exited during startup: %v: %s", waitErr, data)
+		default:
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !ready {
+		stop()
+		data, _ := os.ReadFile(logFile.Name())
+		t.Fatalf("isolated Dolt did not become ready: %s", data)
+	}
+
+	staged := filepath.Join(t.TempDir(), "a_disk_only")
+	initRealDoltDatabaseForRemovalTest(t, doltPath, staged)
+	if err := os.Rename(staged, filepath.Join(dataDir, "a_disk_only")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
+		t.Fatalf("RemoveDatabase() against isolated server: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "testdb_remove")); !os.IsNotExist(err) {
+		t.Fatalf("target directory still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "a_disk_only", ".dolt")); err != nil {
+		t.Fatalf("filesystem-only database was mutated: %v", err)
+	}
+	live, err := listDatabasesRemote(DefaultConfig(townRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slicesContain(live, "testdb_remove") || slicesContain(live, "a_disk_only") || !slicesContain(live, "beads_global") {
+		t.Fatalf("live databases = %v, want only protected control database", live)
+	}
+}
+
+func TestRemoveDatabaseResumesAfterPostDropBranchControlFailure(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "branch-delete-attempted")
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
+case "$*" in
+  *"DROP DATABASE"*) mv "$REMOVE_DB_PATH" "$REMOVE_DB_PATH.dropped"; exit 0 ;;
+  *"DELETE FROM dolt_branch_control"*)
+    if [ ! -f "$BRANCH_MARKER" ]; then
+      : > "$BRANCH_MARKER"
+	  printf '{"rows":[{"Database":"control_db"}]}\n' > "$GT_TEST_SHOW_DATABASES_FILE"
+      printf 'temporary branch-control failure\n' >&2
+      exit 1
+    fi
+    exit 0 ;;
+esac
+exit 0
+`)
+	t.Setenv("BRANCH_MARKER", marker)
+	t.Setenv("REMOVE_DB_PATH", dbPath)
+	catalogFile := filepath.Join(t.TempDir(), "show-databases.json")
+	if err := os.WriteFile(catalogFile, []byte("{\"rows\":[{\"Database\":\"testdb_remove\"},{\"Database\":\"control_db\"}]}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_TEST_SHOW_DATABASES_FILE", catalogFile)
+	receiptPath := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "testdb_remove.json")
+
+	err := RemoveDatabase(townRoot, "testdb_remove", true)
+	if err == nil || !strings.Contains(err.Error(), "branch-control") {
+		t.Fatalf("first RemoveDatabase() error = %v, want branch-control failure", err)
+	}
+	if _, err := os.Stat(receiptPath); err != nil {
+		t.Fatalf("durable cleanup receipt missing after committed DROP: %v", err)
+	}
+	info, err := os.Stat(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("cleanup receipt mode = %v, want 0600", info.Mode().Perm())
+	}
+
+	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
+		t.Fatalf("resumed RemoveDatabase() error = %v", err)
+	}
+	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
+		t.Fatalf("cleanup receipt still exists after successful resume: %v", err)
+	}
+}
+
 func TestRemoveDatabaseAllowsAlreadyAbsentCatalogEntry(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
 case "$*" in
@@ -3859,13 +4028,45 @@ func setupRemoveDatabaseSQLTest(t *testing.T, behavior string) (string, string) 
 	t.Setenv("GT_DOLT_PORT", strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
 
 	binDir := t.TempDir()
-	stub := "#!/bin/sh\n" + behavior
+	t.Setenv("GT_TEST_SHOW_DATABASES_JSON", "{\"rows\":[{\"Database\":\"testdb_remove\"},{\"Database\":\"control_db\"}]}")
+	stub := `#!/bin/sh
+case "$*" in
+  *"SHOW DATABASES"*)
+    if [ -n "$GT_TEST_SHOW_DATABASES_FILE" ]; then
+      cat "$GT_TEST_SHOW_DATABASES_FILE"
+    else
+      printf '%s\n' "$GT_TEST_SHOW_DATABASES_JSON"
+    fi
+    exit 0 ;;
+esac
+` + behavior
 	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	return townRoot, dbPath
+}
+
+func initRealDoltDatabaseForRemovalTest(t *testing.T, doltPath, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(doltPath, "init", "--name", "Gas Town Test", "--email", "test@example.invalid")
+	cmd.Dir = path
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("initializing real Dolt database: %v: %s", err, output)
+	}
+}
+
+func slicesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRecoverReadOnly_NoServer(t *testing.T) {

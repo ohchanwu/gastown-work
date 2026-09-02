@@ -3978,17 +3978,46 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 	return owners
 }
 
+const databaseCleanupReceiptVersion = 1
+
+type databaseCleanupReceipt struct {
+	Version  int    `json:"version"`
+	Database string `json:"database"`
+	Force    bool   `json:"force"`
+}
+
 // RemoveDatabase removes an orphaned database directory from .dolt-data/.
 // The caller should verify the database is actually orphaned before calling this.
 // If the Dolt server is running, it will DROP the database first.
 // If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
 func RemoveDatabase(townRoot, dbName string, force bool) error {
+	if !validSQLName(dbName) || dbName == "." || dbName == ".." {
+		return fmt.Errorf("invalid database name %q: must match [a-zA-Z0-9_.-]+", dbName)
+	}
 	if isProtectedSharedServerDatabase(dbName) {
 		return fmt.Errorf("database %q is a protected shared-server database", dbName)
 	}
 
 	config := DefaultConfig(townRoot)
 	dbPath := filepath.Join(config.DataDir, dbName)
+	receiptPath := databaseCleanupReceiptPath(townRoot, dbName)
+	receipt, receiptErr := readDatabaseCleanupReceipt(receiptPath)
+	if receiptErr == nil {
+		if receipt.Database != dbName {
+			return fmt.Errorf("database cleanup receipt does not match %q", dbName)
+		}
+		if receipt.Force && !force {
+			return fmt.Errorf("database %q has a pending forced cleanup — rerun with --force", dbName)
+		}
+		running, _, _ := IsRunning(townRoot)
+		if !running {
+			return fmt.Errorf("database %q has a pending live-server cleanup — start the server and retry", dbName)
+		}
+		return resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath, receipt)
+	}
+	if !os.IsNotExist(receiptErr) {
+		return fmt.Errorf("reading database cleanup receipt for %q: %w", dbName, receiptErr)
+	}
 
 	// Verify the directory exists
 	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
@@ -3999,16 +4028,7 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 	// This prevents destroying legitimate databases that happen to be unreferenced.
 	running, _, _ := IsRunning(townRoot)
 	if !force {
-		if running {
-			// Server is up — check via SQL for user tables
-			hasData, inspectErr := databaseHasUserTables(townRoot, dbName)
-			if inspectErr != nil {
-				return fmt.Errorf("inspecting user tables in database %q: %w", dbName, inspectErr)
-			}
-			if hasData {
-				return fmt.Errorf("database %q has user tables — use --force to remove", dbName)
-			}
-		} else {
+		if !running {
 			// Server is down — check via filesystem size as a safety proxy. (gt-xvh)
 			// Databases with >1MB of data are almost certainly not empty orphans.
 			// Without the server, we can't query tables, so size is the best heuristic.
@@ -4021,35 +4041,12 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 		}
 	}
 
-	// If server is running, DROP the database and then clean up branch control entries.
-	// In Dolt 1.81.x, DROP DATABASE does not automatically remove dolt_branch_control
-	// entries for the dropped database. These stale entries cause the database directory
-	// to be recreated when connections reference the database name (gt-zlv7l).
 	if running {
-		identifier := strings.ReplaceAll(dbName, "`", "``")
-		controlDB, controlErr := branchControlDatabase(townRoot, dbName)
-		if controlErr != nil {
-			return controlErr
+		receipt = databaseCleanupReceipt{Version: databaseCleanupReceiptVersion, Database: dbName, Force: force}
+		if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
+			return fmt.Errorf("writing database cleanup receipt for %q: %w", dbName, err)
 		}
-
-		// Try to DROP — capture errors for read-only detection (gt-r1cyd)
-		if dropErr := serverExecSQL(townRoot, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", identifier)); dropErr != nil {
-			if IsReadOnlyError(dropErr.Error()) {
-				return fmt.Errorf("DROP put server into read-only mode: %w", dropErr)
-			}
-			if !isDatabaseNotFoundError(dropErr) {
-				return fmt.Errorf("dropping database %q: %w", dbName, dropErr)
-			}
-		}
-
-		// dolt_branch_control is global but exposed through each loaded Dolt database.
-		// Select a surviving database so a failed DROP cannot leave branch-control state
-		// partially removed and a successful DROP cannot invalidate the cleanup context.
-		controlIdentifier := strings.ReplaceAll(controlDB, "`", "``")
-		branchQuery := fmt.Sprintf("USE `%s`; DELETE FROM dolt_branch_control WHERE `database` = '%s'", controlIdentifier, EscapeSQL(dbName))
-		if err := serverExecSQL(townRoot, branchQuery); err != nil {
-			return fmt.Errorf("cleaning branch-control entries for database %q: %w", dbName, err)
-		}
+		return resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath, receipt)
 	}
 
 	InvalidateDBCache() // Database removed — bust the cache.
@@ -4062,17 +4059,162 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 	return nil
 }
 
-func branchControlDatabase(townRoot, removedDB string) (string, error) {
-	databases, err := ListDatabases(townRoot)
-	if err != nil {
-		return "", fmt.Errorf("listing databases for branch-control cleanup: %w", err)
+// PendingDatabaseCleanupNames returns valid durable live-cleanup receipts.
+func PendingDatabaseCleanupNames(townRoot string) ([]string, error) {
+	dir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
 	}
-	for _, database := range databases {
-		if database != removedDB {
-			return database, nil
+	if err != nil {
+		return nil, fmt.Errorf("reading pending database cleanup directory: %w", err)
+	}
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		receipt, err := readDatabaseCleanupReceipt(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("reading pending database cleanup %q: %w", entry.Name(), err)
+		}
+		if entry.Name() != receipt.Database+".json" {
+			return nil, fmt.Errorf("pending database cleanup %q does not match receipt database", entry.Name())
+		}
+		names = append(names, receipt.Database)
+	}
+	return names, nil
+}
+
+func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, receipt databaseCleanupReceipt) error {
+	controlDB, targetLive, err := liveBranchControlDatabase(townRoot, dbName)
+	if err != nil {
+		return err
+	}
+	if targetLive && !receipt.Force {
+		hasData, inspectErr := databaseHasUserTables(townRoot, dbName)
+		if inspectErr != nil {
+			return clearUnmutatedDatabaseCleanupReceipt(receiptPath, fmt.Errorf("inspecting user tables in database %q: %w", dbName, inspectErr))
+		}
+		if hasData {
+			return clearUnmutatedDatabaseCleanupReceipt(receiptPath, fmt.Errorf("database %q has user tables — use --force to remove", dbName))
 		}
 	}
-	return "", fmt.Errorf("no surviving database available for branch-control cleanup of %q", removedDB)
+	if controlDB == "" {
+		err := fmt.Errorf("no surviving live database available for branch-control cleanup of %q", dbName)
+		if targetLive {
+			return clearUnmutatedDatabaseCleanupReceipt(receiptPath, err)
+		}
+		return err
+	}
+
+	controlIdentifier := strings.ReplaceAll(controlDB, "`", "``")
+	if err := serverExecSQL(townRoot, fmt.Sprintf("USE `%s`; SELECT 1", controlIdentifier)); err != nil {
+		preflightErr := fmt.Errorf("preflighting live branch-control database %q: %w", controlDB, err)
+		if targetLive {
+			return clearUnmutatedDatabaseCleanupReceipt(receiptPath, preflightErr)
+		}
+		return preflightErr
+	}
+
+	if targetLive {
+		identifier := strings.ReplaceAll(dbName, "`", "``")
+		if dropErr := serverExecSQL(townRoot, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", identifier)); dropErr != nil {
+			if IsReadOnlyError(dropErr.Error()) {
+				return fmt.Errorf("DROP put server into read-only mode; database cleanup receipt preserved: %w", dropErr)
+			}
+			if !isDatabaseNotFoundError(dropErr) {
+				return fmt.Errorf("dropping database %q; database cleanup receipt preserved: %w", dbName, dropErr)
+			}
+		}
+		InvalidateDBCache()
+	}
+
+	// Dolt does not remove branch-control rows during DROP. Keeping a durable
+	// receipt until this idempotent DELETE succeeds makes a committed DROP
+	// resumable after transport or control-database failure.
+	branchQuery := fmt.Sprintf("USE `%s`; DELETE FROM dolt_branch_control WHERE `database` = '%s'", controlIdentifier, EscapeSQL(dbName))
+	if err := serverExecSQL(townRoot, branchQuery); err != nil {
+		return fmt.Errorf("cleaning branch-control entries for database %q; database cleanup receipt preserved: %w", dbName, err)
+	}
+	if err := os.RemoveAll(dbPath); err != nil {
+		return fmt.Errorf("removing database directory; database cleanup receipt preserved: %w", err)
+	}
+	if err := clearDatabaseCleanupReceipt(receiptPath); err != nil {
+		return fmt.Errorf("database removed but cleanup receipt could not be cleared: %w", err)
+	}
+	InvalidateDBCache()
+	return nil
+}
+
+func liveBranchControlDatabase(townRoot, removedDB string) (controlDB string, targetLive bool, err error) {
+	databases, err := listDatabasesRemote(DefaultConfig(townRoot))
+	if err != nil {
+		return "", false, fmt.Errorf("listing live databases for branch-control cleanup: %w", err)
+	}
+	for _, database := range databases {
+		if database == removedDB {
+			targetLive = true
+			continue
+		}
+		if controlDB == "" {
+			controlDB = database
+		}
+	}
+	return controlDB, targetLive, nil
+}
+
+func databaseCleanupReceiptPath(townRoot, dbName string) string {
+	return filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", dbName+".json")
+}
+
+func writeDatabaseCleanupReceipt(path string, receipt databaseCleanupReceipt) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	return atomicfile.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+func readDatabaseCleanupReceipt(path string) (databaseCleanupReceipt, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return databaseCleanupReceipt{}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return databaseCleanupReceipt{}, fmt.Errorf("database cleanup receipt is not a private regular file")
+	}
+	var receipt databaseCleanupReceipt
+	if err := json.NewDecoder(f).Decode(&receipt); err != nil {
+		return databaseCleanupReceipt{}, err
+	}
+	if receipt.Version != databaseCleanupReceiptVersion || !validSQLName(receipt.Database) || receipt.Database == "." || receipt.Database == ".." {
+		return databaseCleanupReceipt{}, fmt.Errorf("invalid database cleanup receipt")
+	}
+	return receipt, nil
+}
+
+func clearUnmutatedDatabaseCleanupReceipt(path string, operationErr error) error {
+	if err := clearDatabaseCleanupReceipt(path); err != nil {
+		return errors.Join(operationErr, fmt.Errorf("clearing unmutated database cleanup receipt: %w", err))
+	}
+	return operationErr
+}
+
+func clearDatabaseCleanupReceipt(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_ = os.Remove(filepath.Dir(path))
+	return nil
 }
 
 func isDatabaseNotFoundError(err error) bool {

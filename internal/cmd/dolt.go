@@ -1360,6 +1360,24 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
+	pending, err := doltserver.PendingDatabaseCleanupNames(townRoot)
+	if err != nil {
+		return fmt.Errorf("finding pending database cleanups: %w", err)
+	}
+	if doltCleanupDry && len(pending) > 0 {
+		fmt.Printf("%s %d pending database cleanup(s) require a non-dry-run retry\n", style.Bold.Render("!"), len(pending))
+	} else {
+		for _, name := range pending {
+			if err := doltserver.RemoveDatabase(townRoot, name, doltCleanupForce); err != nil {
+				resumeErr := fmt.Errorf("resuming pending database cleanup %s: %w", name, err)
+				reportErr := renderDoltCleanupListenerReport(os.Stdout, false, func() ([]doltserver.LocalDoltServer, error) {
+					return doltserver.InventoryLocalDoltServersWithError(townRoot)
+				})
+				return errors.Join(resumeErr, reportErr)
+			}
+			fmt.Printf("  %s Resumed removal of %s\n", style.Bold.Render("✓"), name)
+		}
+	}
 	orphans, err := doltserver.FindOrphanedDatabases(townRoot)
 	if err != nil {
 		return fmt.Errorf("finding orphaned databases: %w", err)
@@ -1425,6 +1443,7 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	removed := 0
 	var cleanupErr error
 	for _, o := range orphans {
+		serverWasRunning, _, _ := doltserver.IsRunning(townRoot)
 		if err := doltserver.RemoveDatabase(townRoot, o.Name, doltCleanupForce); err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("removing database %s: %w", o.Name, err))
 			// If DROP caused read-only, stop immediately and recover (gt-r1cyd)
@@ -1444,6 +1463,10 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("  %s Removed %s\n", style.Bold.Render("✓"), o.Name)
 		removed++
+
+		if !serverWasRunning {
+			continue
+		}
 
 		// Health check after each DROP to catch read-only early (gt-r1cyd)
 		readOnly, probeErr := doltserver.CheckReadOnly(townRoot)

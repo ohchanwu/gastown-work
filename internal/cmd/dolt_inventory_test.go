@@ -157,7 +157,9 @@ func TestRunDoltCleanupStopsAfterWriteProbeFailure(t *testing.T) {
 	binDir := t.TempDir()
 	stub := `#!/bin/sh
 case "$*" in
+  *"SHOW DATABASES"*) printf '{"rows":[{"Database":"testdb_a"},{"Database":"testdb_b"}]}\n'; exit 0 ;;
   *"SHOW TABLES"*) exit 0 ;;
+  *"SELECT 1"*) exit 0 ;;
   *"DROP DATABASE"*) exit 0 ;;
   *"DELETE FROM dolt_branch_control"*) exit 0 ;;
   *"__gt_health_probe"*) printf 'probe unavailable\n' >&2; exit 1 ;;
@@ -222,6 +224,71 @@ func TestRunDoltCleanupStopsWhenDatabaseInventoryFails(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(townRoot, ".dolt-data", "testdb_unverified")); statErr != nil {
 		t.Fatalf("orphan was not preserved: %v", statErr)
+	}
+}
+
+func TestRunDoltCleanupRemovesAllOrphansWhenServerOffline(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"testdb_offline_a", "testdb_offline_b"} {
+		noms := filepath.Join(townRoot, ".dolt-data", name, ".dolt", "noms")
+		if err := os.MkdirAll(noms, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(noms, "manifest"), []byte("test"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Chdir(townRoot)
+	t.Setenv("GT_DOLT_PORT", "1")
+	oldDry, oldForce := doltCleanupDry, doltCleanupForce
+	doltCleanupDry, doltCleanupForce = false, false
+	t.Cleanup(func() { doltCleanupDry, doltCleanupForce = oldDry, oldForce })
+
+	var runErr error
+	output := captureStdout(t, func() { runErr = runDoltCleanup(nil, nil) })
+	if runErr != nil {
+		t.Fatalf("runDoltCleanup() error = %v; output = %q", runErr, output)
+	}
+	for _, name := range []string{"testdb_offline_a", "testdb_offline_b"} {
+		if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", name)); !os.IsNotExist(err) {
+			t.Fatalf("offline orphan %s still exists: %v", name, err)
+		}
+	}
+}
+
+func TestRunDoltCleanupDryRunPreservesPendingReceipt(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "testdb_pending.json")
+	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptPath, []byte("{\"version\":1,\"database\":\"testdb_pending\",\"force\":false}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(townRoot)
+	t.Setenv("GT_DOLT_PORT", "1")
+	oldDry, oldForce := doltCleanupDry, doltCleanupForce
+	doltCleanupDry, doltCleanupForce = true, false
+	t.Cleanup(func() { doltCleanupDry, doltCleanupForce = oldDry, oldForce })
+
+	var runErr error
+	output := captureStdout(t, func() { runErr = runDoltCleanup(nil, nil) })
+	if runErr != nil {
+		t.Fatalf("runDoltCleanup() error = %v; output = %q", runErr, output)
+	}
+	if _, err := os.Stat(receiptPath); err != nil {
+		t.Fatalf("dry-run removed pending receipt: %v", err)
+	}
+	if !strings.Contains(output, "pending database cleanup") {
+		t.Fatalf("dry-run output omitted pending cleanup: %q", output)
 	}
 }
 
