@@ -95,6 +95,7 @@ func TestSparseCheckoutCheck_NoGitRepos(t *testing.T) {
 // initGitRepo creates a minimal git repo with an initial commit.
 func initGitRepo(t *testing.T, path string) {
 	t.Helper()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	if err := os.MkdirAll(path, 0755); err != nil {
 		t.Fatal(err)
 	}

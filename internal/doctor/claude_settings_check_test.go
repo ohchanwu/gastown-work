@@ -743,6 +743,7 @@ func TestClaudeSettingsCheck_WrongLocationPolecat(t *testing.T) {
 // initTestGitRepo initializes a git repo in the given directory for settings tests.
 func initTestGitRepo(t *testing.T, dir string) {
 	t.Helper()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	cmds := [][]string{
 		{"git", "init"},
 		{"git", "config", "user.email", "test@test.com"},

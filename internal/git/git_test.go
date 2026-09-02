@@ -1784,6 +1784,7 @@ func TestPushSubmoduleCommit_ShortSHA(t *testing.T) {
 }
 
 func TestSubmoduleChanges_SkipsClaudeWorktrees(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	// Verify that SubmoduleChanges filters out .claude/ paths.
 	// Claude Code creates worktrees under .claude/worktrees/ which have .git
 	// files that git may report as gitlinks (mode 160000). These are not
