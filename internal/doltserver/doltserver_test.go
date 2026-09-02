@@ -2770,6 +2770,157 @@ func TestMigrateRigFromBeadsPreservesReplacementAfterFinalCleanupRevalidation(t 
 	}
 }
 
+func TestMigrateRigFromBeadsPreservesReplacementAtCleanupEmptyMove(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "cleanup-empty-swap"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	targetToken := setupDatabaseMigrationTargetClaim(t, targetPath)
+	cleanupPath := sourcePath + ".migration-cleanup-" + targetToken
+	if err := os.MkdirAll(cleanupPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cleanupToken := strings.Repeat("a", 64)
+	if err := os.WriteFile(filepath.Join(cleanupPath, databaseMigrationCleanupClaimName), []byte(cleanupToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := databaseMigrationReceiptPath(townRoot, rigName)
+	if err := writeDatabaseMigrationReceipt(receiptPath, databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		CleanupToken: cleanupToken,
+		TargetToken:  targetToken,
+		Phase:        databaseMigrationCleanupEmpty,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	originalPath := cleanupPath + ".original"
+	previous := databaseMigrationBeforeCleanupEmptyMove
+	var once sync.Once
+	var hookErr error
+	databaseMigrationBeforeCleanupEmptyMove = func() {
+		once.Do(func() {
+			if err := os.Rename(cleanupPath, originalPath); err != nil {
+				hookErr = err
+				return
+			}
+			if err := os.MkdirAll(cleanupPath, 0o700); err != nil {
+				hookErr = err
+				return
+			}
+			hookErr = os.WriteFile(filepath.Join(cleanupPath, "foreign"), []byte("preserve"), 0o600)
+		})
+	}
+	t.Cleanup(func() { databaseMigrationBeforeCleanupEmptyMove = previous })
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "cleanup identity changed") {
+		t.Fatalf("migration error = %v, want cleanup-identity refusal", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(cleanupPath, "foreign")); err != nil || string(got) != "preserve" {
+		t.Fatalf("replacement cleanup changed: data = %q, err = %v", got, err)
+	}
+	if info, err := os.Stat(originalPath); err != nil || !info.IsDir() {
+		t.Fatalf("original cleanup directory was not preserved: %v", err)
+	}
+	if _, err := os.Stat(receiptPath); err != nil {
+		t.Fatalf("migration receipt was not preserved: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsResumesCleanupEmptyAfterClaimRemoval(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "cleanup-empty-resume"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	targetToken := setupDatabaseMigrationTargetClaim(t, targetPath)
+	cleanupPath := sourcePath + ".migration-cleanup-" + targetToken
+	if err := os.MkdirAll(cleanupPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		CleanupToken: strings.Repeat("a", 64),
+		TargetToken:  targetToken,
+		Phase:        databaseMigrationCleanupEmpty,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
+		t.Fatalf("resume cleanup-empty migration: %v", err)
+	}
+	if _, err := os.Stat(cleanupPath); !os.IsNotExist(err) {
+		t.Fatalf("cleanup path remains after resume: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsPreservesUnclaimedCleanupEmptyData(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "cleanup-empty-foreign"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	targetToken := setupDatabaseMigrationTargetClaim(t, targetPath)
+	cleanupPath := sourcePath + ".migration-cleanup-" + targetToken
+	if err := os.MkdirAll(cleanupPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cleanupPath, "foreign"), []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		CleanupToken: strings.Repeat("a", 64),
+		TargetToken:  targetToken,
+		Phase:        databaseMigrationCleanupEmpty,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if err == nil || !strings.Contains(err.Error(), "unclaimed entry") {
+		t.Fatalf("migration error = %v, want unclaimed-data refusal", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(cleanupPath, "foreign")); err != nil || string(got) != "preserve" {
+		t.Fatalf("unclaimed cleanup data changed: data = %q, err = %v", got, err)
+	}
+}
+
 func TestMigrateRigFromBeadsRollsBackReplacementMovedAfterSourceValidation(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()

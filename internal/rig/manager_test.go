@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
@@ -1605,6 +1606,33 @@ func TestRegisterRig_DetectsAndPersistsCustomPushURL(t *testing.T) {
 	}
 	if entry.PushURL != forkURL {
 		t.Errorf("PushURL = %q, want %q", entry.PushURL, forkURL)
+	}
+}
+
+func TestRegisterRigPersistsCommittedRoute(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	rigName := "adopted"
+	if err := os.MkdirAll(filepath.Join(root, rigName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	if _, err := manager.RegisterRig(RegisterRigOptions{Name: rigName, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	routes, err := beads.LoadRoutes(filepath.Join(root, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Prefix != deriveBeadsPrefix(rigName)+"-" || routes[0].Path != rigName || routes[0].PendingReservations != "" {
+		t.Fatalf("routes = %v, want one committed adopted route", routes)
+	}
+	persisted, err := config.LoadRigsConfig(filepath.Join(root, "mayor", "rigs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persisted.Rigs[rigName]; !ok {
+		t.Fatalf("persisted rigs = %v, want %q", persisted.Rigs, rigName)
 	}
 }
 

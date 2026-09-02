@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -1171,55 +1170,6 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("adopting rig: %w", err)
 	}
-
-	// Add route to town-level routes.jsonl for prefix-based routing
-	var routeReservation beads.RouteReservation
-	if result.BeadsPrefix != "" {
-		routePath := name
-		mayorRigBeads := filepath.Join(townRoot, name, "mayor", "rig", ".beads")
-		if _, err := os.Stat(mayorRigBeads); err == nil {
-			routePath = name + "/mayor/rig"
-		}
-		reservedRoute := beads.Route{
-			Prefix: result.BeadsPrefix + "-",
-			Path:   routePath,
-		}
-		var err error
-		routeReservation, err = beads.ReserveRoute(townRoot, reservedRoute)
-		if err != nil {
-			return fmt.Errorf("reserving issue prefix route: %w", err)
-		}
-	}
-	registrationCommitted := false
-	defer func() {
-		if !registrationCommitted {
-			_ = beads.ReleaseRouteReservation(townRoot, routeReservation)
-		}
-	}()
-
-	entry, ok := rigsConfig.Rigs[name]
-	if !ok {
-		return fmt.Errorf("adopted rig %q missing from registry update", name)
-	}
-	if err := config.UpdateRigsConfig(rigsPath, func(current *config.RigsConfig) error {
-		current.Rigs[name] = entry
-		return nil
-	}); err != nil {
-		return fmt.Errorf("saving rigs config: %w", err)
-	}
-	if err := beads.CommitRouteReservation(townRoot, routeReservation); err != nil {
-		rollbackErr := config.UpdateRigsConfig(rigsPath, func(current *config.RigsConfig) error {
-			if currentEntry, ok := current.Rigs[name]; ok && reflect.DeepEqual(currentEntry, entry) {
-				delete(current.Rigs, name)
-			}
-			return nil
-		})
-		if rollbackErr != nil {
-			return fmt.Errorf("committing issue prefix route: %v (also rolling back rigs.json: %w)", err, rollbackErr)
-		}
-		return fmt.Errorf("committing issue prefix route: %w", err)
-	}
-	registrationCommitted = true
 
 	// Add adopted rig to daemon.json patrol config (witness + refinery rigs arrays)
 	if err := config.AddRigToDaemonPatrols(townRoot, name); err != nil {

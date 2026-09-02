@@ -620,6 +620,30 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		}
 	}
 
+	// Reserve the final detected prefix before creating any central database or
+	// agent state. A late collision must leave no resources behind.
+	var routeReservation beads.RouteReservation
+	if opts.BeadsPrefix != "" {
+		routePath := opts.Name
+		mayorRigBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
+		if _, err := os.Stat(mayorRigBeads); err == nil {
+			routePath = opts.Name + "/mayor/rig"
+		}
+		var err error
+		routeReservation, err = beads.ReserveRoute(m.townRoot, beads.Route{
+			Prefix: opts.BeadsPrefix + "-",
+			Path:   routePath,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("reserving issue prefix route: %w", err)
+		}
+		defer func() {
+			if !success {
+				_ = beads.ReleaseRouteReservation(m.townRoot, routeReservation)
+			}
+		}()
+	}
+
 	// Create the server-side database after tracked prefix detection but before
 	// either tracked or untracked beads initialization. bd init falls back to an
 	// embedded store when the requested central database does not exist yet.
@@ -864,32 +888,6 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	if err := commands.ProvisionFor(polecatsPath, defaultAgentName); err != nil {
 		// Non-fatal: commands are convenience, not critical
 		fmt.Printf("  %s Could not scaffold polecat commands: %v\n", "!", err)
-	}
-
-	// Register route in town-level routes.jsonl BEFORE creating agent beads.
-	// initAgentBeads calls ResolveRoutingTarget which needs the route to exist.
-	// Without this, agent bead creation logs "no route found" warnings (#1424).
-	var routeReservation beads.RouteReservation
-	if opts.BeadsPrefix != "" {
-		routePath := opts.Name
-		mayorRigBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
-		if _, err := os.Stat(mayorRigBeads); err == nil {
-			routePath = opts.Name + "/mayor/rig"
-		}
-		route := beads.Route{
-			Prefix: opts.BeadsPrefix + "-",
-			Path:   routePath,
-		}
-		var err error
-		routeReservation, err = beads.ReserveRoute(m.townRoot, route)
-		if err != nil {
-			return nil, fmt.Errorf("reserving issue prefix route: %w", err)
-		}
-		defer func() {
-			if !success {
-				_ = beads.ReleaseRouteReservation(m.townRoot, routeReservation)
-			}
-		}()
 	}
 
 	// Create rig-level settings directory (used by gt config for rig overrides)
@@ -1754,6 +1752,23 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 	if err := beads.CheckPrefixAvailable(m.townRoot, result.BeadsPrefix+"-", opts.Name); err != nil {
 		return nil, fmt.Errorf("prefix collision (prefix %q): %w", result.BeadsPrefix, err)
 	}
+	routePath := opts.Name
+	if _, err := os.Stat(filepath.Join(rigPath, "mayor", "rig", ".beads")); err == nil {
+		routePath = opts.Name + "/mayor/rig"
+	}
+	routeReservation, err := beads.ReserveRoute(m.townRoot, beads.Route{
+		Prefix: result.BeadsPrefix + "-",
+		Path:   routePath,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reserving issue prefix route: %w", err)
+	}
+	registrationCommitted := false
+	defer func() {
+		if !registrationCommitted {
+			_ = beads.ReleaseRouteReservation(m.townRoot, routeReservation)
+		}
+	}()
 
 	// Determine push URL: explicit option > existing config > auto-detect from remotes.
 	// Only explicit option and config.json with non-empty push_url are "authoritative"
@@ -1837,8 +1852,8 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 		}
 	}
 
-	// Register in town config
-	m.config.Rigs[opts.Name] = config.RigEntry{
+	// Register in town config only after all repository mutations succeed.
+	entry := config.RigEntry{
 		GitURL:      result.GitURL,
 		PushURL:     pushURL,
 		UpstreamURL: opts.UpstreamURL,
@@ -1847,6 +1862,32 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 			Prefix: result.BeadsPrefix,
 		},
 	}
+	rigsPath := filepath.Join(m.townRoot, "mayor", "rigs.json")
+	var savedConfig *config.RigsConfig
+	if err := config.UpdateRigsConfig(rigsPath, func(current *config.RigsConfig) error {
+		current.Rigs[opts.Name] = entry
+		savedConfig = current
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("registering rig in rigs.json: %w", err)
+	}
+	*m.config = *savedConfig
+	if err := beads.CommitRouteReservation(m.townRoot, routeReservation); err != nil {
+		var rolledBackConfig *config.RigsConfig
+		rollbackErr := config.UpdateRigsConfig(rigsPath, func(current *config.RigsConfig) error {
+			if currentEntry, ok := current.Rigs[opts.Name]; ok && reflect.DeepEqual(currentEntry, entry) {
+				delete(current.Rigs, opts.Name)
+			}
+			rolledBackConfig = current
+			return nil
+		})
+		if rollbackErr != nil {
+			return nil, fmt.Errorf("committing issue prefix route: %v (also rolling back rigs.json: %w)", err, rollbackErr)
+		}
+		*m.config = *rolledBackConfig
+		return nil, fmt.Errorf("committing issue prefix route: %w", err)
+	}
+	registrationCommitted = true
 
 	return result, nil
 }
