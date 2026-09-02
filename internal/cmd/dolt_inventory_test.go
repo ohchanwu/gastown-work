@@ -158,6 +158,7 @@ func TestRunDoltCleanupStopsAfterWriteProbeFailure(t *testing.T) {
 	stub := `#!/bin/sh
 case "$*" in
   *"SHOW DATABASES"*) printf '{"rows":[{"Database":"testdb_a"},{"Database":"testdb_b"}]}\n'; exit 0 ;;
+  *"FROM dolt_log"*) printf '{"rows":[{"incarnation":"0123456789abcdefghijklmnopqrstuv"}]}\n'; exit 0 ;;
   *"SHOW TABLES"*) exit 0 ;;
   *"SELECT 1"*) exit 0 ;;
   *"DROP DATABASE"*) exit 0 ;;
@@ -269,7 +270,7 @@ func TestRunDoltCleanupDryRunPreservesPendingReceipt(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(receiptPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(receiptPath, []byte("{\"version\":1,\"database\":\"testdb_pending\",\"force\":false}\n"), 0o600); err != nil {
+	if err := os.WriteFile(receiptPath, []byte("{\"version\":3,\"database\":\"testdb_pending\",\"force\":false,\"phase\":\"prepared\",\"incarnation\":\"dolt-root:0123456789abcdefghijklmnopqrstuv/manifest-sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
