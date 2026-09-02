@@ -5748,6 +5748,53 @@ func TestRemoveDatabaseIfCreationTokenRemovesReferencedIncompleteRig(t *testing.
 	}
 }
 
+func TestRecoverDatabaseCreationTokenAfterCreateBeforeStamp(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	dbName := "crash_created"
+	token := "create-generation"
+	if err := prepareDatabaseCreationIntent(townRoot, dbName, token, 0); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	dbPath := filepath.Join(townRoot, ".dolt-data", dbName)
+	if err := os.MkdirAll(filepath.Join(dbPath, ".dolt", "noms"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"), []byte("created"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverDatabaseCreationToken(townRoot, dbName, token); err != nil {
+		t.Fatalf("RecoverDatabaseCreationToken() error = %v", err)
+	}
+	if err := verifyDatabaseCreationToken(dbPath, token); err != nil {
+		t.Fatalf("recovered token not stamped: %v", err)
+	}
+	if _, err := os.Stat(databaseCreationIntentPath(townRoot, dbName)); !os.IsNotExist(err) {
+		t.Fatalf("creation intent remains after recovery: %v", err)
+	}
+}
+
+func TestRemoveDatabasePreservesPendingCreationIntent(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	dbName := "pending_create"
+	if err := prepareDatabaseCreationIntent(townRoot, dbName, "create-generation", 0); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(townRoot, ".dolt-data", dbName)
+	if err := os.MkdirAll(filepath.Join(dbPath, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveDatabase(townRoot, dbName, true); err == nil || !strings.Contains(err.Error(), "creation intent") {
+		t.Fatalf("generic cleanup crossed pending creation intent: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("generic cleanup mutated pending creation: %v", err)
+	}
+}
+
 func TestRemoveDatabaseIfCreationTokenPreservesWrongGeneration(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
 	if err := os.WriteFile(filepath.Join(dbPath, databaseCreationOwnerFile), []byte("current-generation\n"), 0o600); err != nil {

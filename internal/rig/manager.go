@@ -1344,7 +1344,12 @@ func migrateAndValidateAddRegistration(townRoot, name string, route beads.Route,
 	databaseOwnership, err := readAddDatabaseOwnership(rigPath)
 	if os.IsNotExist(err) {
 		if entry.RegistrationDatabaseToken != "" {
-			return fmt.Errorf("pending add database ownership is missing for %q", name)
+			if !routeCommitted {
+				return fmt.Errorf("pending add database ownership is missing for %q", name)
+			}
+			if err := doltserver.DatabaseCreationTokenReleased(townRoot, name, entry.RegistrationDatabaseToken); err != nil {
+				return fmt.Errorf("proving retired database cleanup authority: %w", err)
+			}
 		}
 		return nil
 	}
@@ -1431,6 +1436,9 @@ func recoverInterruptedAdd(townRoot, name string) (bool, error) {
 			return false, fmt.Errorf("releasing interrupted route reservation: %w", err)
 		}
 		if doltserver.DatabaseExists(townRoot, name) {
+			if err := doltserver.RecoverDatabaseCreationToken(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
+				return false, fmt.Errorf("recovering interrupted database creation custody: %w", err)
+			}
 			if err := removeAddDatabase(townRoot, name, databaseOwnership.DatabaseToken, true); err != nil {
 				return false, fmt.Errorf("removing exact interrupted rig database: %w", err)
 			}

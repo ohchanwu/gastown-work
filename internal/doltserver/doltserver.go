@@ -3528,6 +3528,11 @@ func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning boo
 			} else if !os.IsNotExist(statErr) {
 				return fmt.Errorf("checking existing rig database: %w", statErr)
 			} else {
+				if creationToken != "" {
+					if err := prepareDatabaseCreationIntent(townRoot, rigName, creationToken, runningPID); err != nil {
+						return fmt.Errorf("recording database creation intent: %w", err)
+					}
+				}
 				created = true
 				if serverWasRunning {
 					if err := serverExecSQL(townRoot, fmt.Sprintf("CREATE DATABASE `%s`", rigName)); err != nil {
@@ -3555,6 +3560,9 @@ func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning boo
 					return fmt.Errorf("stamping created database ownership: %w", err)
 				}
 				ownedToken = creationToken
+				if err := clearDatabaseCreationIntent(townRoot, rigName, creationToken); err != nil {
+					return fmt.Errorf("retiring database creation intent: %w", err)
+				}
 			}
 
 			beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
@@ -3574,6 +3582,15 @@ func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning boo
 		return nil
 	})
 	if err != nil {
+		if creationToken != "" {
+			cleanupErr := WithDatabaseOwnershipTransaction(townRoot, func() error {
+				if DatabaseExists(townRoot, rigName) {
+					return nil
+				}
+				return clearDatabaseCreationIntent(townRoot, rigName, creationToken)
+			})
+			err = errors.Join(err, cleanupErr)
+		}
 		return serverWasRunning, created, ownedToken, err
 	}
 	if !serverWasRunning {
@@ -6004,6 +6021,13 @@ func removeDatabase(townRoot, dbName string, force bool, creationToken string) e
 func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken string) error {
 	config := DefaultConfig(townRoot)
 	dbPath := filepath.Join(config.DataDir, dbName)
+	if intent, intentErr := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, dbName)); intentErr == nil {
+		if creationToken == "" || intent.Token != creationToken {
+			return fmt.Errorf("database %q has a pending creation intent owned by another operation", dbName)
+		}
+	} else if !os.IsNotExist(intentErr) {
+		return fmt.Errorf("reading database creation intent for %q: %w", dbName, intentErr)
+	}
 	receiptPath := databaseCleanupReceiptPath(townRoot, dbName)
 	receipt, receiptErr := readDatabaseCleanupReceipt(receiptPath)
 	if receiptErr == nil {
@@ -6459,6 +6483,130 @@ type databaseCreationReleaseReceipt struct {
 	Database    string `json:"database"`
 	Token       string `json:"token"`
 	Incarnation string `json:"incarnation"`
+}
+
+type databaseCreationIntent struct {
+	Version      int    `json:"version"`
+	Database     string `json:"database"`
+	Token        string `json:"token"`
+	ServerPID    int    `json:"server_pid,omitempty"`
+	ServerToken  string `json:"server_token,omitempty"`
+	PreparedNano int64  `json:"prepared_unix_nano"`
+}
+
+func databaseCreationIntentPath(townRoot, dbName string) string {
+	return filepath.Join(townRoot, ".runtime", "dolt-database-creations", canonicalDatabaseName(dbName)+".json")
+}
+
+func prepareDatabaseCreationIntent(townRoot, dbName, token string, serverPID int) error {
+	path := databaseCreationIntentPath(townRoot, dbName)
+	if existing, err := readDatabaseCreationIntent(path); err == nil {
+		if existing.Database == dbName && existing.Token == token {
+			return nil
+		}
+		return fmt.Errorf("database creation is owned by another operation")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	intent := databaseCreationIntent{
+		Version: 1, Database: dbName, Token: token, ServerPID: serverPID,
+		PreparedNano: time.Now().UnixNano(),
+	}
+	if serverPID != 0 {
+		intent.ServerToken = getProcessStartToken(serverPID)
+		if intent.ServerToken == "" {
+			return fmt.Errorf("could not capture Dolt server generation")
+		}
+	}
+	if err := ensurePrivateDatabaseCleanupDirectory(filepath.Dir(path)); err != nil {
+		return err
+	}
+	data, err := json.Marshal(intent)
+	if err != nil {
+		return err
+	}
+	return writeDatabaseCleanupFileDurable(path, append(data, '\n'), 0o600)
+}
+
+func readDatabaseCreationIntent(path string) (databaseCreationIntent, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return databaseCreationIntent{}, err
+	}
+	var intent databaseCreationIntent
+	if err := json.Unmarshal(data, &intent); err != nil {
+		return databaseCreationIntent{}, err
+	}
+	if intent.Version != 1 || intent.Database == "" || intent.Token == "" || intent.PreparedNano <= 0 || (intent.ServerPID == 0) != (intent.ServerToken == "") {
+		return databaseCreationIntent{}, fmt.Errorf("invalid database creation intent")
+	}
+	return intent, nil
+}
+
+func clearDatabaseCreationIntent(townRoot, dbName, token string) error {
+	path := databaseCreationIntentPath(townRoot, dbName)
+	intent, err := readDatabaseCreationIntent(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if intent.Database != dbName || intent.Token != token {
+		return fmt.Errorf("database creation intent is owned by another operation")
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncDatabaseCleanupDirectory(filepath.Dir(path))
+}
+
+// RecoverDatabaseCreationToken stamps a database created after a durable
+// absent-to-present intent when the same server generation still owns that
+// creation window.
+func RecoverDatabaseCreationToken(townRoot, dbName, token string) error {
+	return withDoltLifecycle(townRoot, func() error {
+		return WithDatabaseOwnershipTransaction(townRoot, func() error {
+			dbPath, err := DatabasePath(townRoot, dbName)
+			if err != nil {
+				return err
+			}
+			if err := verifyDatabaseCreationToken(dbPath, token); err == nil {
+				return clearDatabaseCreationIntent(townRoot, dbName, token)
+			} else if !os.IsNotExist(err) {
+				return err
+			}
+			intent, err := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, dbName))
+			if err != nil {
+				return err
+			}
+			if intent.Database != dbName || intent.Token != token {
+				return fmt.Errorf("database creation intent changed")
+			}
+			running, pid, err := IsRunning(townRoot)
+			if err != nil {
+				return err
+			}
+			if intent.ServerPID == 0 {
+				if running {
+					return fmt.Errorf("Dolt server generation changed after offline database creation intent")
+				}
+			} else if !running || pid != intent.ServerPID || getProcessStartToken(pid) != intent.ServerToken {
+				return fmt.Errorf("Dolt server generation changed after database creation intent")
+			}
+			doltInfo, err := os.Stat(filepath.Join(dbPath, ".dolt"))
+			if err != nil {
+				return err
+			}
+			if doltInfo.ModTime().UnixNano() < intent.PreparedNano {
+				return fmt.Errorf("database generation predates creation intent")
+			}
+			if err := writeDatabaseCleanupFileDurable(filepath.Join(dbPath, databaseCreationOwnerFile), []byte(token+"\n"), 0o600); err != nil {
+				return err
+			}
+			return clearDatabaseCreationIntent(townRoot, dbName, token)
+		})
+	})
 }
 
 func databaseCreationReleaseReceiptPath(townRoot, dbName, token string) string {

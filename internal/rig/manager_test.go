@@ -1750,6 +1750,69 @@ func TestReconcilePendingAddAfterOwnershipRetirement(t *testing.T) {
 	}
 }
 
+func TestReconcileAfterDatabaseMarkerRetiredBeforePathMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX dolt stub")
+	}
+	t.Setenv("GT_DOLT_PORT", "1")
+	root, rigsConfig := setupTestTown(t)
+	rigName := "partial_retirement"
+	token := "database-generation"
+	rigPath := filepath.Join(root, rigName)
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, "path-generation"); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(root, ".dolt-data", rigName)
+	if err := os.MkdirAll(filepath.Join(dbPath, ".dolt", "noms"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"), []byte("test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dbPath, ".gastown-creation-owner"), []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	stub := "#!/bin/sh\nprintf '{\"rows\":[{\"incarnation\":\"0123456789abcdefghijklmnopqrstuv\"}]}\\n'\n"
+	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := doltserver.ReleaseDatabaseCreationToken(root, rigName, token); err != nil {
+		t.Fatal(err)
+	}
+
+	reservation, err := beads.ReserveRoute(root, beads.Route{Prefix: "pr-", Path: rigName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := beads.CommitRouteReservation(root, reservation); err != nil {
+		t.Fatal(err)
+	}
+	rigsPath := filepath.Join(root, "mayor", "rigs.json")
+	if err := config.SaveRigsConfig(rigsPath, &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{rigName: {
+			RegistrationToken: reservation.Token, RegistrationPending: true,
+			RegistrationKind: rigRegistrationKindAdd, RegistrationRoutePath: rigName,
+			RegistrationPathToken: "path-generation", RegistrationDatabaseToken: token,
+			BeadsConfig: &config.BeadsConfig{Prefix: "pr"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	if recovered, err := manager.reconcileRigRegistration(rigName, rigRegistrationExpectation{Kind: rigRegistrationKindAdd}); err != nil || !recovered {
+		t.Fatalf("reconcile partial marker retirement: recovered=%v err=%v", recovered, err)
+	}
+	if _, err := os.Stat(filepath.Join(rigPath, addOwnershipStampFile)); !os.IsNotExist(err) {
+		t.Fatalf("path marker remains after recovery: %v", err)
+	}
+}
+
 func TestReconcilePendingRegistrationRejectsChangedRequest(t *testing.T) {
 	root, rigsConfig := setupTestTown(t)
 	rigName := "changed_request"

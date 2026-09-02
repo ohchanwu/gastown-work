@@ -12,6 +12,9 @@ func TestRecoverInterruptedAddRemovesExactCreatedDatabase(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "recovering", ".dolt"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".dolt-data", "recovering", ".gastown-creation-owner"), []byte("database-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	rigPath := filepath.Join(townRoot, "recovering")
 	if err := os.MkdirAll(rigPath, 0o755); err != nil {
 		t.Fatal(err)
@@ -48,6 +51,9 @@ func TestRecoverInterruptedAddRemovesExactCreatedDatabase(t *testing.T) {
 func TestRecoverInterruptedAddPreservesPathWhenDatabaseIdentityChanged(t *testing.T) {
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "recovering", ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".dolt-data", "recovering", ".gastown-creation-owner"), []byte("database-token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	rigPath := filepath.Join(townRoot, "recovering")
