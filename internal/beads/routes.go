@@ -3,6 +3,8 @@ package beads
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,8 +19,15 @@ import (
 // Route represents a prefix-to-path routing rule.
 // This mirrors the structure in bd's internal/routing package.
 type Route struct {
-	Prefix string `json:"prefix"` // Issue ID prefix (e.g., "gt-")
-	Path   string `json:"path"`   // Relative path to .beads directory from town root
+	Prefix              string `json:"prefix"`                     // Issue ID prefix (e.g., "gt-")
+	Path                string `json:"path"`                       // Relative path to .beads directory from town root
+	PendingReservations string `json:"_gt_reservations,omitempty"` // Internal rollback ownership tokens
+}
+
+// RouteReservation identifies one caller's claim on a pending route.
+type RouteReservation struct {
+	Route Route
+	Token string
 }
 
 // RoutesFileName is the name of the routes configuration file.
@@ -63,26 +72,43 @@ func LoadRoutes(beadsDir string) ([]Route, error) {
 // AppendRoute appends a route to routes.jsonl in the town's beads directory.
 // If the prefix already exists, it updates the path.
 func AppendRoute(townRoot string, route Route) error {
-	_, err := ReserveRoute(townRoot, route)
-	return err
+	reservation, err := ReserveRoute(townRoot, route)
+	if err != nil {
+		return err
+	}
+	if err := CommitRouteReservation(townRoot, reservation); err != nil {
+		_ = ReleaseRouteReservation(townRoot, reservation)
+		return err
+	}
+	return nil
 }
 
 // AppendRouteToDir appends a route to routes.jsonl in the given beads directory.
 // If the prefix already exists, it updates the path.
 func AppendRouteToDir(beadsDir string, route Route) error {
-	_, err := reserveRouteToDir(beadsDir, route)
-	return err
+	reservation, err := reserveRouteToDir(beadsDir, route)
+	if err != nil {
+		return err
+	}
+	if err := commitRouteReservationToDir(beadsDir, reservation); err != nil {
+		_ = releaseRouteReservationToDir(beadsDir, reservation)
+		return err
+	}
+	return nil
 }
 
-// ReserveRoute atomically validates and publishes a route. It reports whether
-// this call created the route so a failed registration can undo only its work.
-func ReserveRoute(townRoot string, route Route) (bool, error) {
+// ReserveRoute atomically validates and publishes a pending route claim.
+func ReserveRoute(townRoot string, route Route) (RouteReservation, error) {
 	return reserveRouteToDir(filepath.Join(townRoot, ".beads"), route)
 }
 
-func reserveRouteToDir(beadsDir string, route Route) (bool, error) {
-	created := false
-	err := UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
+func reserveRouteToDir(beadsDir string, route Route) (RouteReservation, error) {
+	token, err := newRouteReservationToken()
+	if err != nil {
+		return RouteReservation{}, err
+	}
+	reservation := RouteReservation{Route: route, Token: token}
+	err = UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
 		for i, existing := range routes {
 			if existing.Prefix == route.Prefix {
 				existingRig := strings.SplitN(existing.Path, "/", 2)[0]
@@ -90,29 +116,108 @@ func reserveRouteToDir(beadsDir string, route Route) (bool, error) {
 				if existingRig != newRig {
 					return nil, fmt.Errorf("prefix %q is already used by %s (path: %s); use --prefix to specify a different prefix", route.Prefix, existingRig, existing.Path)
 				}
+				if existing.Path == route.Path && existing.PendingReservations == "" {
+					reservation.Token = ""
+					return routes, nil
+				}
+				if existing.Path != route.Path && existing.PendingReservations != "" {
+					return nil, fmt.Errorf("prefix %q has a route registration in progress", route.Prefix)
+				}
 				routes[i].Path = route.Path
+				routes[i].PendingReservations = appendRouteReservation(existing.PendingReservations, token)
 				return routes, nil
 			}
 		}
-		created = true
+		route.PendingReservations = token
 		return append(routes, route), nil
 	})
-	return created, err
+	return reservation, err
 }
 
-// ReleaseRouteReservation removes route only while its exact prefix and path
-// still match, preserving any route subsequently published by another owner.
-func ReleaseRouteReservation(townRoot string, reserved Route) error {
-	beadsDir := filepath.Join(townRoot, ".beads")
+// CommitRouteReservation publishes a pending route and protects it from every
+// rollback for callers that reserved the same exact route.
+func CommitRouteReservation(townRoot string, reservation RouteReservation) error {
+	return commitRouteReservationToDir(filepath.Join(townRoot, ".beads"), reservation)
+}
+
+func commitRouteReservationToDir(beadsDir string, reservation RouteReservation) error {
+	if reservation.Token == "" {
+		return nil
+	}
 	return UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
-		filtered := make([]Route, 0, len(routes))
-		for _, route := range routes {
-			if route != reserved {
-				filtered = append(filtered, route)
+		for i, route := range routes {
+			if route.Prefix != reservation.Route.Prefix || route.Path != reservation.Route.Path {
+				continue
 			}
+			if route.PendingReservations == "" {
+				return routes, nil
+			}
+			if !hasRouteReservation(route.PendingReservations, reservation.Token) {
+				return nil, fmt.Errorf("route reservation for prefix %q is no longer owned by this registration", route.Prefix)
+			}
+			routes[i].PendingReservations = ""
+			return routes, nil
 		}
-		return filtered, nil
+		return nil, fmt.Errorf("reserved route for prefix %q is no longer present", reservation.Route.Prefix)
 	})
+}
+
+// ReleaseRouteReservation removes only this caller's pending claim. The route
+// remains while another identical reservation exists or any caller committed.
+func ReleaseRouteReservation(townRoot string, reservation RouteReservation) error {
+	return releaseRouteReservationToDir(filepath.Join(townRoot, ".beads"), reservation)
+}
+
+func releaseRouteReservationToDir(beadsDir string, reservation RouteReservation) error {
+	if reservation.Token == "" {
+		return nil
+	}
+	return UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
+		for i, route := range routes {
+			if route.Prefix != reservation.Route.Prefix || route.Path != reservation.Route.Path || route.PendingReservations == "" {
+				continue
+			}
+			remaining := removeRouteReservation(route.PendingReservations, reservation.Token)
+			if remaining == route.PendingReservations {
+				return routes, nil
+			}
+			if remaining == "" {
+				return slices.Delete(routes, i, i+1), nil
+			}
+			routes[i].PendingReservations = remaining
+			return routes, nil
+		}
+		return routes, nil
+	})
+}
+
+func newRouteReservationToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generating route reservation token: %w", err)
+	}
+	return hex.EncodeToString(token[:]), nil
+}
+
+func appendRouteReservation(existing, token string) string {
+	if existing == "" {
+		return token
+	}
+	return existing + "," + token
+}
+
+func hasRouteReservation(reservations, token string) bool {
+	return slices.Contains(strings.Split(reservations, ","), token)
+}
+
+func removeRouteReservation(reservations, token string) string {
+	tokens := strings.Split(reservations, ",")
+	for i, candidate := range tokens {
+		if candidate == token {
+			return strings.Join(slices.Delete(tokens, i, i+1), ",")
+		}
+	}
+	return reservations
 }
 
 // RemoveRoute removes a route by prefix from routes.jsonl.

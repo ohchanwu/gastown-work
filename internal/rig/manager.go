@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -868,6 +869,7 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	// Register route in town-level routes.jsonl BEFORE creating agent beads.
 	// initAgentBeads calls ResolveRoutingTarget which needs the route to exist.
 	// Without this, agent bead creation logs "no route found" warnings (#1424).
+	var routeReservation beads.RouteReservation
 	if opts.BeadsPrefix != "" {
 		routePath := opts.Name
 		mayorRigBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
@@ -878,17 +880,16 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 			Prefix: opts.BeadsPrefix + "-",
 			Path:   routePath,
 		}
-		routeCreated, err := beads.ReserveRoute(m.townRoot, route)
+		var err error
+		routeReservation, err = beads.ReserveRoute(m.townRoot, route)
 		if err != nil {
 			return nil, fmt.Errorf("reserving issue prefix route: %w", err)
 		}
-		if routeCreated {
-			defer func() {
-				if !success {
-					_ = beads.ReleaseRouteReservation(m.townRoot, route)
-				}
-			}()
-		}
+		defer func() {
+			if !success {
+				_ = beads.ReleaseRouteReservation(m.townRoot, routeReservation)
+			}
+		}()
 	}
 
 	// Create rig-level settings directory (used by gt config for rig overrides)
@@ -960,6 +961,21 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 		return nil, fmt.Errorf("registering rig in rigs.json: %w", err)
 	}
 	m.config = savedConfig
+	if err := beads.CommitRouteReservation(m.townRoot, routeReservation); err != nil {
+		var rolledBackConfig *config.RigsConfig
+		rollbackErr := config.UpdateRigsConfig(rigsPath, func(current *config.RigsConfig) error {
+			if currentEntry, ok := current.Rigs[opts.Name]; ok && reflect.DeepEqual(currentEntry, entry) {
+				delete(current.Rigs, opts.Name)
+			}
+			rolledBackConfig = current
+			return nil
+		})
+		if rollbackErr != nil {
+			return nil, fmt.Errorf("committing issue prefix route: %v (also rolling back rigs.json: %w)", err, rollbackErr)
+		}
+		m.config = rolledBackConfig
+		return nil, fmt.Errorf("committing issue prefix route: %w", err)
+	}
 
 	success = true
 	// Best-effort cleanup: once the add succeeds, the stamp is no longer needed.

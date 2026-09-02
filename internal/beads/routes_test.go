@@ -136,29 +136,21 @@ func TestAppendRouteRejectsConcurrentDifferentRigAfterBothPreflight(t *testing.T
 	}
 }
 
-func TestReleaseRouteReservationRemovesOnlyCreatedExactRoute(t *testing.T) {
+func TestReleaseRouteReservationRemovesOnlyOwnedPendingRoute(t *testing.T) {
 	townRoot := t.TempDir()
-	reserved := Route{Prefix: "zz-", Path: "alpha"}
-	created, err := ReserveRoute(townRoot, reserved)
+	route := Route{Prefix: "zz-", Path: "alpha"}
+	reservation, err := ReserveRoute(townRoot, route)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !created {
-		t.Fatal("new route was not reported as created")
-	}
-
-	created, err = ReserveRoute(townRoot, reserved)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if created {
-		t.Fatal("existing exact route was reported as created")
+	if reservation.Token == "" {
+		t.Fatal("new route did not receive a reservation token")
 	}
 
 	if err := AppendRoute(townRoot, Route{Prefix: "yy-", Path: "bravo"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ReleaseRouteReservation(townRoot, reserved); err != nil {
+	if err := ReleaseRouteReservation(townRoot, reservation); err != nil {
 		t.Fatal(err)
 	}
 	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
@@ -167,6 +159,66 @@ func TestReleaseRouteReservationRemovesOnlyCreatedExactRoute(t *testing.T) {
 	}
 	if len(routes) != 1 || routes[0].Prefix != "yy-" {
 		t.Fatalf("routes = %v, want only unrelated yy- route", routes)
+	}
+}
+
+func TestRouteReleasePreservesConcurrentReuse(t *testing.T) {
+	townRoot := t.TempDir()
+	route := Route{Prefix: "zz-", Path: "alpha"}
+	first, err := ReserveRoute(townRoot, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ReserveRoute(townRoot, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ReleaseRouteReservation(townRoot, first); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Prefix != route.Prefix || routes[0].Path != route.Path {
+		t.Fatalf("routes = %v, want reused route preserved", routes)
+	}
+	if err := ReleaseRouteReservation(townRoot, second); err != nil {
+		t.Fatal(err)
+	}
+	routes, err = LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 0 {
+		t.Fatalf("routes = %v, want pending route removed after all releases", routes)
+	}
+}
+
+func TestCommittedRouteSurvivesOtherReservationRelease(t *testing.T) {
+	townRoot := t.TempDir()
+	route := Route{Prefix: "zz-", Path: "alpha"}
+	first, err := ReserveRoute(townRoot, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ReserveRoute(townRoot, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CommitRouteReservation(townRoot, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReleaseRouteReservation(townRoot, first); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0] != route {
+		t.Fatalf("routes = %v, want committed route preserved", routes)
 	}
 }
 
