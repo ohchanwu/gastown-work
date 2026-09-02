@@ -5,9 +5,39 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/config"
 )
+
+func TestWriteRoutesWaitsForDatabaseOwnership(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	lockPath := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "ownership.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ownershipLock := flock.New(lockPath)
+	if err := ownershipLock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- WriteRoutes(beadsDir, []Route{{Prefix: "hq-", Path: "."}}) }()
+	select {
+	case err := <-done:
+		_ = ownershipLock.Unlock()
+		t.Fatalf("WriteRoutes bypassed ownership fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := ownershipLock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("WriteRoutes after ownership release: %v", err)
+	}
+}
 
 func TestGetPrefixForRig(t *testing.T) {
 	// Create a temporary directory with routes.jsonl

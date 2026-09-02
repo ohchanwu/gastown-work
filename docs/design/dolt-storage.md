@@ -1,7 +1,7 @@
 # Dolt Storage Architecture
 
 > **Status**: Current reference for Gas Town agents
-> **Updated**: 2026-02-28
+> **Updated**: 2026-09-02
 > **Context**: Dolt is the sole storage backend for Beads and Gas Town
 
 ---
@@ -33,6 +33,20 @@ Dolt SQL Server (one per town, port 3307)
 accessible via `USE <name>` in SQL.
 
 **Connection**: `root@tcp(<host>:3307)/<database>` (no password).
+
+### Ownership and physical-move custody
+
+Destructive database cleanup shares one ownership transaction with every
+publisher of `metadata.json`, `mayor/rigs.json`, and town
+`.beads/routes.jsonl`. Cleanup rechecks those registries while holding the
+transaction; malformed, unreadable, or incomplete rig/route ownership fails
+closed. Missing town metadata still protects the canonical `hq` database.
+
+Database names must resolve to one direct child of `.dolt-data`. Physical
+renames and migrations take the Dolt lifecycle fence before the ownership
+transaction, stop a running server for the move, and restore it afterward.
+This lock order prevents cleanup, registry publication, and server startup from
+observing contradictory ownership or a partially moved database.
 
 ## Environment Variables
 

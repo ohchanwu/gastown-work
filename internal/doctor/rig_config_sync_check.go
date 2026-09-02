@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -466,85 +465,79 @@ func (c *RigConfigSyncCheck) Fix(ctx *CheckContext) error {
 		}
 	}
 
-	// Fix database name mismatches - rename database to match rig directory name
-	renamedDBs := false
-	for _, mismatch := range c.dbNameMismatches {
-		renamed := false
-		if err := doltserver.WithDatabaseOwnershipTransaction(ctx.TownRoot, func() error {
-			metadataPath := filepath.Join(doltserver.FindRigBeadsDir(ctx.TownRoot, mismatch.rigName), "metadata.json")
-			metadataBytes, err := os.ReadFile(metadataPath)
-			if err != nil {
-				return fmt.Errorf("reading metadata.json: %w", err)
-			}
-			var metadata map[string]interface{}
-			if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
-				return fmt.Errorf("parsing metadata.json: %w", err)
-			}
-			currentDB, ok := metadata["dolt_database"].(string)
-			if !ok || currentDB != mismatch.currentDB {
-				return fmt.Errorf("database ownership changed from %q to %q", mismatch.currentDB, currentDB)
-			}
-
-			dataDir := filepath.Join(ctx.TownRoot, ".dolt-data")
-			oldDBPath := filepath.Join(dataDir, mismatch.currentDB)
-			newDBPath := filepath.Join(dataDir, mismatch.expectedDB)
-			if _, err := os.Stat(oldDBPath); err == nil {
-				if _, err := os.Stat(newDBPath); err == nil {
-					return fmt.Errorf("database path conflict: %s already exists", mismatch.expectedDB)
-				} else if !os.IsNotExist(err) {
-					return fmt.Errorf("checking target database path: %w", err)
-				}
-				if err := os.Rename(oldDBPath, newDBPath); err != nil {
-					return fmt.Errorf("renaming database %s to %s: %w", mismatch.currentDB, mismatch.expectedDB, err)
-				}
-				renamed = true
-			} else if !os.IsNotExist(err) {
-				return fmt.Errorf("checking source database path: %w", err)
-			}
-
-			metadata["dolt_database"] = mismatch.expectedDB
-			newMetadata, err := json.MarshalIndent(metadata, "", "  ")
-			if err != nil {
-				return fmt.Errorf("serializing metadata.json: %w", err)
-			}
-			if err := atomicfile.WriteFile(metadataPath, append(newMetadata, '\n'), 0o600); err != nil {
-				if renamed {
-					if rollbackErr := os.Rename(newDBPath, oldDBPath); rollbackErr != nil {
-						return fmt.Errorf("writing metadata.json: %w; database rename rollback failed: %v", err, rollbackErr)
+	// Physical database moves run under lifecycle -> ownership lock order, with
+	// any live server stopped and restored around the complete move set.
+	if len(c.dbNameMismatches) > 0 {
+		if err := doltserver.WithStoppedDoltForDatabaseMove(ctx.TownRoot, func() error {
+			for _, mismatch := range c.dbNameMismatches {
+				renamed := false
+				if err := doltserver.WithDatabaseOwnershipTransaction(ctx.TownRoot, func() error {
+					beadsDir := doltserver.FindRigBeadsDir(ctx.TownRoot, mismatch.rigName)
+					if beadsDir == "" {
+						return fmt.Errorf("rig beads directory is unavailable")
 					}
-					renamed = false
+					metadataPath := filepath.Join(beadsDir, "metadata.json")
+					metadataBytes, err := os.ReadFile(metadataPath)
+					if err != nil {
+						return fmt.Errorf("reading metadata.json: %w", err)
+					}
+					var metadata map[string]interface{}
+					if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+						return fmt.Errorf("parsing metadata.json: %w", err)
+					}
+					currentDB, ok := metadata["dolt_database"].(string)
+					if !ok || currentDB != mismatch.currentDB {
+						return fmt.Errorf("database ownership changed from %q to %q", mismatch.currentDB, currentDB)
+					}
+
+					oldDBPath, err := doltserver.DatabasePath(ctx.TownRoot, mismatch.currentDB)
+					if err != nil {
+						return err
+					}
+					newDBPath, err := doltserver.DatabasePath(ctx.TownRoot, mismatch.expectedDB)
+					if err != nil {
+						return err
+					}
+					if _, err := os.Stat(oldDBPath); err == nil {
+						if _, err := os.Stat(filepath.Join(oldDBPath, ".dolt")); err != nil {
+							return fmt.Errorf("source database path is not a Dolt database: %w", err)
+						}
+						if _, err := os.Stat(newDBPath); err == nil {
+							return fmt.Errorf("database path conflict: %s already exists", mismatch.expectedDB)
+						} else if !os.IsNotExist(err) {
+							return fmt.Errorf("checking target database path: %w", err)
+						}
+						if err := os.Rename(oldDBPath, newDBPath); err != nil {
+							return fmt.Errorf("renaming database %s to %s: %w", mismatch.currentDB, mismatch.expectedDB, err)
+						}
+						renamed = true
+					} else if !os.IsNotExist(err) {
+						return fmt.Errorf("checking source database path: %w", err)
+					} else if _, err := os.Stat(filepath.Join(newDBPath, ".dolt")); err != nil {
+						return fmt.Errorf("source database %q is missing and target %q is not a Dolt database: %w", mismatch.currentDB, mismatch.expectedDB, err)
+					}
+
+					metadata["dolt_database"] = mismatch.expectedDB
+					newMetadata, err := json.MarshalIndent(metadata, "", "  ")
+					if err != nil {
+						return fmt.Errorf("serializing metadata.json: %w", err)
+					}
+					if err := atomicfile.WriteFile(metadataPath, append(newMetadata, '\n'), 0o600); err != nil {
+						if renamed {
+							if rollbackErr := os.Rename(newDBPath, oldDBPath); rollbackErr != nil {
+								return fmt.Errorf("writing metadata.json: %w; database rename rollback failed: %v", err, rollbackErr)
+							}
+						}
+						return fmt.Errorf("writing metadata.json: %w", err)
+					}
+					return nil
+				}); err != nil {
+					return fmt.Errorf("could not reconcile Dolt database ownership for %s: %w", mismatch.rigName, err)
 				}
-				return fmt.Errorf("writing metadata.json: %w", err)
 			}
 			return nil
 		}); err != nil {
-			return fmt.Errorf("could not reconcile Dolt database ownership for %s: %w", mismatch.rigName, err)
-		}
-		renamedDBs = renamedDBs || renamed
-	}
-
-	// If we renamed databases, restart the Dolt server to pick up the changes.
-	// Guard: skip restart if the server has been running less than 60s — restarting
-	// during startup churn is a known crash trigger (gt-9bxzs: Dolt NomsBlockStore
-	// panic when SIGTERM arrives mid-write). The server will pick up renamed databases
-	// on its next natural restart or on the next doctor --fix run once stable.
-	if renamedDBs {
-		if running, pid, _ := doltserver.IsRunning(ctx.TownRoot); running && pid > 0 {
-			const minStableAge = 60 * time.Second
-			state, _ := doltserver.LoadState(ctx.TownRoot)
-			if state != nil && !state.StartedAt.IsZero() && time.Since(state.StartedAt) < minStableAge {
-				// Server started less than 60s ago — skip restart to avoid crash
-				// during Dolt startup churn. Databases will be picked up on next restart.
-			} else {
-				// Stop the server
-				if err := doltserver.Stop(ctx.TownRoot); err != nil {
-					return fmt.Errorf("could not stop Dolt server for restart: %w", err)
-				}
-				// Start the server again
-				if err := doltserver.Start(ctx.TownRoot); err != nil {
-					return fmt.Errorf("could not restart Dolt server: %w", err)
-				}
-			}
+			return err
 		}
 	}
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltlock"
 )
 
 // resolveConfigMu serializes agent config resolution across all callers.
@@ -120,6 +121,17 @@ func LoadRigsConfig(path string) (*RigsConfig, error) {
 // rename is atomic on POSIX, so concurrent readers never observe a zero-byte
 // or partially-written rigs.json.
 func SaveRigsConfig(path string, config *RigsConfig) error {
+	operation := func() error {
+		return saveRigsConfig(path, config)
+	}
+	cleanPath := filepath.Clean(path)
+	if filepath.Base(cleanPath) != "rigs.json" || filepath.Base(filepath.Dir(cleanPath)) != "mayor" {
+		return operation()
+	}
+	return doltlock.WithDatabaseOwnership(filepath.Dir(filepath.Dir(cleanPath)), operation)
+}
+
+func saveRigsConfig(path string, config *RigsConfig) error {
 	if err := validateRigsConfig(config); err != nil {
 		return err
 	}

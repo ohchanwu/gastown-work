@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/doltlock"
 )
 
 // Route represents a prefix-to-path routing rule.
@@ -116,6 +117,15 @@ func RemoveRoute(townRoot string, prefix string) error {
 
 // WriteRoutes writes routes to routes.jsonl, overwriting existing content.
 func WriteRoutes(beadsDir string, routes []Route) error {
+	operation := func() error { return writeRoutes(beadsDir, routes) }
+	cleanDir := filepath.Clean(beadsDir)
+	if filepath.Base(cleanDir) != ".beads" {
+		return operation()
+	}
+	return doltlock.WithDatabaseOwnership(filepath.Dir(cleanDir), operation)
+}
+
+func writeRoutes(beadsDir string, routes []Route) error {
 	// Ensure beads directory exists
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		return fmt.Errorf("creating beads directory: %w", err)

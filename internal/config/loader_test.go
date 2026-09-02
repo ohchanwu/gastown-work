@@ -12,8 +12,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/constants"
 )
+
+func TestSaveRigsConfigWaitsForDatabaseOwnership(t *testing.T) {
+	townRoot := t.TempDir()
+	path := filepath.Join(townRoot, "mayor", "rigs.json")
+	lockPath := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "ownership.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ownershipLock := flock.New(lockPath)
+	if err := ownershipLock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- SaveRigsConfig(path, &RigsConfig{Version: CurrentRigsVersion, Rigs: map[string]RigEntry{}})
+	}()
+	select {
+	case err := <-done:
+		_ = ownershipLock.Unlock()
+		t.Fatalf("SaveRigsConfig bypassed ownership fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := ownershipLock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("SaveRigsConfig after ownership release: %v", err)
+	}
+}
 
 // skipIfAgentBinaryMissing skips the test if any of the specified agent binaries
 // are not found in PATH. This allows tests that depend on specific agents to be

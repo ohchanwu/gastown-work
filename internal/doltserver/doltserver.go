@@ -53,6 +53,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	configpkg "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltlock"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -522,6 +523,19 @@ func envKeyMatches(entryKey, key, goos string) bool {
 func RigDatabaseDir(townRoot, rigName string) string {
 	config := DefaultConfig(townRoot)
 	return filepath.Join(config.DataDir, rigName)
+}
+
+// DatabasePath returns a validated direct child of the shared Dolt data dir.
+func DatabasePath(townRoot, name string) (string, error) {
+	if !validSQLName(name) || name == "." || name == ".." {
+		return "", fmt.Errorf("invalid database name %q: must match [a-zA-Z0-9_.-]+ and name one direct child", name)
+	}
+	dataDir := filepath.Clean(DefaultConfig(townRoot).DataDir)
+	path := filepath.Join(dataDir, name)
+	if filepath.Dir(path) != dataDir || filepath.Base(path) != name {
+		return "", fmt.Errorf("invalid database name %q: resolved path is not a direct child", name)
+	}
+	return path, nil
 }
 
 // State represents the Dolt server's runtime state.
@@ -2837,6 +2851,55 @@ func Stop(townRoot string) error {
 	return stopLocked(townRoot)
 }
 
+// WithStoppedDoltForDatabaseMove excludes start/stop races and prevents a live
+// server from observing a partial physical database move. A server that was
+// running is restored after the operation, including when the operation fails.
+func WithStoppedDoltForDatabaseMove(townRoot string, operation func() error) error {
+	if operation == nil {
+		return fmt.Errorf("database move operation is required")
+	}
+	wasRunning := false
+	operationErr := func() error {
+		doltLifecycleMu.Lock()
+		defer doltLifecycleMu.Unlock()
+		lifecycleLock, err := tryLockDoltLifecycle(townRoot)
+		if err != nil {
+			return fmt.Errorf("locking Dolt lifecycle for database move: %w", err)
+		}
+		defer func() { _ = lifecycleLock.Unlock() }()
+
+		running, pid, err := IsRunning(townRoot)
+		if err != nil {
+			return fmt.Errorf("checking Dolt lifecycle before database move: %w", err)
+		}
+		if running && pid <= 0 {
+			return fmt.Errorf("Dolt server is reachable but local process ownership is unavailable; refusing database move")
+		}
+		if running {
+			const minStableAge = 60 * time.Second
+			state, _ := LoadState(townRoot)
+			if state != nil && !state.StartedAt.IsZero() && time.Since(state.StartedAt) < minStableAge {
+				return fmt.Errorf("Dolt server is too new to stop safely for a database move")
+			}
+			wasRunning = true
+			if err := stopLocked(townRoot); err != nil {
+				return fmt.Errorf("stopping Dolt server for database move: %w", err)
+			}
+		}
+		return operation()
+	}()
+
+	if wasRunning {
+		if restartErr := Start(townRoot); restartErr != nil {
+			if operationErr != nil {
+				return fmt.Errorf("database move failed: %w; restarting Dolt server failed: %v", operationErr, restartErr)
+			}
+			return fmt.Errorf("restarting Dolt server after database move: %w", restartErr)
+		}
+	}
+	return operationErr
+}
+
 func stopLocked(townRoot string) error {
 	config := DefaultConfig(townRoot)
 
@@ -3657,35 +3720,39 @@ func FindMigratableDatabases(townRoot string) []Migration {
 // This is used to migrate from the old per-rig .beads/dolt/<db_name> layout to the new
 // centralized .dolt-data/<rigname> layout.
 func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
-	config := DefaultConfig(townRoot)
-	return WithDatabaseOwnershipTransaction(townRoot, func() error {
-		targetDir := filepath.Join(config.DataDir, rigName)
-		if _, err := os.Stat(filepath.Join(targetDir, ".dolt")); err == nil {
-			return fmt.Errorf("rig database %q already exists at %s", rigName, targetDir)
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("checking target database: %w", err)
-		}
-		if _, err := os.Stat(filepath.Join(sourcePath, ".dolt")); err != nil {
-			return fmt.Errorf("checking source database: %w", err)
-		}
-		if err := os.MkdirAll(config.DataDir, 0o755); err != nil {
-			return fmt.Errorf("creating data directory: %w", err)
-		}
-		if err := moveDir(sourcePath, targetDir); err != nil {
-			return fmt.Errorf("moving database: %w", err)
-		}
-
-		beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
-		if err == nil {
-			err = ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName)
-		}
-		if err != nil {
-			if rollbackErr := moveDir(targetDir, sourcePath); rollbackErr != nil {
-				return fmt.Errorf("publishing migrated database ownership: %w; rollback failed: %v", err, rollbackErr)
+	targetDir, err := DatabasePath(townRoot, rigName)
+	if err != nil {
+		return err
+	}
+	return WithStoppedDoltForDatabaseMove(townRoot, func() error {
+		return WithDatabaseOwnershipTransaction(townRoot, func() error {
+			if _, err := os.Stat(filepath.Join(targetDir, ".dolt")); err == nil {
+				return fmt.Errorf("rig database %q already exists at %s", rigName, targetDir)
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("checking target database: %w", err)
 			}
-			return fmt.Errorf("publishing migrated database ownership: %w", err)
-		}
-		return nil
+			if _, err := os.Stat(filepath.Join(sourcePath, ".dolt")); err != nil {
+				return fmt.Errorf("checking source database: %w", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(targetDir), 0o755); err != nil {
+				return fmt.Errorf("creating data directory: %w", err)
+			}
+			if err := moveDir(sourcePath, targetDir); err != nil {
+				return fmt.Errorf("moving database: %w", err)
+			}
+
+			beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
+			if err == nil {
+				err = ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName)
+			}
+			if err != nil {
+				if rollbackErr := moveDir(targetDir, sourcePath); rollbackErr != nil {
+					return fmt.Errorf("publishing migrated database ownership: %w; rollback failed: %v", err, rollbackErr)
+				}
+				return fmt.Errorf("publishing migrated database ownership: %w", err)
+			}
+			return nil
+		})
 	})
 }
 
@@ -3824,6 +3891,9 @@ func readExistingDoltDatabase(beadsDir string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("parsing %s: dolt_database must be a string", metadataPath)
 	}
+	if db != "" && (!validSQLName(db) || db == "." || db == "..") {
+		return "", fmt.Errorf("parsing %s: invalid dolt_database %q", metadataPath, db)
+	}
 	return db, nil
 }
 
@@ -3849,8 +3919,15 @@ func collectReferencedDatabases(townRoot string) (map[string]bool, error) {
 
 	// Check town-level beads (hq)
 	townBeadsDir := filepath.Join(townRoot, ".beads")
-	if err := addReference(townBeadsDir); err != nil {
+	townDB, err := readExistingDoltDatabase(townBeadsDir)
+	if err != nil {
 		return nil, err
+	}
+	// hq is the canonical town database even while metadata is absent or being
+	// repaired; never let registry loss make it eligible for cleanup.
+	referenced["hq"] = true
+	if townDB != "" {
+		referenced[canonicalDatabaseName(townDB)] = true
 	}
 
 	// Check all rigs from rigs.json. A configured rig that cannot be resolved is
@@ -3876,10 +3953,11 @@ func collectReferencedDatabases(townRoot string) (map[string]bool, error) {
 			if db != "" {
 				referenced[canonicalDatabaseName(db)] = true
 			}
+			if db == "" {
+				return nil, fmt.Errorf("configured rig %q has no database ownership metadata", rigName)
+			}
 			if entry.BeadsConfig != nil && entry.BeadsConfig.Prefix != "" {
 				referenced[canonicalDatabaseName(strings.TrimSuffix(entry.BeadsConfig.Prefix, "-"))] = true
-			} else if db == "" {
-				return nil, fmt.Errorf("configured rig %q has no database ownership identity", rigName)
 			}
 		}
 	}
@@ -3916,10 +3994,11 @@ func collectReferencedDatabases(townRoot string) (map[string]bool, error) {
 			if db != "" {
 				referenced[canonicalDatabaseName(db)] = true
 			}
+			if db == "" {
+				return nil, fmt.Errorf("route ownership registry %s:%d has no database ownership metadata", routesPath, lineNumber+1)
+			}
 			if route.Prefix != "" {
 				referenced[canonicalDatabaseName(strings.TrimSuffix(route.Prefix, "-"))] = true
-			} else if db == "" {
-				return nil, fmt.Errorf("route ownership registry %s:%d has no database identity", routesPath, lineNumber+1)
 			}
 		}
 	} else if !os.IsNotExist(readErr) {
@@ -4078,44 +4157,14 @@ type databaseCleanupReceipt struct {
 }
 
 var (
-	// databaseCleanupMu serializes ownership publication with cleanup in this
-	// process; ownership.lock provides the matching cross-process fence.
-	databaseCleanupMu       sync.Mutex
 	databaseCleanupFileSync = func(f *os.File) error { return f.Sync() }
 	databaseCleanupDirSync  = func(f *os.File) error { return f.Sync() }
 )
 
-func lockDatabaseCleanupOwnership(townRoot string) (*flock.Flock, error) {
-	lockDir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup")
-	if err := ensurePrivateDatabaseCleanupDirectory(lockDir); err != nil {
-		return nil, err
-	}
-	lockPath := filepath.Join(lockDir, "ownership.lock")
-	lock := flock.New(lockPath)
-	if err := lock.Lock(); err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(lockPath, 0o600); err != nil {
-		_ = lock.Unlock()
-		return nil, err
-	}
-	return lock, nil
-}
-
 // WithDatabaseOwnershipTransaction excludes destructive cleanup while a caller
 // creates, renames, or publishes ownership for a Dolt database.
 func WithDatabaseOwnershipTransaction(townRoot string, operation func() error) error {
-	if operation == nil {
-		return fmt.Errorf("database ownership operation is required")
-	}
-	databaseCleanupMu.Lock()
-	defer databaseCleanupMu.Unlock()
-	ownershipLock, err := lockDatabaseCleanupOwnership(townRoot)
-	if err != nil {
-		return fmt.Errorf("locking database ownership: %w", err)
-	}
-	defer func() { _ = ownershipLock.Unlock() }()
-	return operation()
+	return doltlock.WithDatabaseOwnership(townRoot, operation)
 }
 
 // RemoveDatabase removes an orphaned database directory from .dolt-data/.
@@ -4123,8 +4172,8 @@ func WithDatabaseOwnershipTransaction(townRoot string, operation func() error) e
 // If the Dolt server is running, it will DROP the database first.
 // If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
 func RemoveDatabase(townRoot, dbName string, force bool) error {
-	if !validSQLName(dbName) || dbName == "." || dbName == ".." {
-		return fmt.Errorf("invalid database name %q: must match [a-zA-Z0-9_.-]+", dbName)
+	if _, err := DatabasePath(townRoot, dbName); err != nil {
+		return err
 	}
 	if isProtectedSharedServerDatabase(dbName) {
 		return fmt.Errorf("database %q is a protected shared-server database", dbName)

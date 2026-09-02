@@ -155,6 +155,72 @@ func TestRigConfigSyncFixRejectsStaleDatabaseOwnership(t *testing.T) {
 	}
 }
 
+func TestRigConfigSyncFixRejectsEscapingDatabaseName(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(`{"version":1,"rigs":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beadsDir := filepath.Join(townRoot, "testrig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, []byte("{\"dolt_database\":\"../victim\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	victimPath := filepath.Join(townRoot, "victim")
+	if err := os.MkdirAll(filepath.Join(victimPath, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewRigConfigSyncCheck()
+	check.dbNameMismatches = []dbMismatch{{rigName: "testrig", currentDB: "../victim", expectedDB: "testrig"}}
+	err := check.Fix(&CheckContext{TownRoot: townRoot})
+	if err == nil || !strings.Contains(err.Error(), "invalid database name") {
+		t.Fatalf("Fix() error = %v, want invalid database name refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(victimPath, ".dolt")); err != nil {
+		t.Fatalf("escaping source was mutated: %v", err)
+	}
+}
+
+func TestRigConfigSyncFixRejectsMissingPhysicalSource(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(`{"version":1,"rigs":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beadsDir := filepath.Join(townRoot, "testrig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, []byte("{\"dolt_database\":\"old_db\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewRigConfigSyncCheck()
+	check.dbNameMismatches = []dbMismatch{{rigName: "testrig", currentDB: "old_db", expectedDB: "testrig"}}
+	err := check.Fix(&CheckContext{TownRoot: townRoot})
+	if err == nil || !strings.Contains(err.Error(), "source database") {
+		t.Fatalf("Fix() error = %v, want missing physical source refusal", err)
+	}
+	metadata, readErr := os.ReadFile(metadataPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(metadata), `"dolt_database":"old_db"`) {
+		t.Fatalf("missing source changed ownership metadata: %s", metadata)
+	}
+}
+
 func TestRigConfigSyncCheck_FixCreatesConfig(t *testing.T) {
 	// Create temp town root
 	tmpDir := t.TempDir()

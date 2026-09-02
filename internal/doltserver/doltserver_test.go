@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/doltlock"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1738,6 +1739,7 @@ func TestMoveDir_SameFilesystem(t *testing.T) {
 }
 
 func TestMigrateRigFromBeads(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 
 	// Create source database
@@ -1782,6 +1784,7 @@ func TestMigrateRigFromBeads(t *testing.T) {
 }
 
 func TestMigrateRigFromBeads_AlreadyExists(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 
 	rigName := "existing"
@@ -1799,6 +1802,56 @@ func TestMigrateRigFromBeads_AlreadyExists(t *testing.T) {
 	err := MigrateRigFromBeads(townRoot, rigName, sourcePath)
 	if err == nil {
 		t.Fatal("expected error for already-existing target, got nil")
+	}
+}
+
+func TestMigrateRigFromBeadsFailsClosedWhileLifecycleLockHeld(t *testing.T) {
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	sourcePath := filepath.Join(townRoot, "source")
+	if err := os.MkdirAll(filepath.Join(sourcePath, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := doltLifecycleLockPath(townRoot)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lifecycleLock := flock.New(lockPath)
+	if err := lifecycleLock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lifecycleLock.Unlock() })
+
+	err := MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if err == nil || !strings.Contains(err.Error(), "lifecycle") {
+		t.Fatalf("MigrateRigFromBeads() error = %v, want lifecycle-lock refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(sourcePath, ".dolt")); err != nil {
+		t.Fatalf("source mutated while lifecycle lock was held: %v", err)
+	}
+}
+
+func TestWithStoppedDoltForDatabaseMoveRejectsUnownedReachableServer(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
+
+	called := false
+	err = WithStoppedDoltForDatabaseMove(t.TempDir(), func() error {
+		called = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "ownership") {
+		t.Fatalf("WithStoppedDoltForDatabaseMove() error = %v, want ownership refusal", err)
+	}
+	if called {
+		t.Fatal("database move ran without local server ownership")
 	}
 }
 
@@ -1956,6 +2009,7 @@ func TestFindMigratableDatabases_SkipsAlreadyMigrated(t *testing.T) {
 // some rigs but not others (simulating a crash), resuming migration completes
 // all remaining rigs without corrupting already-migrated ones.
 func TestMidMigrationCrashRecovery_PartialMigration(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 
 	// Create 3 rigs with source databases
@@ -2270,6 +2324,7 @@ func TestConcurrentFindMigratableDatabases(t *testing.T) {
 // consistent results even while a migration is in progress (the source is
 // being moved and the target is appearing).
 func TestConcurrentMigrateAndFind(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 
 	// Create multiple rigs
@@ -2669,6 +2724,7 @@ func TestEnsureAllMetadata_RepairsAllCorrupt(t *testing.T) {
 // TestMigrateRigFromBeads_IdempotentDetection tests that running migration
 // twice for the same rig: first succeeds, second correctly reports already done.
 func TestMigrateRigFromBeads_IdempotentDetection(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 
 	rigName := "idem-rig"
@@ -2755,6 +2811,7 @@ func TestHasConnectionCapacity_ZeroMax(t *testing.T) {
 }
 
 func TestFindAndMigrateAll_Idempotent(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 
 	// Create 2 rigs with valid noms/manifest so ListDatabases recognizes them post-migration
@@ -4378,16 +4435,16 @@ func TestStopFailsClosedWhileDoltLifecycleLockHeld(t *testing.T) {
 
 func TestEnsureMetadataWaitsForDatabaseCleanupOwnership(t *testing.T) {
 	townRoot := t.TempDir()
-	databaseCleanupMu.Lock()
+	releaseOwnership := holdDatabaseOwnership(t, townRoot)
 	done := make(chan error, 1)
 	go func() { done <- EnsureMetadata(townRoot, "hq") }()
 	select {
 	case err := <-done:
-		databaseCleanupMu.Unlock()
+		releaseOwnership()
 		t.Fatalf("EnsureMetadata() bypassed cleanup ownership lock: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	databaseCleanupMu.Unlock()
+	releaseOwnership()
 	if err := <-done; err != nil {
 		t.Fatalf("EnsureMetadata() after cleanup ownership release: %v", err)
 	}
@@ -4395,18 +4452,18 @@ func TestEnsureMetadataWaitsForDatabaseCleanupOwnership(t *testing.T) {
 
 func TestDatabaseOwnershipTransactionWaitsForCleanup(t *testing.T) {
 	townRoot := t.TempDir()
-	databaseCleanupMu.Lock()
+	releaseOwnership := holdDatabaseOwnership(t, townRoot)
 	done := make(chan error, 1)
 	go func() {
 		done <- WithDatabaseOwnershipTransaction(townRoot, func() error { return nil })
 	}()
 	select {
 	case err := <-done:
-		databaseCleanupMu.Unlock()
+		releaseOwnership()
 		t.Fatalf("ownership transaction bypassed cleanup lock: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	databaseCleanupMu.Unlock()
+	releaseOwnership()
 	if err := <-done; err != nil {
 		t.Fatalf("ownership transaction after cleanup release: %v", err)
 	}
@@ -4421,7 +4478,7 @@ func TestInitRigWaitsForDatabaseOwnershipTransaction(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	databaseCleanupMu.Lock()
+	releaseOwnership := holdDatabaseOwnership(t, townRoot)
 	done := make(chan error, 1)
 	go func() {
 		_, _, err := InitRig(townRoot, "newrig")
@@ -4429,13 +4486,34 @@ func TestInitRigWaitsForDatabaseOwnershipTransaction(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		databaseCleanupMu.Unlock()
+		releaseOwnership()
 		t.Fatalf("InitRig() bypassed ownership transaction: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	databaseCleanupMu.Unlock()
+	releaseOwnership()
 	if err := <-done; err == nil {
 		t.Fatal("InitRig() unexpectedly succeeded with failing dolt fixture")
+	}
+}
+
+func holdDatabaseOwnership(t *testing.T, townRoot string) func() {
+	t.Helper()
+	acquired := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- doltlock.WithDatabaseOwnership(townRoot, func() error {
+			close(acquired)
+			<-release
+			return nil
+		})
+	}()
+	<-acquired
+	return func() {
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatalf("releasing database ownership: %v", err)
+		}
 	}
 }
 
@@ -5116,6 +5194,22 @@ func TestFindOrphanedDatabasesFailsClosedOnMalformedMetadata(t *testing.T) {
 	}
 }
 
+func TestFindOrphanedDatabasesFailsClosedOnUnsafeMetadataDatabaseName(t *testing.T) {
+	townRoot := t.TempDir()
+	setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), "rigdb")
+	setupRigsJSON(t, townRoot, []string{})
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_database":"../victim"}`)
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "metadata.json"), metadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if orphans, err := FindOrphanedDatabases(townRoot); err == nil {
+		t.Fatalf("unsafe metadata database name failed open: %v", orphans)
+	}
+}
+
 func TestFindOrphanedDatabases_MultipleOrphans(t *testing.T) {
 	townRoot := t.TempDir()
 	dataDir := filepath.Join(townRoot, ".dolt-data")
@@ -5233,6 +5327,7 @@ func TestCollectReferencedDatabases_CustomDatabaseName(t *testing.T) {
 	townRoot := t.TempDir()
 
 	// Rig name differs from dolt_database name
+	setupRigMetadata(t, townRoot, "hq", "hq")
 	setupRigsJSON(t, townRoot, []string{"myrig"})
 	setupRigMetadata(t, townRoot, "myrig", "custom_db_name")
 
@@ -5276,6 +5371,55 @@ func TestCollectReferencedDatabases_NoRigsJSON(t *testing.T) {
 	if len(referenced) != 1 {
 		t.Errorf("expected 1 referenced, got %d", len(referenced))
 	}
+}
+
+func TestCollectReferencedDatabasesFailsClosedOnMissingCanonicalMetadata(t *testing.T) {
+	t.Run("town", func(t *testing.T) {
+		townRoot := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		referenced, err := collectReferencedDatabases(townRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !referenced["hq"] {
+			t.Fatalf("missing town metadata did not conservatively retain hq: %v", referenced)
+		}
+	})
+
+	t.Run("configured rig", func(t *testing.T) {
+		townRoot := t.TempDir()
+		setupRigMetadata(t, townRoot, "hq", "hq")
+		if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		registry := `{"version":1,"rigs":{"testrig":{"git_url":"local","beads":{"repo":"local","prefix":"tr-"}}}}`
+		if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(registry), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(townRoot, "testrig", ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if referenced, err := collectReferencedDatabases(townRoot); err == nil {
+			t.Fatalf("missing configured-rig metadata failed open: %v", referenced)
+		}
+	})
+
+	t.Run("route", func(t *testing.T) {
+		townRoot := t.TempDir()
+		setupRigMetadata(t, townRoot, "hq", "hq")
+		if err := os.MkdirAll(filepath.Join(townRoot, "testrig", ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		route := []byte("{\"prefix\":\"tr-\",\"path\":\"testrig\"}\n")
+		if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), route, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if referenced, err := collectReferencedDatabases(townRoot); err == nil {
+			t.Fatalf("missing route metadata failed open: %v", referenced)
+		}
+	})
 }
 
 func TestRemoveDatabase_RemovesDirectory(t *testing.T) {
