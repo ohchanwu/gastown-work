@@ -93,6 +93,83 @@ func TestAppendRouteToDirSerializesReadModifyWrite(t *testing.T) {
 	}
 }
 
+func TestAppendRouteRejectsConcurrentDifferentRigAfterBothPreflight(t *testing.T) {
+	townRoot := t.TempDir()
+	for _, path := range []string{"alpha", "bravo"} {
+		if err := CheckPrefixAvailable(townRoot, "zz-", path); err != nil {
+			t.Fatalf("preflight for %s: %v", path, err)
+		}
+	}
+
+	start := make(chan struct{})
+	done := make(chan error, 2)
+	for _, path := range []string{"alpha", "bravo"} {
+		go func() {
+			<-start
+			done <- AppendRoute(townRoot, Route{Prefix: "zz-", Path: path})
+		}()
+	}
+	close(start)
+
+	var successes, collisions int
+	for range 2 {
+		err := <-done
+		switch {
+		case err == nil:
+			successes++
+		case strings.Contains(err.Error(), "already used"):
+			collisions++
+		default:
+			t.Fatalf("route publication error = %v, want prefix collision", err)
+		}
+	}
+	if successes != 1 || collisions != 1 {
+		t.Fatalf("route publication results: successes=%d collisions=%d, want 1 and 1", successes, collisions)
+	}
+
+	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Prefix != "zz-" {
+		t.Fatalf("routes = %v, want one zz- owner", routes)
+	}
+}
+
+func TestReleaseRouteReservationRemovesOnlyCreatedExactRoute(t *testing.T) {
+	townRoot := t.TempDir()
+	reserved := Route{Prefix: "zz-", Path: "alpha"}
+	created, err := ReserveRoute(townRoot, reserved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("new route was not reported as created")
+	}
+
+	created, err = ReserveRoute(townRoot, reserved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Fatal("existing exact route was reported as created")
+	}
+
+	if err := AppendRoute(townRoot, Route{Prefix: "yy-", Path: "bravo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReleaseRouteReservation(townRoot, reserved); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Prefix != "yy-" {
+		t.Fatalf("routes = %v, want only unrelated yy- route", routes)
+	}
+}
+
 func TestGetPrefixForRig(t *testing.T) {
 	// Create a temporary directory with routes.jsonl
 	tmpDir := t.TempDir()

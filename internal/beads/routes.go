@@ -63,26 +63,55 @@ func LoadRoutes(beadsDir string) ([]Route, error) {
 // AppendRoute appends a route to routes.jsonl in the town's beads directory.
 // If the prefix already exists, it updates the path.
 func AppendRoute(townRoot string, route Route) error {
-	beadsDir := filepath.Join(townRoot, ".beads")
-	return AppendRouteToDir(beadsDir, route)
+	_, err := ReserveRoute(townRoot, route)
+	return err
 }
 
 // AppendRouteToDir appends a route to routes.jsonl in the given beads directory.
 // If the prefix already exists, it updates the path.
 func AppendRouteToDir(beadsDir string, route Route) error {
-	return UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
-		found := false
+	_, err := reserveRouteToDir(beadsDir, route)
+	return err
+}
+
+// ReserveRoute atomically validates and publishes a route. It reports whether
+// this call created the route so a failed registration can undo only its work.
+func ReserveRoute(townRoot string, route Route) (bool, error) {
+	return reserveRouteToDir(filepath.Join(townRoot, ".beads"), route)
+}
+
+func reserveRouteToDir(beadsDir string, route Route) (bool, error) {
+	created := false
+	err := UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
 		for i, existing := range routes {
 			if existing.Prefix == route.Prefix {
+				existingRig := strings.SplitN(existing.Path, "/", 2)[0]
+				newRig := strings.SplitN(route.Path, "/", 2)[0]
+				if existingRig != newRig {
+					return nil, fmt.Errorf("prefix %q is already used by %s (path: %s); use --prefix to specify a different prefix", route.Prefix, existingRig, existing.Path)
+				}
 				routes[i].Path = route.Path
-				found = true
-				break
+				return routes, nil
 			}
 		}
-		if !found {
-			routes = append(routes, route)
+		created = true
+		return append(routes, route), nil
+	})
+	return created, err
+}
+
+// ReleaseRouteReservation removes route only while its exact prefix and path
+// still match, preserving any route subsequently published by another owner.
+func ReleaseRouteReservation(townRoot string, reserved Route) error {
+	beadsDir := filepath.Join(townRoot, ".beads")
+	return UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
+		filtered := make([]Route, 0, len(routes))
+		for _, route := range routes {
+			if route != reserved {
+				filtered = append(filtered, route)
+			}
 		}
-		return routes, nil
+		return filtered, nil
 	})
 }
 

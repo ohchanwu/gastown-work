@@ -878,8 +878,16 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 			Prefix: opts.BeadsPrefix + "-",
 			Path:   routePath,
 		}
-		if err := beads.AppendRoute(m.townRoot, route); err != nil {
-			fmt.Printf("  Warning: Could not update routes.jsonl: %v\n", err)
+		routeCreated, err := beads.ReserveRoute(m.townRoot, route)
+		if err != nil {
+			return nil, fmt.Errorf("reserving issue prefix route: %w", err)
+		}
+		if routeCreated {
+			defer func() {
+				if !success {
+					_ = beads.ReleaseRouteReservation(m.townRoot, route)
+				}
+			}()
 		}
 	}
 
