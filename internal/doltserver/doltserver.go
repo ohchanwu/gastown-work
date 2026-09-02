@@ -4423,6 +4423,12 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			}
 
 		case databaseMigrationCleanupRemoving:
+			if !targetComplete {
+				return fmt.Errorf("cleanup-removing migration target is missing or incomplete")
+			}
+			if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
+				return err
+			}
 			if sourceExists {
 				return fmt.Errorf("migration source reappeared during cleanup")
 			}
@@ -4451,6 +4457,12 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			}
 
 		case databaseMigrationSourceCleaned:
+			if !targetComplete {
+				return fmt.Errorf("source-cleaned migration target is missing or incomplete")
+			}
+			if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
+				return err
+			}
 			cleanupExists, _, err := databaseMigrationRootPathState(root, cleanupRel)
 			if err != nil {
 				return err
