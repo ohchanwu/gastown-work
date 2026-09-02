@@ -625,14 +625,19 @@ type RigsConfig struct {
 
 // RigEntry represents a single rig in the registry.
 type RigEntry struct {
-	GitURL              string       `json:"git_url"`
-	PushURL             string       `json:"push_url,omitempty"`
-	UpstreamURL         string       `json:"upstream_url,omitempty"` // optional upstream URL (for fork workflows)
-	LocalRepo           string       `json:"local_repo,omitempty"`
-	AddedAt             time.Time    `json:"added_at"`
-	BeadsConfig         *BeadsConfig `json:"beads,omitempty"`
-	RegistrationToken   string       `json:"registration_token,omitempty"`
-	RegistrationPending bool         `json:"registration_pending,omitempty"`
+	GitURL                    string       `json:"git_url"`
+	PushURL                   string       `json:"push_url,omitempty"`
+	UpstreamURL               string       `json:"upstream_url,omitempty"` // optional upstream URL (for fork workflows)
+	LocalRepo                 string       `json:"local_repo,omitempty"`
+	AddedAt                   time.Time    `json:"added_at"`
+	BeadsConfig               *BeadsConfig `json:"beads,omitempty"`
+	RegistrationToken         string       `json:"registration_token,omitempty"`
+	RegistrationPending       bool         `json:"registration_pending,omitempty"`
+	RegistrationKind          string       `json:"registration_kind,omitempty"`
+	RegistrationRoutePath     string       `json:"registration_route_path,omitempty"`
+	RegistrationPathToken     string       `json:"registration_path_token,omitempty"`
+	RegistrationDatabaseToken string       `json:"registration_database_token,omitempty"`
+	RegistrationDatabase      string       `json:"registration_database,omitempty"`
 }
 
 // BeadsConfig represents beads configuration for a rig.

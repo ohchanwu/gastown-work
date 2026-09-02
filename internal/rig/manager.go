@@ -174,66 +174,196 @@ func (m *Manager) RigExists(name string) bool {
 	return ok
 }
 
+const (
+	rigRegistrationKindAdd      = "add"
+	rigRegistrationKindRegister = "register"
+)
+
+type rigRegistrationExpectation struct {
+	Kind        string
+	GitURL      string
+	PushURL     string
+	UpstreamURL string
+	BeadsPrefix string
+}
+
 func (m *Manager) rigRegistrationRoute(name string, entry config.RigEntry) (beads.Route, error) {
 	if entry.BeadsConfig == nil || strings.TrimSpace(entry.BeadsConfig.Prefix) == "" {
 		return beads.Route{}, fmt.Errorf("pending registration for %q has no beads prefix", name)
 	}
-	path := name
-	if _, err := os.Stat(filepath.Join(m.townRoot, name, "mayor", "rig", ".beads")); err == nil {
-		path = name + "/mayor/rig"
-	} else if !os.IsNotExist(err) {
-		return beads.Route{}, fmt.Errorf("checking pending route path: %w", err)
+	prefix := strings.TrimSuffix(entry.BeadsConfig.Prefix, "-") + "-"
+	path := entry.RegistrationRoutePath
+	if path == "" {
+		var err error
+		path, err = beads.RouteReservationPath(m.townRoot, prefix, entry.RegistrationToken)
+		if err != nil {
+			return beads.Route{}, fmt.Errorf("migrating pending route path: %w", err)
+		}
 	}
-	return beads.Route{Prefix: strings.TrimSuffix(entry.BeadsConfig.Prefix, "-") + "-", Path: path}, nil
+	clean := filepath.Clean(path)
+	if filepath.IsAbs(path) || clean != path || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return beads.Route{}, fmt.Errorf("pending registration for %q has unsafe route path %q", name, path)
+	}
+	parts := strings.Split(clean, string(filepath.Separator))
+	if len(parts) == 0 || parts[0] != name {
+		return beads.Route{}, fmt.Errorf("pending registration route %q is outside rig %q", path, name)
+	}
+	if info, err := os.Stat(filepath.Join(m.townRoot, clean)); err != nil {
+		return beads.Route{}, fmt.Errorf("checking pending route path: %w", err)
+	} else if !info.IsDir() {
+		return beads.Route{}, fmt.Errorf("pending route path is not a directory: %s", clean)
+	}
+	return beads.Route{Prefix: prefix, Path: clean}, nil
 }
 
 // reconcileRigRegistration completes an exact config/route transaction left
 // pending by an interrupted AddRig or RegisterRig call.
-func (m *Manager) reconcileRigRegistration(name string) (bool, error) {
+func (m *Manager) reconcileRigRegistration(name string, expected rigRegistrationExpectation) (bool, error) {
 	rigsPath := filepath.Join(m.townRoot, "mayor", "rigs.json")
-	current, err := config.LoadRigsConfig(rigsPath)
+	current, err := config.LoadRigsConfigIncludingPending(rigsPath)
 	if errors.Is(err, config.ErrNotFound) {
+		if _, journalErr := os.Stat(rigRegistrationJournalPath(m.townRoot, name)); journalErr == nil {
+			if restoreErr := restoreRigRegistrationJournal(m.townRoot, name, ""); restoreErr != nil {
+				return false, fmt.Errorf("restoring interrupted rig registration: %w", restoreErr)
+			}
+		}
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("loading pending rig registration: %w", err)
 	}
-	*m.config = *current
 	entry, ok := current.Rigs[name]
 	if !ok || !entry.RegistrationPending {
+		if _, journalErr := os.Stat(rigRegistrationJournalPath(m.townRoot, name)); journalErr == nil {
+			if restoreErr := restoreRigRegistrationJournal(m.townRoot, name, ""); restoreErr != nil {
+				return false, fmt.Errorf("restoring interrupted rig registration: %w", restoreErr)
+			}
+		}
 		return false, nil
 	}
 	if entry.RegistrationToken == "" {
 		return false, fmt.Errorf("pending registration for %q has no ownership token", name)
 	}
+	if err := validateRigRegistrationExpectation(name, entry, expected); err != nil {
+		return false, err
+	}
 	route, err := m.rigRegistrationRoute(name, entry)
 	if err != nil {
 		return false, err
 	}
-	if err := beads.CommitRouteReservation(m.townRoot, beads.RouteReservation{
-		Route: route,
-		Token: entry.RegistrationToken,
-	}); err != nil {
+	reservation := beads.RouteReservation{Route: route, Token: entry.RegistrationToken}
+	routeCommitted, err := beads.RouteReservationCommitted(m.townRoot, reservation)
+	if err != nil {
+		return false, fmt.Errorf("checking pending route state: %w", err)
+	}
+	if entry.RegistrationRoutePath == "" {
+		entry.RegistrationRoutePath = route.Path
+	}
+	legacyRegistration := entry.RegistrationKind == ""
+	if entry.RegistrationKind == "" {
+		if readAddOwnershipStamp(filepath.Join(m.townRoot, name)) != "" {
+			entry.RegistrationKind = rigRegistrationKindAdd
+		} else {
+			entry.RegistrationKind = rigRegistrationKindRegister
+		}
+	}
+	if entry.RegistrationKind == rigRegistrationKindAdd {
+		if err := migrateAndValidateAddRegistration(m.townRoot, name, route, routeCommitted, &entry); err != nil {
+			return false, err
+		}
+	} else if entry.RegistrationKind != rigRegistrationKindRegister {
+		return false, fmt.Errorf("pending registration for %q has unknown kind %q", name, entry.RegistrationKind)
+	}
+	if err := validateRegistrationDatabase(filepath.Join(m.townRoot, route.Path), entry.RegistrationDatabase); err != nil {
+		return false, err
+	}
+	if err := persistMigratedRigRegistration(rigsPath, name, entry); err != nil {
+		return false, err
+	}
+	if entry.RegistrationKind == rigRegistrationKindRegister {
+		if _, journalErr := os.Stat(rigRegistrationJournalPath(m.townRoot, name)); journalErr == nil {
+			if err := m.applyRigRegistrationRepositoryConfig(name, entry); err != nil {
+				return false, fmt.Errorf("reapplying pending repository configuration: %w", err)
+			}
+		} else if !os.IsNotExist(journalErr) {
+			return false, fmt.Errorf("checking repository mutation journal: %w", journalErr)
+		} else if legacyRegistration {
+			if err := m.applyRigRegistrationRepositoryConfig(name, entry); err != nil {
+				return false, fmt.Errorf("reapplying legacy pending repository configuration: %w", err)
+			}
+		} else if !routeCommitted {
+			return false, fmt.Errorf("pending repository registration for %q has no mutation journal", name)
+		}
+	}
+	if err := beads.CommitRouteReservation(m.townRoot, reservation); err != nil {
 		return false, fmt.Errorf("reconciling issue prefix route: %w", err)
 	}
-
-	var saved *config.RigsConfig
-	if err := config.UpdateRigsConfig(rigsPath, func(latest *config.RigsConfig) error {
-		candidate, ok := latest.Rigs[name]
-		if !ok || candidate.RegistrationToken != entry.RegistrationToken || !candidate.RegistrationPending {
-			return fmt.Errorf("pending registration for %q changed during reconciliation", name)
+	if entry.RegistrationKind == rigRegistrationKindAdd {
+		if err := retireAddRegistrationOwnership(m.townRoot, name, entry); err != nil {
+			return false, err
 		}
-		candidate.RegistrationPending = false
-		latest.Rigs[name] = candidate
-		saved = latest
-		return nil
-	}); err != nil {
+	} else if err := retireRigRegistrationJournal(m.townRoot, name, entry.RegistrationToken); err != nil {
+		return false, fmt.Errorf("retiring repository mutation journal: %w", err)
+	}
+	saved, err := markRigRegistrationCommitted(rigsPath, name, entry.RegistrationToken)
+	if err != nil {
 		return false, fmt.Errorf("committing rig registration: %w", err)
 	}
 	*m.config = *saved
-	_ = clearAddDatabaseOwnership(filepath.Join(m.townRoot, name))
-	_ = clearAddOwnershipStamp(filepath.Join(m.townRoot, name))
 	return true, nil
+}
+
+func validateRigRegistrationExpectation(name string, entry config.RigEntry, expected rigRegistrationExpectation) error {
+	checks := []struct{ label, want, got string }{
+		{"kind", expected.Kind, entry.RegistrationKind},
+		{"git URL", expected.GitURL, entry.GitURL},
+		{"push URL", expected.PushURL, entry.PushURL},
+		{"upstream URL", expected.UpstreamURL, entry.UpstreamURL},
+	}
+	if entry.BeadsConfig != nil {
+		checks = append(checks, struct{ label, want, got string }{"beads prefix", strings.TrimSuffix(expected.BeadsPrefix, "-"), strings.TrimSuffix(entry.BeadsConfig.Prefix, "-")})
+	}
+	for _, check := range checks {
+		if check.label == "kind" && check.got == "" {
+			continue
+		}
+		if check.want != "" && check.want != check.got {
+			return fmt.Errorf("pending registration for %q has %s %q, current request requires %q", name, check.label, check.got, check.want)
+		}
+	}
+	return nil
+}
+
+func validateRegistrationDatabase(workDir, expected string) error {
+	if expected == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(workDir, ".beads", "metadata.json"))
+	if err != nil {
+		return fmt.Errorf("reading pending registration metadata: %w", err)
+	}
+	var metadata struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fmt.Errorf("parsing pending registration metadata: %w", err)
+	}
+	if metadata.DoltMode != "server" || metadata.DoltDatabase != expected {
+		return fmt.Errorf("pending registration database identity changed: mode=%q database=%q, want server/%q", metadata.DoltMode, metadata.DoltDatabase, expected)
+	}
+	return nil
+}
+
+func persistMigratedRigRegistration(path, name string, entry config.RigEntry) error {
+	return config.UpdateRigsConfig(path, func(current *config.RigsConfig) error {
+		candidate, ok := current.Rigs[name]
+		if !ok || !candidate.RegistrationPending || candidate.RegistrationToken != entry.RegistrationToken {
+			return fmt.Errorf("pending registration for %q changed during migration", name)
+		}
+		current.Rigs[name] = entry
+		return nil
+	})
 }
 
 func persistPendingRigRegistration(path, name string, entry config.RigEntry) (*config.RigsConfig, error) {
@@ -257,6 +387,8 @@ func markRigRegistrationCommitted(path, name, token string) (*config.RigsConfig,
 			return fmt.Errorf("rig %q registration ownership changed before commit", name)
 		}
 		entry.RegistrationPending = false
+		entry.RegistrationPathToken = ""
+		entry.RegistrationDatabaseToken = ""
 		current.Rigs[name] = entry
 		saved = current
 		return nil
@@ -422,7 +554,13 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			return nil, fmt.Errorf("rig name %q is reserved for town-level infrastructure", opts.Name)
 		}
 	}
-	if recovered, err := m.reconcileRigRegistration(opts.Name); err != nil {
+	if recovered, err := m.reconcileRigRegistration(opts.Name, rigRegistrationExpectation{
+		Kind:        rigRegistrationKindAdd,
+		GitURL:      opts.GitURL,
+		PushURL:     opts.PushURL,
+		UpstreamURL: opts.UpstreamURL,
+		BeadsPrefix: opts.BeadsPrefix,
+	}); err != nil {
 		return nil, err
 	} else if recovered {
 		return m.GetRig(opts.Name)
@@ -752,22 +890,32 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Create the server-side database after tracked prefix detection but before
 	// either tracked or untracked beads initialization. bd init falls back to an
 	// embedded store when the requested central database does not exist yet.
+	databaseToken := ""
 	if !opts.SkipDoltCheck {
-		_, createdDatabase, databaseRoot, err := doltserver.InitRigOwned(m.townRoot, opts.Name)
-		if createdDatabase && databaseRoot == "" {
+		preparedDatabaseOwnership := addDatabaseOwnership{
+			Owner:         ownershipStamp,
+			DatabaseToken: ownershipStamp,
+			RoutePrefix:   routeReservation.Route.Prefix,
+			RoutePath:     routeReservation.Route.Path,
+			RouteToken:    routeReservation.Token,
+		}
+		if err := writeAddDatabaseOwnership(rigPath, preparedDatabaseOwnership); err != nil {
+			return nil, fmt.Errorf("recording database creation intent: %w", err)
+		}
+		_, createdDatabase, ownedToken, err := doltserver.InitRigOwned(m.townRoot, opts.Name, ownershipStamp)
+		if createdDatabase {
+			databaseToken = ownedToken
+		}
+		if createdDatabase && databaseToken != ownershipStamp {
 			return nil, errors.Join(fmt.Errorf("created rig database has no cleanup identity"), err)
 		}
-		if createdDatabase {
-			if markerErr := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{
-				Owner:       ownershipStamp,
-				Root:        databaseRoot,
-				RoutePrefix: routeReservation.Route.Prefix,
-				RoutePath:   routeReservation.Route.Path,
-				RouteToken:  routeReservation.Token,
+		if !createdDatabase {
+			if markerErr := clearExactAddDatabaseOwnership(rigPath, config.RigEntry{
+				RegistrationToken:         routeReservation.Token,
+				RegistrationPathToken:     ownershipStamp,
+				RegistrationDatabaseToken: ownershipStamp,
 			}); markerErr != nil {
-				releaseErr := beads.ReleaseRouteReservation(m.townRoot, routeReservation)
-				cleanupErr := removeAddDatabase(m.townRoot, opts.Name, databaseRoot, true)
-				return nil, errors.Join(fmt.Errorf("recording created database ownership: %w", markerErr), releaseErr, cleanupErr)
+				return nil, fmt.Errorf("retiring unused database creation intent: %w", markerErr)
 			}
 		}
 		if err != nil {
@@ -1053,8 +1201,18 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 		BeadsConfig: &config.BeadsConfig{
 			Prefix: opts.BeadsPrefix,
 		},
-		RegistrationToken:   routeReservation.Token,
-		RegistrationPending: true,
+		RegistrationToken:         routeReservation.Token,
+		RegistrationPending:       true,
+		RegistrationKind:          rigRegistrationKindAdd,
+		RegistrationRoutePath:     routeReservation.Route.Path,
+		RegistrationPathToken:     ownershipStamp,
+		RegistrationDatabaseToken: databaseToken,
+	}
+	if !opts.SkipDoltCheck {
+		entry.RegistrationDatabase = opts.Name
+		if err := validateRegistrationDatabase(filepath.Join(m.townRoot, routeReservation.Route.Path), opts.Name); err != nil {
+			return nil, err
+		}
 	}
 
 	// Post-init identity verification (gas-tc4): verify metadata.json points
@@ -1078,9 +1236,11 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 		return nil, fmt.Errorf("registering rig in rigs.json: %w", err)
 	}
 	registrationDurable = true
-	*m.config = *savedConfig
 	if err := beads.CommitRouteReservation(m.townRoot, routeReservation); err != nil {
 		return nil, fmt.Errorf("committing issue prefix route: %w", err)
+	}
+	if err := retireAddRegistrationOwnership(m.townRoot, opts.Name, entry); err != nil {
+		return nil, err
 	}
 	savedConfig, err = markRigRegistrationCommitted(rigsPath, opts.Name, routeReservation.Token)
 	if err != nil {
@@ -1090,9 +1250,6 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	entry = savedConfig.Rigs[opts.Name]
 
 	success = true
-	// Best-effort cleanup: once the add succeeds, the stamp is no longer needed.
-	_ = clearAddDatabaseOwnership(rigPath)
-	_ = clearAddOwnershipStamp(rigPath)
 	return m.loadRig(opts.Name, entry)
 }
 
@@ -1102,14 +1259,14 @@ const addOwnershipStampFile = ".gt-add-owner"
 const addDatabaseOwnershipFile = ".gt-add-database"
 
 type addDatabaseOwnership struct {
-	Owner       string `json:"owner"`
-	Root        string `json:"root"`
-	RoutePrefix string `json:"route_prefix"`
-	RoutePath   string `json:"route_path"`
-	RouteToken  string `json:"route_token"`
+	Owner         string `json:"owner"`
+	DatabaseToken string `json:"database_token"`
+	RoutePrefix   string `json:"route_prefix"`
+	RoutePath     string `json:"route_path"`
+	RouteToken    string `json:"route_token"`
 }
 
-var removeAddDatabase = doltserver.RemoveDatabaseIfRootIncarnation
+var removeAddDatabase = doltserver.RemoveDatabaseIfCreationToken
 
 func newAddOwnershipStamp() (string, error) {
 	var buf [16]byte
@@ -1152,7 +1309,7 @@ func readAddDatabaseOwnership(rigPath string) (addDatabaseOwnership, error) {
 	if err := json.Unmarshal(data, &ownership); err != nil {
 		return addDatabaseOwnership{}, err
 	}
-	if ownership.Owner == "" || ownership.Root == "" || ownership.RoutePrefix == "" || ownership.RoutePath == "" || ownership.RouteToken == "" {
+	if ownership.Owner == "" || ownership.DatabaseToken == "" || ownership.RoutePrefix == "" || ownership.RoutePath == "" || ownership.RouteToken == "" {
 		return addDatabaseOwnership{}, fmt.Errorf("incomplete created database ownership")
 	}
 	return ownership, nil
@@ -1160,6 +1317,100 @@ func readAddDatabaseOwnership(rigPath string) (addDatabaseOwnership, error) {
 
 func clearAddDatabaseOwnership(rigPath string) error {
 	return os.Remove(filepath.Join(rigPath, addDatabaseOwnershipFile))
+}
+
+func migrateAndValidateAddRegistration(townRoot, name string, route beads.Route, routeCommitted bool, entry *config.RigEntry) error {
+	rigPath := filepath.Join(townRoot, name)
+	owner := readAddOwnershipStamp(rigPath)
+	if entry.RegistrationPathToken == "" {
+		entry.RegistrationPathToken = owner
+	}
+	if owner == "" && routeCommitted && entry.RegistrationPathToken != "" {
+		if entry.RegistrationDatabaseToken != "" {
+			if err := doltserver.DatabaseCreationTokenReleased(townRoot, name, entry.RegistrationDatabaseToken); err != nil {
+				return fmt.Errorf("proving retired database cleanup authority: %w", err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(rigPath, addDatabaseOwnershipFile)); err == nil {
+			return fmt.Errorf("pending add database marker remains after path ownership retirement")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if entry.RegistrationPathToken == "" || owner != entry.RegistrationPathToken {
+		return fmt.Errorf("pending add path ownership changed for %q", name)
+	}
+	databaseOwnership, err := readAddDatabaseOwnership(rigPath)
+	if os.IsNotExist(err) {
+		if entry.RegistrationDatabaseToken != "" {
+			return fmt.Errorf("pending add database ownership is missing for %q", name)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading pending add database ownership: %w", err)
+	}
+	if databaseOwnership.Owner != entry.RegistrationPathToken ||
+		databaseOwnership.RoutePrefix != route.Prefix ||
+		databaseOwnership.RoutePath != route.Path ||
+		databaseOwnership.RouteToken != entry.RegistrationToken {
+		return fmt.Errorf("pending add ownership changed for %q", name)
+	}
+	if entry.RegistrationDatabaseToken == "" {
+		entry.RegistrationDatabaseToken = databaseOwnership.DatabaseToken
+	}
+	if entry.RegistrationDatabaseToken != databaseOwnership.DatabaseToken {
+		return fmt.Errorf("pending add database generation changed for %q", name)
+	}
+	if entry.RegistrationDatabase == "" {
+		entry.RegistrationDatabase = name
+	}
+	return nil
+}
+
+func retireAddRegistrationOwnership(townRoot, name string, entry config.RigEntry) error {
+	rigPath := filepath.Join(townRoot, name)
+	if entry.RegistrationDatabaseToken != "" {
+		if err := doltserver.ReleaseDatabaseCreationToken(townRoot, name, entry.RegistrationDatabaseToken); err != nil {
+			return fmt.Errorf("retiring database cleanup authority: %w", err)
+		}
+	}
+	if err := clearExactAddDatabaseOwnership(rigPath, entry); err != nil {
+		return err
+	}
+	return clearExactAddOwnershipStamp(rigPath, entry.RegistrationPathToken)
+}
+
+func clearExactAddDatabaseOwnership(rigPath string, entry config.RigEntry) error {
+	ownership, err := readAddDatabaseOwnership(rigPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if ownership.Owner != entry.RegistrationPathToken || ownership.DatabaseToken != entry.RegistrationDatabaseToken || ownership.RouteToken != entry.RegistrationToken {
+		return fmt.Errorf("refusing to retire changed add database ownership")
+	}
+	if err := clearAddDatabaseOwnership(rigPath); err != nil {
+		return err
+	}
+	return syncRigRegistrationDirectory(rigPath)
+}
+
+func clearExactAddOwnershipStamp(rigPath, token string) error {
+	owner := readAddOwnershipStamp(rigPath)
+	if owner == "" {
+		return nil
+	}
+	if token == "" || owner != token {
+		return fmt.Errorf("refusing to retire changed add path ownership")
+	}
+	if err := clearAddOwnershipStamp(rigPath); err != nil {
+		return err
+	}
+	return syncRigRegistrationDirectory(rigPath)
 }
 
 func recoverInterruptedAdd(townRoot, name string) (bool, error) {
@@ -1179,8 +1430,10 @@ func recoverInterruptedAdd(townRoot, name string) (bool, error) {
 		}); err != nil {
 			return false, fmt.Errorf("releasing interrupted route reservation: %w", err)
 		}
-		if err := removeAddDatabase(townRoot, name, databaseOwnership.Root, true); err != nil {
-			return false, fmt.Errorf("removing exact interrupted rig database: %w", err)
+		if doltserver.DatabaseExists(townRoot, name) {
+			if err := removeAddDatabase(townRoot, name, databaseOwnership.DatabaseToken, true); err != nil {
+				return false, fmt.Errorf("removing exact interrupted rig database: %w", err)
+			}
 		}
 		if err := clearAddDatabaseOwnership(rigPath); err != nil && !os.IsNotExist(err) {
 			return false, fmt.Errorf("clearing interrupted database ownership: %w", err)
@@ -1884,7 +2137,13 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 			return nil, fmt.Errorf("rig name %q is reserved for town-level infrastructure", opts.Name)
 		}
 	}
-	if recovered, err := m.reconcileRigRegistration(opts.Name); err != nil {
+	if recovered, err := m.reconcileRigRegistration(opts.Name, rigRegistrationExpectation{
+		Kind:        rigRegistrationKindRegister,
+		GitURL:      opts.GitURL,
+		PushURL:     opts.PushURL,
+		UpstreamURL: opts.UpstreamURL,
+		BeadsPrefix: opts.BeadsPrefix,
+	}); err != nil {
 		return nil, err
 	} else if recovered {
 		entry := m.config.Rigs[opts.Name]
@@ -1975,14 +2234,11 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 	// the push_url feature. Auto-detection may fail silently (returns empty on git errors)
 	// and must not trigger stale URL clearing.
 	pushURL := ""
-	pushURLAuthoritative := false // whether the source can be trusted for clearing decisions
 	if opts.PushURL != "" {
 		pushURL = opts.PushURL
-		pushURLAuthoritative = true
 	} else if existingConfig != nil && existingConfig.PushURL != "" {
 		// Config.json has an explicit push URL — use it as authoritative
 		pushURL = existingConfig.PushURL
-		pushURLAuthoritative = true
 	} else {
 		// No authoritative push URL source: either no config.json (fresh adopt) or
 		// legacy config without push_url field. Auto-detect from existing git remotes.
@@ -1990,67 +2246,6 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 		// Not authoritative — only use for positive detection, never for clearing
 	}
 
-	// Apply push URL to existing repos (mirrors AddRig behavior).
-	bareRepoPath := filepath.Join(rigPath, ".repo.git")
-	mayorRigPath := filepath.Join(rigPath, "mayor", "rig")
-	if pushURL != "" {
-		if _, err := os.Stat(bareRepoPath); err == nil {
-			bareGit := git.NewGitWithDir(bareRepoPath, "")
-			if cfgErr := bareGit.ConfigurePushURL("origin", pushURL); cfgErr != nil {
-				return nil, fmt.Errorf("configuring push URL on bare repo: %w", cfgErr)
-			}
-		}
-		if _, err := os.Stat(mayorRigPath); err == nil {
-			mayorGit := git.NewGit(mayorRigPath)
-			if cfgErr := mayorGit.ConfigurePushURL("origin", pushURL); cfgErr != nil {
-				return nil, fmt.Errorf("configuring mayor push URL: %w", cfgErr)
-			}
-		}
-	} else if pushURLAuthoritative {
-		// Clear stale push URLs only when an authoritative source says "no push URL".
-		// Auto-detection returning empty could be a git error — don't clear in that case.
-		// Note: currently unreachable — authoritative sources always set non-empty pushURL.
-		// Retained for future --no-push-url flag support.
-		if _, err := os.Stat(bareRepoPath); err == nil {
-			bareGit := git.NewGitWithDir(bareRepoPath, "")
-			if clrErr := bareGit.ClearPushURL("origin"); clrErr != nil {
-				return nil, fmt.Errorf("clearing stale push URL on bare repo: %w", clrErr)
-			}
-		}
-		if _, err := os.Stat(mayorRigPath); err == nil {
-			mayorGit := git.NewGit(mayorRigPath)
-			if clrErr := mayorGit.ClearPushURL("origin"); clrErr != nil {
-				return nil, fmt.Errorf("clearing stale mayor push URL: %w", clrErr)
-			}
-		}
-	}
-
-	// Sync push URL to config.json so doctor check sees it
-	if existingConfig != nil && existingConfig.PushURL != pushURL {
-		existingConfig.PushURL = pushURL
-		if saveErr := m.saveRigConfig(rigPath, existingConfig); saveErr != nil {
-			// Non-fatal: town.json has the value, but doctor may flag a mismatch
-			fmt.Fprintf(os.Stderr, "Warning: could not update config.json with push URL: %v\n", saveErr)
-		}
-	}
-
-	// Configure upstream remote if provided (for fork workflows)
-	if opts.UpstreamURL != "" {
-		if _, err := os.Stat(bareRepoPath); err == nil {
-			bareGit := git.NewGitWithDir(bareRepoPath, "")
-			if upErr := bareGit.AddUpstreamRemote(opts.UpstreamURL); upErr != nil {
-				return nil, fmt.Errorf("configuring upstream remote on bare repo: %w", upErr)
-			}
-		}
-		if _, err := os.Stat(mayorRigPath); err == nil {
-			mayorGit := git.NewGit(mayorRigPath)
-			if upErr := mayorGit.AddUpstreamRemote(opts.UpstreamURL); upErr != nil {
-				return nil, fmt.Errorf("configuring mayor upstream remote: %w", upErr)
-			}
-		}
-	}
-
-	// Register in town config only after all repository mutations succeed.
 	entry := config.RigEntry{
 		GitURL:      result.GitURL,
 		PushURL:     pushURL,
@@ -2059,18 +2254,37 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 		BeadsConfig: &config.BeadsConfig{
 			Prefix: result.BeadsPrefix,
 		},
-		RegistrationToken:   routeReservation.Token,
-		RegistrationPending: true,
+		RegistrationToken:     routeReservation.Token,
+		RegistrationPending:   true,
+		RegistrationKind:      rigRegistrationKindRegister,
+		RegistrationRoutePath: routeReservation.Route.Path,
 	}
+	if metadataDatabase, err := registrationDatabaseIdentity(filepath.Join(m.townRoot, routeReservation.Route.Path)); err != nil {
+		return nil, err
+	} else if metadataDatabase != "" && metadataDatabase != opts.Name {
+		return nil, fmt.Errorf("rig metadata names database %q, want %q", metadataDatabase, opts.Name)
+	} else {
+		entry.RegistrationDatabase = metadataDatabase
+	}
+	if err := beginRigRegistrationJournal(m.townRoot, opts.Name, routeReservation.Token); err != nil {
+		return nil, fmt.Errorf("starting repository mutation journal: %w", err)
+	}
+	if err := m.applyRigRegistrationRepositoryConfig(opts.Name, entry); err != nil {
+		return nil, abortRigRegistrationJournal(m.townRoot, opts.Name, routeReservation.Token, err)
+	}
+
+	// Register in town config only after all repository mutations succeed.
 	rigsPath := filepath.Join(m.townRoot, "mayor", "rigs.json")
 	savedConfig, err := persistPendingRigRegistration(rigsPath, opts.Name, entry)
 	if err != nil {
-		return nil, fmt.Errorf("registering rig in rigs.json: %w", err)
+		return nil, abortRigRegistrationJournal(m.townRoot, opts.Name, routeReservation.Token, fmt.Errorf("registering rig in rigs.json: %w", err))
 	}
 	registrationDurable = true
-	*m.config = *savedConfig
 	if err := beads.CommitRouteReservation(m.townRoot, routeReservation); err != nil {
 		return nil, fmt.Errorf("committing issue prefix route: %w", err)
+	}
+	if err := retireRigRegistrationJournal(m.townRoot, opts.Name, routeReservation.Token); err != nil {
+		return nil, fmt.Errorf("retiring repository mutation journal: %w", err)
 	}
 	savedConfig, err = markRigRegistrationCommitted(rigsPath, opts.Name, routeReservation.Token)
 	if err != nil {
@@ -2079,6 +2293,77 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 	*m.config = *savedConfig
 
 	return result, nil
+}
+
+func registrationDatabaseIdentity(workDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(workDir, ".beads", "metadata.json"))
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading rig metadata: %w", err)
+	}
+	var metadata struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return "", fmt.Errorf("parsing rig metadata: %w", err)
+	}
+	if metadata.DoltMode != "server" {
+		return "", nil
+	}
+	if metadata.DoltDatabase == "" {
+		return "", fmt.Errorf("server-mode rig metadata has no Dolt database")
+	}
+	return metadata.DoltDatabase, nil
+}
+
+func (m *Manager) applyRigRegistrationRepositoryConfig(name string, entry config.RigEntry) error {
+	rigPath := filepath.Join(m.townRoot, name)
+	targets := []struct {
+		path string
+		bare bool
+		name string
+	}{
+		{filepath.Join(rigPath, ".repo.git"), true, "bare repo"},
+		{filepath.Join(rigPath, "mayor", "rig"), false, "mayor repo"},
+	}
+	for _, target := range targets {
+		if _, err := os.Stat(target.path); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("checking %s: %w", target.name, err)
+		}
+		var repo *git.Git
+		if target.bare {
+			repo = git.NewGitWithDir(target.path, "")
+		} else {
+			repo = git.NewGit(target.path)
+		}
+		if entry.PushURL != "" {
+			if err := repo.ConfigurePushURL("origin", entry.PushURL); err != nil {
+				return fmt.Errorf("configuring push URL on %s: %w", target.name, err)
+			}
+		}
+		if entry.UpstreamURL != "" {
+			if err := repo.AddUpstreamRemote(entry.UpstreamURL); err != nil {
+				return fmt.Errorf("configuring upstream remote on %s: %w", target.name, err)
+			}
+		}
+	}
+	if rigConfig, err := LoadRigConfig(rigPath); err == nil {
+		if rigConfig.PushURL != entry.PushURL || rigConfig.UpstreamURL != entry.UpstreamURL {
+			rigConfig.PushURL = entry.PushURL
+			rigConfig.UpstreamURL = entry.UpstreamURL
+			if err := m.saveRigConfig(rigPath, rigConfig); err != nil {
+				return fmt.Errorf("updating rig config remote URLs: %w", err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("loading rig config for remote update: %w", err)
+	}
+	return nil
 }
 
 // detectPushURL attempts to detect a custom push URL from an existing repository.

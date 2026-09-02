@@ -1662,7 +1662,7 @@ func TestReconcilePendingRigRegistrationCommitsRoute(t *testing.T) {
 	}
 
 	manager := NewManager(root, rigsConfig, git.NewGit(root))
-	recovered, err := manager.reconcileRigRegistration(rigName)
+	recovered, err := manager.reconcileRigRegistration(rigName, rigRegistrationExpectation{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1677,13 +1677,103 @@ func TestReconcilePendingRigRegistrationCommitsRoute(t *testing.T) {
 	if len(routes) != 1 || routes[0].Prefix != "rc-" || routes[0].Path != rigName {
 		t.Fatalf("routes = %v, want recovered rc- route", routes)
 	}
-	persisted, err := config.LoadRigsConfig(rigsPath)
+	persisted, err := config.LoadRigsConfigIncludingPending(rigsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	entry := persisted.Rigs[rigName]
 	if entry.RegistrationPending || entry.RegistrationToken != reservation.Token {
 		t.Fatalf("registration state = %#v, want committed token %q", entry, reservation.Token)
+	}
+}
+
+func TestReconcilePendingRigRegistrationUsesStoredRoutePath(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	rigName := "stored_route"
+	if err := os.MkdirAll(filepath.Join(root, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := beads.ReserveRoute(root, beads.Route{Prefix: "sr-", Path: rigName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rigsPath := filepath.Join(root, "mayor", "rigs.json")
+	if err := config.SaveRigsConfig(rigsPath, &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{rigName: {
+			RegistrationToken: reservation.Token, RegistrationPending: true,
+			RegistrationRoutePath: rigName, BeadsConfig: &config.BeadsConfig{Prefix: "sr"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	if recovered, err := manager.reconcileRigRegistration(rigName, rigRegistrationExpectation{}); err != nil || !recovered {
+		t.Fatalf("reconcile stored route: recovered=%v err=%v", recovered, err)
+	}
+	routes, err := beads.LoadRoutes(filepath.Join(root, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Path != rigName {
+		t.Fatalf("route was re-derived from mutable filesystem: %v", routes)
+	}
+}
+
+func TestReconcilePendingAddAfterOwnershipRetirement(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	rigName := "retired_add"
+	if err := os.MkdirAll(filepath.Join(root, rigName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := beads.ReserveRoute(root, beads.Route{Prefix: "ra-", Path: rigName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := beads.CommitRouteReservation(root, reservation); err != nil {
+		t.Fatal(err)
+	}
+	rigsPath := filepath.Join(root, "mayor", "rigs.json")
+	if err := config.SaveRigsConfig(rigsPath, &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{rigName: {
+			RegistrationToken: reservation.Token, RegistrationPending: true,
+			RegistrationKind: rigRegistrationKindAdd, RegistrationRoutePath: rigName,
+			RegistrationPathToken: "retired-owner", BeadsConfig: &config.BeadsConfig{Prefix: "ra"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	if recovered, err := manager.reconcileRigRegistration(rigName, rigRegistrationExpectation{Kind: rigRegistrationKindAdd}); err != nil || !recovered {
+		t.Fatalf("reconcile retired add: recovered=%v err=%v", recovered, err)
+	}
+}
+
+func TestReconcilePendingRegistrationRejectsChangedRequest(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	rigName := "changed_request"
+	if err := os.MkdirAll(filepath.Join(root, rigName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := beads.ReserveRoute(root, beads.Route{Prefix: "cr-", Path: rigName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rigsPath := filepath.Join(root, "mayor", "rigs.json")
+	if err := config.SaveRigsConfig(rigsPath, &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{rigName: {
+			GitURL: "old-url", RegistrationToken: reservation.Token, RegistrationPending: true,
+			RegistrationKind: rigRegistrationKindRegister, RegistrationRoutePath: rigName,
+			BeadsConfig: &config.BeadsConfig{Prefix: "cr"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	if _, err := manager.reconcileRigRegistration(rigName, rigRegistrationExpectation{GitURL: "new-url"}); err == nil || !strings.Contains(err.Error(), "current request") {
+		t.Fatalf("changed request error = %v", err)
 	}
 }
 
@@ -1697,12 +1787,73 @@ func TestPersistPendingRigRegistrationRejectsDifferentToken(t *testing.T) {
 	if _, err := persistPendingRigRegistration(path, "owned", config.RigEntry{RegistrationToken: "second", RegistrationPending: true}); err == nil {
 		t.Fatal("different registration token overwrote durable owner")
 	}
-	persisted, err := config.LoadRigsConfig(path)
+	persisted, err := config.LoadRigsConfigIncludingPending(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := persisted.Rigs["owned"].RegistrationToken; got != "first" {
 		t.Fatalf("registration token = %q, want first", got)
+	}
+}
+
+func TestRegisterRigFailureRestoresEarlierRemoteMutation(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	rigName := "rollback_remote"
+	rigPath := filepath.Join(root, rigName)
+	barePath := filepath.Join(rigPath, ".repo.git")
+	mayorPath := filepath.Join(rigPath, "mayor", "rig")
+	upstreamURL := filepath.Join(root, "upstream.git")
+	pushURL := filepath.Join(root, "fork.git")
+	for _, path := range []string{upstreamURL, pushURL} {
+		if out, err := exec.Command("git", "init", "--bare", path).CombinedOutput(); err != nil {
+			t.Fatalf("git init --bare: %v\n%s", err, out)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(barePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "clone", "--bare", upstreamURL, barePath).CombinedOutput(); err != nil {
+		t.Fatalf("clone bare: %v\n%s", err, out)
+	}
+	if err := os.MkdirAll(filepath.Dir(mayorPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "clone", upstreamURL, mayorPath).CombinedOutput(); err != nil {
+		t.Fatalf("clone mayor: %v\n%s", err, out)
+	}
+	bareConfig := filepath.Join(barePath, "config")
+	before, err := os.ReadFile(bareConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mayorConfig := filepath.Join(mayorPath, ".git", "config")
+	if err := os.WriteFile(mayorConfig, []byte("[broken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = manager.RegisterRig(RegisterRigOptions{
+		Name: rigName, GitURL: upstreamURL, PushURL: pushURL, BeadsPrefix: "rr", Force: true,
+	})
+	if err == nil {
+		t.Fatal("RegisterRig succeeded with malformed mayor Git config")
+	}
+	after, err := os.ReadFile(bareConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("bare Git config retained partial mutation\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	if _, err := os.Stat(rigRegistrationJournalPath(root, rigName)); !os.IsNotExist(err) {
+		t.Fatalf("registration journal remains after successful rollback: %v", err)
+	}
+	routes, err := beads.LoadRoutes(filepath.Join(root, ".beads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 0 {
+		t.Fatalf("failed registration published route: %v", routes)
 	}
 }
 

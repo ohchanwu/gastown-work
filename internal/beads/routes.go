@@ -82,6 +82,13 @@ func loadRoutes(beadsDir string) ([]Route, error) {
 			fmt.Fprintf(os.Stderr, "Warning: skipping malformed route at %s:%d: %v\n", routesPath, lineNum, err)
 			continue
 		}
+		// b934 wrote pending routes by overwriting Path before PendingPath
+		// existed. Treat those records as unpublished so the durable token can
+		// still commit or release them safely.
+		if route.PendingReservations != "" && route.PendingPath == "" {
+			route.PendingPath = route.Path
+			route.Path = ""
+		}
 		if route.Prefix != "" && (route.Path != "" || route.PendingPath != "") {
 			routes = append(routes, route)
 		}
@@ -161,6 +168,68 @@ func reserveRouteToDir(beadsDir string, route Route) (RouteReservation, error) {
 // rollback for callers that reserved the same exact route.
 func CommitRouteReservation(townRoot string, reservation RouteReservation) error {
 	return commitRouteReservationToDir(filepath.Join(townRoot, ".beads"), reservation)
+}
+
+// RouteReservationPath returns the durable path owned by reservation. It is
+// used only to migrate registrations written before their route path was
+// copied into rigs.json.
+func RouteReservationPath(townRoot, prefix, token string) (string, error) {
+	if prefix == "" || token == "" {
+		return "", fmt.Errorf("route prefix and reservation token are required")
+	}
+	var path string
+	err := withRoutesOwnership(filepath.Join(townRoot, ".beads"), func() error {
+		routes, err := loadRoutes(filepath.Join(townRoot, ".beads"))
+		if err != nil {
+			return err
+		}
+		for _, route := range routes {
+			if route.Prefix != prefix {
+				continue
+			}
+			if route.PendingPath != "" && hasRouteReservation(route.PendingReservations, token) {
+				path = route.PendingPath
+				return nil
+			}
+			if route.Path != "" && route.PendingReservations == "" {
+				path = route.Path
+				return nil
+			}
+			return fmt.Errorf("route reservation for prefix %q is no longer owned by this registration", prefix)
+		}
+		return fmt.Errorf("route reservation for prefix %q is no longer present", prefix)
+	})
+	return path, err
+}
+
+// RouteReservationCommitted reports which side of the durable publish boundary
+// contains reservation.
+func RouteReservationCommitted(townRoot string, reservation RouteReservation) (bool, error) {
+	if reservation.Route.Prefix == "" || reservation.Route.Path == "" || reservation.Token == "" {
+		return false, fmt.Errorf("complete route reservation is required")
+	}
+	committed := false
+	err := withRoutesOwnership(filepath.Join(townRoot, ".beads"), func() error {
+		routes, err := loadRoutes(filepath.Join(townRoot, ".beads"))
+		if err != nil {
+			return err
+		}
+		for _, route := range routes {
+			if route.Prefix != reservation.Route.Prefix {
+				continue
+			}
+			if route.PendingPath == reservation.Route.Path && hasRouteReservation(route.PendingReservations, reservation.Token) {
+				return nil
+			}
+			if route.Path == reservation.Route.Path && route.PendingReservations == "" {
+				committed = true
+				return nil
+			}
+			return fmt.Errorf("route reservation for prefix %q changed", route.Prefix)
+		}
+		return fmt.Errorf("route reservation for prefix %q is no longer present", reservation.Route.Prefix)
+	})
+	return committed, err
 }
 
 func commitRouteReservationToDir(beadsDir string, reservation RouteReservation) error {

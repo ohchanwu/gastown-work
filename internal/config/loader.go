@@ -88,6 +88,16 @@ func SaveTownConfig(path string, config *TownConfig) error {
 // SaveRigsConfig now using atomic write-then-rename this is belt-and-suspenders
 // against older versions that may still be writing the file.
 func LoadRigsConfig(path string) (*RigsConfig, error) {
+	return loadRigsConfig(path, false)
+}
+
+// LoadRigsConfigIncludingPending is reserved for registration recovery. Normal
+// readers must not observe half-committed rigs.
+func LoadRigsConfigIncludingPending(path string) (*RigsConfig, error) {
+	return loadRigsConfig(path, true)
+}
+
+func loadRigsConfig(path string, includePending bool) (*RigsConfig, error) {
 	readAndParse := func() (*RigsConfig, error) {
 		data, err := os.ReadFile(path) //nolint:gosec // G304: path is constructed internally, not from user input
 		if err != nil {
@@ -106,6 +116,13 @@ func LoadRigsConfig(path string) (*RigsConfig, error) {
 			return nil, err
 		}
 
+		if !includePending {
+			for name, entry := range config.Rigs {
+				if entry.RegistrationPending {
+					delete(config.Rigs, name)
+				}
+			}
+		}
 		return &config, nil
 	}
 
@@ -131,7 +148,7 @@ func UpdateRigsConfig(path string, update func(*RigsConfig) error) error {
 		return fmt.Errorf("rigs config update is required")
 	}
 	return withRigsConfigOwnership(path, func() error {
-		current, err := LoadRigsConfig(path)
+		current, err := LoadRigsConfigIncludingPending(path)
 		if errors.Is(err, ErrNotFound) {
 			current = &RigsConfig{Version: CurrentRigsVersion, Rigs: make(map[string]RigEntry)}
 		} else if err != nil {

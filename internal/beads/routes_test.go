@@ -192,6 +192,37 @@ func TestPendingRouteIsNotPublishedBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestLegacyPendingRouteMigratesWithoutPublication(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, RoutesFileName), []byte(`{"prefix":"zz-","path":"alpha","_gt_reservations":"legacy-token"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := LoadRoutes(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 0 {
+		t.Fatalf("legacy pending route was published: %v", routes)
+	}
+	if err := CommitRouteReservation(townRoot, RouteReservation{
+		Route: Route{Prefix: "zz-", Path: "alpha"},
+		Token: "legacy-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	routes, err = LoadRoutes(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].Prefix != "zz-" || routes[0].Path != "alpha" {
+		t.Fatalf("migrated route = %v, want committed zz-/alpha", routes)
+	}
+}
+
 func TestRouteReleaseRestoresCommittedPredecessor(t *testing.T) {
 	townRoot := t.TempDir()
 	committed := Route{Prefix: "zz-", Path: "alpha/old"}

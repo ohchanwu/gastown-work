@@ -46,6 +46,35 @@ func TestSaveRigsConfigWaitsForDatabaseOwnership(t *testing.T) {
 	}
 }
 
+func TestLoadRigsConfigHidesPendingRegistrations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mayor", "rigs.json")
+	cfg := &RigsConfig{Version: CurrentRigsVersion, Rigs: map[string]RigEntry{
+		"ready":   {GitURL: "ready"},
+		"pending": {GitURL: "pending", RegistrationToken: "token", RegistrationPending: true},
+	}}
+	if err := SaveRigsConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	public, err := LoadRigsConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := public.Rigs["pending"]; ok {
+		t.Fatal("pending registration leaked through public loader")
+	}
+	if _, ok := public.Rigs["ready"]; !ok {
+		t.Fatal("committed registration was hidden")
+	}
+	raw, err := LoadRigsConfigIncludingPending(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw.Rigs["pending"]; !ok {
+		t.Fatal("recovery loader did not return pending registration")
+	}
+}
+
 func TestUpdateRigsConfigSerializesReadModifyWrite(t *testing.T) {
 	townRoot := t.TempDir()
 	path := filepath.Join(townRoot, "mayor", "rigs.json")

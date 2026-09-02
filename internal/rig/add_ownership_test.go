@@ -9,6 +9,9 @@ import (
 
 func TestRecoverInterruptedAddRemovesExactCreatedDatabase(t *testing.T) {
 	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "recovering", ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	rigPath := filepath.Join(townRoot, "recovering")
 	if err := os.MkdirAll(rigPath, 0o755); err != nil {
 		t.Fatal(err)
@@ -16,16 +19,16 @@ func TestRecoverInterruptedAddRemovesExactCreatedDatabase(t *testing.T) {
 	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{Owner: "owner-token", Root: "dolt-root:exact", RoutePrefix: "rc-", RoutePath: "recovering", RouteToken: "route-token"}); err != nil {
+	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{Owner: "owner-token", DatabaseToken: "database-token", RoutePrefix: "rc-", RoutePath: "recovering", RouteToken: "route-token"}); err != nil {
 		t.Fatal(err)
 	}
 	previous := removeAddDatabase
 	t.Cleanup(func() { removeAddDatabase = previous })
 	called := false
-	removeAddDatabase = func(gotTown, gotName, gotRoot string, force bool) error {
+	removeAddDatabase = func(gotTown, gotName, gotToken string, force bool) error {
 		called = true
-		if gotTown != townRoot || gotName != "recovering" || gotRoot != "dolt-root:exact" || !force {
-			t.Fatalf("cleanup args = %q, %q, %q, %v", gotTown, gotName, gotRoot, force)
+		if gotTown != townRoot || gotName != "recovering" || gotToken != "database-token" || !force {
+			t.Fatalf("cleanup args = %q, %q, %q, %v", gotTown, gotName, gotToken, force)
 		}
 		return nil
 	}
@@ -44,6 +47,9 @@ func TestRecoverInterruptedAddRemovesExactCreatedDatabase(t *testing.T) {
 
 func TestRecoverInterruptedAddPreservesPathWhenDatabaseIdentityChanged(t *testing.T) {
 	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "recovering", ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	rigPath := filepath.Join(townRoot, "recovering")
 	if err := os.MkdirAll(rigPath, 0o755); err != nil {
 		t.Fatal(err)
@@ -51,13 +57,13 @@ func TestRecoverInterruptedAddPreservesPathWhenDatabaseIdentityChanged(t *testin
 	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{Owner: "owner-token", Root: "dolt-root:old", RoutePrefix: "rc-", RoutePath: "recovering", RouteToken: "route-token"}); err != nil {
+	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{Owner: "owner-token", DatabaseToken: "database-token", RoutePrefix: "rc-", RoutePath: "recovering", RouteToken: "route-token"}); err != nil {
 		t.Fatal(err)
 	}
 	previous := removeAddDatabase
 	t.Cleanup(func() { removeAddDatabase = previous })
 	removeAddDatabase = func(string, string, string, bool) error {
-		return errors.New("database no longer matches owning root incarnation")
+		return errors.New("database no longer matches owning creation token")
 	}
 
 	if _, err := recoverInterruptedAdd(townRoot, "recovering"); err == nil {

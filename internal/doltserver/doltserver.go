@@ -3485,13 +3485,13 @@ func jsonKeys(m map[string]json.RawMessage) []string {
 // Returns (serverWasRunning, created, err). created is false when the database
 // already existed on disk (idempotent no-op).
 func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err error) {
-	serverWasRunning, created, _, err = InitRigOwned(townRoot, rigName)
+	serverWasRunning, created, _, err = InitRigOwned(townRoot, rigName, "")
 	return serverWasRunning, created, err
 }
 
-// InitRigOwned also returns the stable root identity of a database it created.
-// Callers use that identity for exact compensating cleanup after later failure.
-func InitRigOwned(townRoot, rigName string) (serverWasRunning bool, created bool, rootIdentity string, err error) {
+// InitRigOwned durably stamps a newly created database with creationToken so
+// its caller can perform generation-bound compensating cleanup.
+func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning bool, created bool, ownedToken string, err error) {
 	if rigName == "" {
 		return false, false, "", fmt.Errorf("rig name cannot be empty")
 	}
@@ -3550,6 +3550,12 @@ func InitRigOwned(townRoot, rigName string) (serverWasRunning bool, created bool
 				}
 				InvalidateDBCache()
 			}
+			if created && creationToken != "" {
+				if err := writeDatabaseCleanupFileDurable(filepath.Join(rigDir, databaseCreationOwnerFile), []byte(creationToken+"\n"), 0o600); err != nil {
+					return fmt.Errorf("stamping created database ownership: %w", err)
+				}
+				ownedToken = creationToken
+			}
 
 			beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
 			if err != nil {
@@ -3557,13 +3563,6 @@ func InitRigOwned(townRoot, rigName string) (serverWasRunning bool, created bool
 			}
 			if err := ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName); err != nil {
 				return fmt.Errorf("publishing database ownership: %w", err)
-			}
-			if created {
-				incarnation, err := databaseCleanupIncarnation(townRoot, rigName, rigDir, serverWasRunning)
-				if err != nil {
-					return fmt.Errorf("capturing created database identity: %w", err)
-				}
-				rootIdentity = databaseCleanupRootIdentity(incarnation)
 			}
 			return nil
 		}); err != nil {
@@ -3575,15 +3574,15 @@ func InitRigOwned(townRoot, rigName string) (serverWasRunning bool, created bool
 		return nil
 	})
 	if err != nil {
-		return serverWasRunning, created, rootIdentity, err
+		return serverWasRunning, created, ownedToken, err
 	}
 	if !serverWasRunning {
 		if err := EnsureRigIssuePrefix(townRoot, rigName, false); err != nil {
-			return serverWasRunning, created, rootIdentity, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
+			return serverWasRunning, created, ownedToken, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
 		}
 	}
 
-	return serverWasRunning, created, rootIdentity, nil
+	return serverWasRunning, created, ownedToken, nil
 }
 
 // EnsureRigIssuePrefix initializes the beads schema for a rig database and
@@ -4269,6 +4268,9 @@ func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 }
 
 func upgradeDatabaseMigrationReceipt(townRoot, receiptPath string, receipt databaseMigrationReceipt) (databaseMigrationReceipt, error) {
+	if receipt.Version == 1 && receipt.Phase == databaseMigrationCleanupRemoving {
+		return receipt, fmt.Errorf("legacy partial migration cleanup has no durable identity; preserving it for manual recovery")
+	}
 	legacyCleanupPath := receipt.SourcePath + ".migration-cleanup"
 	if receipt.Version == databaseMigrationReceiptVersion && receipt.CleanupPath != legacyCleanupPath {
 		return receipt, nil
@@ -4281,12 +4283,6 @@ func upgradeDatabaseMigrationReceipt(townRoot, receiptPath string, receipt datab
 		}
 		receipt.Version = databaseMigrationReceiptVersion
 		receipt.TargetToken = token
-		if receipt.Phase == databaseMigrationCleanupRemoving {
-			receipt.CleanupToken, err = newDatabaseMigrationCleanupToken()
-			if err != nil {
-				return receipt, err
-			}
-		}
 		receipt.LegacyUpgrade = true
 		if err := writeDatabaseMigrationReceipt(receiptPath, receipt); err != nil {
 			return receipt, err
@@ -4363,17 +4359,14 @@ func upgradeDatabaseMigrationReceipt(townRoot, receiptPath string, receipt datab
 		}
 		claimPath := filepath.Join(claimRel, databaseMigrationCleanupClaimName)
 		if _, err := root.Lstat(claimPath); os.IsNotExist(err) {
-			partialLegacyRemoval := wasVersionOne && receipt.Phase == databaseMigrationCleanupRemoving
-			if !claimComplete && !partialLegacyRemoval {
+			if !claimComplete {
 				return receipt, fmt.Errorf("legacy migration cleanup claim is incomplete")
 			}
 			if !allowLegacyClaim {
 				return receipt, fmt.Errorf("migration cleanup claim has no durable identity")
 			}
-			if !partialLegacyRemoval {
-				if err := verifyDatabaseMigrationDigestAt(root, claimRel, receipt.SourceDigest); err != nil {
-					return receipt, err
-				}
+			if err := verifyDatabaseMigrationDigestAt(root, claimRel, receipt.SourceDigest); err != nil {
+				return receipt, err
 			}
 			if err := writeDatabaseMigrationClaim(root, claimRel, receipt.CleanupToken); err != nil {
 				return receipt, err
@@ -4786,14 +4779,13 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 					if cleanupExists {
 						return removeEmptyClaimedDatabaseMigrationRoot(root, cleanupRel, emptyRel, receipt.CleanupToken)
 					}
-					return removeEmptyDatabaseMigrationQuarantine(root, emptyRel)
+					return verifyEmptyDatabaseMigrationQuarantine(root, emptyRel)
 				}); err != nil {
 					return err
 				}
 				if err := syncDatabaseMigrationDirectory(root, filepath.Dir(cleanupRel)); err != nil {
 					return err
 				}
-				continue
 			}
 			receipt.Phase = databaseMigrationSourceCleaned
 			if err := writeDatabaseMigrationReceipt(receiptPath, receipt); err != nil {
@@ -5034,7 +5026,7 @@ func removeEmptyClaimedDatabaseMigrationRoot(root *os.Root, cleanupRel, emptyRel
 	if !os.SameFile(cleanupInfo, movedInfo) || len(movedEntries) != 0 {
 		return errors.Join(fmt.Errorf("migration cleanup identity changed"), rollbackEmptyDatabaseMigrationMove(root, emptyRel, cleanupRel))
 	}
-	return removeEmptyDatabaseMigrationQuarantine(root, emptyRel)
+	return verifyEmptyDatabaseMigrationQuarantine(root, emptyRel)
 }
 
 func rollbackEmptyDatabaseMigrationMove(root *os.Root, fromRel, toRel string) error {
@@ -5049,7 +5041,7 @@ func rollbackEmptyDatabaseMigrationMove(root *os.Root, fromRel, toRel string) er
 	return syncDatabaseMigrationDirectory(root, filepath.Dir(toRel))
 }
 
-func removeEmptyDatabaseMigrationQuarantine(root *os.Root, emptyRel string) error {
+func verifyEmptyDatabaseMigrationQuarantine(root *os.Root, emptyRel string) error {
 	emptyRoot, err := root.OpenRoot(emptyRel)
 	if err != nil {
 		return err
@@ -5073,19 +5065,9 @@ func removeEmptyDatabaseMigrationQuarantine(root *os.Root, emptyRel string) erro
 		_ = emptyRoot.Close()
 		return fmt.Errorf("migration empty quarantine contains unclaimed data")
 	}
-	if err := root.Remove(emptyRel); err != nil {
-		_ = emptyRoot.Close()
-		return fmt.Errorf("removing empty migration cleanup quarantine: %w", err)
-	}
-	entries, readErr := fs.ReadDir(emptyRoot.FS(), ".")
-	closeErr := emptyRoot.Close()
-	if err := errors.Join(readErr, closeErr); err != nil {
-		return err
-	}
-	if len(entries) != 0 {
-		return fmt.Errorf("removed migration quarantine identity gained data")
-	}
-	return syncDatabaseMigrationDirectory(root, filepath.Dir(emptyRel))
+	// POSIX has no unlink-if-inode primitive. Retaining this token-bound empty
+	// tombstone avoids deleting a same-name replacement after revalidation.
+	return emptyRoot.Close()
 }
 
 func verifyDatabaseMigrationDigestAt(root *os.Root, rel, want string) error {
@@ -5934,7 +5916,10 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 	return owners
 }
 
-const databaseCleanupReceiptVersion = 3
+const (
+	databaseCleanupReceiptVersion = 3
+	databaseCreationOwnerFile     = ".gastown-creation-owner"
+)
 
 type databaseCleanupPhase string
 
@@ -5945,11 +5930,12 @@ const (
 )
 
 type databaseCleanupReceipt struct {
-	Version     int                  `json:"version"`
-	Database    string               `json:"database"`
-	Force       bool                 `json:"force"`
-	Phase       databaseCleanupPhase `json:"phase"`
-	Incarnation string               `json:"incarnation"`
+	Version       int                  `json:"version"`
+	Database      string               `json:"database"`
+	Force         bool                 `json:"force"`
+	Phase         databaseCleanupPhase `json:"phase"`
+	Incarnation   string               `json:"incarnation"`
+	CreationToken string               `json:"creation_token,omitempty"`
 }
 
 var (
@@ -5971,16 +5957,16 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 	return removeDatabase(townRoot, dbName, force, "")
 }
 
-// RemoveDatabaseIfRootIncarnation removes dbName only when it is still the
-// database created by the owning operation.
-func RemoveDatabaseIfRootIncarnation(townRoot, dbName, rootIdentity string, force bool) error {
-	if rootIdentity == "" {
-		return fmt.Errorf("database root identity is required")
+// RemoveDatabaseIfCreationToken removes dbName only when it still carries the
+// exact durable token written by InitRigOwned.
+func RemoveDatabaseIfCreationToken(townRoot, dbName, creationToken string, force bool) error {
+	if creationToken == "" {
+		return fmt.Errorf("database creation token is required")
 	}
-	return removeDatabase(townRoot, dbName, force, rootIdentity)
+	return removeDatabase(townRoot, dbName, force, creationToken)
 }
 
-func removeDatabase(townRoot, dbName string, force bool, rootIdentity string) error {
+func removeDatabase(townRoot, dbName string, force bool, creationToken string) error {
 	if _, err := DatabasePath(townRoot, dbName); err != nil {
 		return err
 	}
@@ -6011,11 +5997,11 @@ func removeDatabase(townRoot, dbName string, force bool, rootIdentity string) er
 			return fmt.Errorf("tightening database cleanup lock for %q: %w", dbName, err)
 		}
 
-		return removeDatabaseLocked(townRoot, dbName, force, rootIdentity)
+		return removeDatabaseLocked(townRoot, dbName, force, creationToken)
 	})
 }
 
-func removeDatabaseLocked(townRoot, dbName string, force bool, rootIdentity string) error {
+func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken string) error {
 	config := DefaultConfig(townRoot)
 	dbPath := filepath.Join(config.DataDir, dbName)
 	receiptPath := databaseCleanupReceiptPath(townRoot, dbName)
@@ -6027,8 +6013,8 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, rootIdentity stri
 		if receipt.Force && !force {
 			return fmt.Errorf("database %q has a pending forced cleanup — rerun with --force", dbName)
 		}
-		if rootIdentity != "" && databaseCleanupRootIdentity(receipt.Incarnation) != rootIdentity {
-			return fmt.Errorf("database %q no longer matches owning root incarnation", dbName)
+		if creationToken != "" && receipt.CreationToken != creationToken {
+			return fmt.Errorf("database %q no longer matches owning creation token", dbName)
 		}
 		running, _, runningErr := IsRunning(townRoot)
 		if runningErr != nil {
@@ -6053,8 +6039,14 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, rootIdentity stri
 	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
 		return fmt.Errorf("database %q not found at %s", dbName, dbPath)
 	}
-	if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
-		return err
+	if creationToken != "" {
+		if err := verifyDatabaseCreationToken(dbPath, creationToken); err != nil {
+			return fmt.Errorf("database %q no longer matches owning creation token: %w", dbName, err)
+		}
+	} else {
+		if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
+			return err
+		}
 	}
 
 	// Safety check: if DB has real data and force is not set, refuse. (gt-q8f6n, gt-xvh)
@@ -6105,12 +6097,9 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, rootIdentity stri
 		if err != nil {
 			return fmt.Errorf("identifying database %q before cleanup: %w", dbName, err)
 		}
-		if rootIdentity != "" && databaseCleanupRootIdentity(incarnation) != rootIdentity {
-			return fmt.Errorf("database %q no longer matches owning root incarnation", dbName)
-		}
 		receipt = databaseCleanupReceipt{
 			Version: databaseCleanupReceiptVersion, Database: dbName, Force: force,
-			Phase: databaseCleanupPrepared, Incarnation: incarnation,
+			Phase: databaseCleanupPrepared, Incarnation: incarnation, CreationToken: creationToken,
 		}
 		if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
 			return fmt.Errorf("writing database cleanup receipt for %q: %w", dbName, err)
@@ -6122,15 +6111,12 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, rootIdentity stri
 	if err != nil {
 		return fmt.Errorf("identifying offline database %q before cleanup: %w", dbName, err)
 	}
-	if rootIdentity != "" && databaseCleanupRootIdentity(incarnation) != rootIdentity {
-		return fmt.Errorf("database %q no longer matches owning root incarnation", dbName)
-	}
-	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, incarnation, false); err != nil {
+	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, incarnation, false, creationToken != ""); err != nil {
 		return err
 	}
 	receipt = databaseCleanupReceipt{
 		Version: databaseCleanupReceiptVersion, Database: dbName, Force: force,
-		Phase: databaseCleanupOfflineReady, Incarnation: incarnation,
+		Phase: databaseCleanupOfflineReady, Incarnation: incarnation, CreationToken: creationToken,
 	}
 	if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
 		return fmt.Errorf("writing offline database cleanup receipt for %q: %w", dbName, err)
@@ -6189,7 +6175,8 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 			return fmt.Errorf("checking claimed database directory: %w", err)
 		}
 	}
-	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, allowMissing); err != nil {
+	ownedCreation := receipt.CreationToken != ""
+	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, allowMissing, ownedCreation); err != nil {
 		return quarantineDatabaseCleanupReceipt(receiptPath, err)
 	}
 	if !targetLive && receipt.Phase == databaseCleanupPrepared && !receipt.Force {
@@ -6230,7 +6217,7 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 				return fmt.Errorf("persisting DROP-attempted cleanup phase for %q: %w", dbName, err)
 			}
 		}
-		if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, false); err != nil {
+		if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, false, ownedCreation); err != nil {
 			return quarantineDatabaseCleanupReceipt(receiptPath, err)
 		}
 		identifier := strings.ReplaceAll(dbName, "`", "``")
@@ -6244,7 +6231,7 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 		}
 		InvalidateDBCache()
 	}
-	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, true); err != nil {
+	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, true, ownedCreation); err != nil {
 		return quarantineDatabaseCleanupReceipt(receiptPath, err)
 	}
 
@@ -6255,7 +6242,7 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 	if err := serverExecSQL(townRoot, branchQuery); err != nil {
 		return fmt.Errorf("cleaning branch-control entries for database %q; database cleanup receipt preserved: %w", dbName, err)
 	}
-	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, true); err != nil {
+	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, true, ownedCreation); err != nil {
 		return quarantineDatabaseCleanupReceipt(receiptPath, err)
 	}
 	claimedPath, err := claimDatabaseCleanupDirectory(townRoot, dbName, dbPath, receipt.Incarnation)
@@ -6263,8 +6250,10 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 		return fmt.Errorf("claiming database directory; database cleanup receipt preserved: %w", err)
 	}
 	if claimedPath != "" {
-		if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
-			return restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath, err)
+		if !ownedCreation {
+			if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
+				return restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath, err)
+			}
 		}
 		claimedIncarnation, err := databaseCleanupIncarnation(townRoot, dbName, claimedPath, false)
 		if err != nil || claimedIncarnation != receipt.Incarnation {
@@ -6286,7 +6275,8 @@ func resumeRunningDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 }
 
 func resumeOfflineDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, receipt databaseCleanupReceipt) error {
-	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, true); err != nil {
+	ownedCreation := receipt.CreationToken != ""
+	if err := ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, receipt.Incarnation, true, ownedCreation); err != nil {
 		return quarantineDatabaseCleanupReceipt(receiptPath, err)
 	}
 	claimedPath, err := claimDatabaseCleanupDirectory(townRoot, dbName, dbPath, receipt.Incarnation)
@@ -6300,8 +6290,10 @@ func resumeOfflineDatabaseRemoval(townRoot, dbName, dbPath, receiptPath string, 
 		InvalidateDBCache()
 		return nil
 	}
-	if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
-		return restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath, err)
+	if !ownedCreation {
+		if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
+			return restoreClaimedDatabaseAndQuarantineReceipt(dbPath, claimedPath, receiptPath, err)
+		}
 	}
 	claimedIncarnation, err := databaseCleanupIncarnation(townRoot, dbName, claimedPath, false)
 	if err != nil || claimedIncarnation != receipt.Incarnation {
@@ -6349,9 +6341,11 @@ func ensureDatabaseCleanupUnreferenced(townRoot, dbName string) error {
 	return nil
 }
 
-func ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, wantIncarnation string, allowMissing bool) error {
-	if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
-		return err
+func ensureDatabaseCleanupTarget(townRoot, dbName, dbPath, wantIncarnation string, allowMissing, allowReferenced bool) error {
+	if !allowReferenced {
+		if err := ensureDatabaseCleanupUnreferenced(townRoot, dbName); err != nil {
+			return err
+		}
 	}
 	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
 		if os.IsNotExist(err) && allowMissing {
@@ -6449,9 +6443,119 @@ func databaseCleanupIncarnation(townRoot, dbName, dbPath string, targetLive bool
 	return fmt.Sprintf("%s/manifest-sha256:%x", rootIdentity, state[:]), nil
 }
 
-func databaseCleanupRootIdentity(incarnation string) string {
-	root, _, _ := strings.Cut(incarnation, "/")
-	return root
+func verifyDatabaseCreationToken(dbPath, want string) error {
+	data, err := os.ReadFile(filepath.Join(dbPath, databaseCreationOwnerFile))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(data)) != want {
+		return fmt.Errorf("creation token mismatch")
+	}
+	return nil
+}
+
+type databaseCreationReleaseReceipt struct {
+	Version     int    `json:"version"`
+	Database    string `json:"database"`
+	Token       string `json:"token"`
+	Incarnation string `json:"incarnation"`
+}
+
+func databaseCreationReleaseReceiptPath(townRoot, dbName, token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return filepath.Join(townRoot, ".runtime", "dolt-database-creation-released", fmt.Sprintf("%s-%x.json", canonicalDatabaseName(dbName), sum[:8]))
+}
+
+func databaseCreationIncarnation(townRoot, dbName, dbPath string) (string, error) {
+	running, _, err := IsRunning(townRoot)
+	if err != nil {
+		return "", err
+	}
+	targetLive := false
+	if running {
+		_, targetLive, err = liveBranchControlDatabase(townRoot, dbName)
+		if err != nil {
+			return "", err
+		}
+	}
+	return databaseCleanupIncarnation(townRoot, dbName, dbPath, targetLive)
+}
+
+// DatabaseCreationTokenReleased proves that rollback authority for the exact
+// database generation was retired before a pending registration is published.
+func DatabaseCreationTokenReleased(townRoot, dbName, token string) error {
+	return WithDatabaseOwnershipTransaction(townRoot, func() error {
+		return databaseCreationTokenReleasedLocked(townRoot, dbName, token)
+	})
+}
+
+func databaseCreationTokenReleasedLocked(townRoot, dbName, token string) error {
+	path := databaseCreationReleaseReceiptPath(townRoot, dbName, token)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var receipt databaseCreationReleaseReceipt
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		return err
+	}
+	if receipt.Version != 1 || receipt.Database != dbName || receipt.Token != token || receipt.Incarnation == "" {
+		return fmt.Errorf("invalid database creation release receipt")
+	}
+	dbPath, err := DatabasePath(townRoot, dbName)
+	if err != nil {
+		return err
+	}
+	incarnation, err := databaseCreationIncarnation(townRoot, dbName, dbPath)
+	if err != nil {
+		return err
+	}
+	if incarnation != receipt.Incarnation {
+		return fmt.Errorf("released database generation changed")
+	}
+	return nil
+}
+
+// ReleaseDatabaseCreationToken retires destructive rollback authority after a
+// registration is otherwise committed.
+func ReleaseDatabaseCreationToken(townRoot, dbName, creationToken string) error {
+	if creationToken == "" {
+		return nil
+	}
+	return WithDatabaseOwnershipTransaction(townRoot, func() error {
+		dbPath, err := DatabasePath(townRoot, dbName)
+		if err != nil {
+			return err
+		}
+		if err := verifyDatabaseCreationToken(dbPath, creationToken); err != nil {
+			if os.IsNotExist(err) {
+				return databaseCreationTokenReleasedLocked(townRoot, dbName, creationToken)
+			}
+			return err
+		}
+		incarnation, err := databaseCreationIncarnation(townRoot, dbName, dbPath)
+		if err != nil {
+			return err
+		}
+		receiptPath := databaseCreationReleaseReceiptPath(townRoot, dbName, creationToken)
+		if err := ensurePrivateDatabaseCleanupDirectory(filepath.Dir(receiptPath)); err != nil {
+			return err
+		}
+		data, err := json.Marshal(databaseCreationReleaseReceipt{
+			Version: 1, Database: dbName, Token: creationToken, Incarnation: incarnation,
+		})
+		if err != nil {
+			return err
+		}
+		if err := writeDatabaseCleanupFileDurable(receiptPath, append(data, '\n'), 0o600); err != nil {
+			return err
+		}
+		path := filepath.Join(dbPath, databaseCreationOwnerFile)
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		return syncDatabaseCleanupDirectory(dbPath)
+	})
 }
 
 func databaseCleanupClaimPath(townRoot, dbName, incarnation string) string {
