@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 func TestRoutesCheck_MissingTownRoute(t *testing.T) {
@@ -224,6 +227,57 @@ func TestRoutesCheck_FixRestoresTownRoute(t *testing.T) {
 			t.Errorf("routes.jsonl was modified when it shouldn't have been: %s", string(content))
 		}
 	})
+}
+
+func TestRoutesCheckFixSerializesConcurrentRoutePublication(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := make(chan struct{})
+	release := make(chan struct{})
+	check := NewRoutesCheck()
+	check.afterLoad = func() {
+		close(loaded)
+		<-release
+	}
+	fixDone := make(chan error, 1)
+	go func() { fixDone <- check.Fix(&CheckContext{TownRoot: townRoot}) }()
+	<-loaded
+
+	appendDone := make(chan error, 1)
+	go func() {
+		appendDone <- beads.AppendRouteToDir(beadsDir, beads.Route{Prefix: "new-", Path: "new"})
+	}()
+	select {
+	case err := <-appendDone:
+		close(release)
+		t.Fatalf("route publication bypassed Doctor ownership: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-fixDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-appendDone; err != nil {
+		t.Fatal(err)
+	}
+
+	routes, err := beads.LoadRoutes(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range routes {
+		if route.Prefix == "new-" {
+			return
+		}
+	}
+	t.Fatalf("Doctor overwrote concurrent route publication: routes=%v", routes)
 }
 
 func TestRoutesCheck_DirectLayoutRig(t *testing.T) {
@@ -604,7 +658,6 @@ func TestRoutesCheck_SuboptimalRoutes(t *testing.T) {
 		}
 	})
 }
-
 
 func TestRoutesCheck_CorruptedRoutesJsonl(t *testing.T) {
 	t.Run("corrupted routes.jsonl results in empty routes", func(t *testing.T) {

@@ -1,10 +1,8 @@
 package beads
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
-	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
@@ -47,18 +45,34 @@ func TestAppendRouteToDirSerializesReadModifyWrite(t *testing.T) {
 	if err := WriteRoutes(beadsDir, []Route{{Prefix: "hq-", Path: "."}}); err != nil {
 		t.Fatal(err)
 	}
-	ownershipLock := flock.New(filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "ownership.lock"))
-	if err := ownershipLock.Lock(); err != nil {
-		t.Fatal(err)
-	}
 
+	entered := make(chan string, 2)
+	release := map[string]chan struct{}{"aa-": make(chan struct{}, 1), "bb-": make(chan struct{}, 1)}
+	start := make(chan struct{})
 	done := make(chan error, 2)
-	go func() { done <- AppendRouteToDir(beadsDir, Route{Prefix: "aa-", Path: "a"}) }()
-	go func() { done <- AppendRouteToDir(beadsDir, Route{Prefix: "bb-", Path: "b"}) }()
-	waitForBlockedRouteWriters(t, 2)
-	if err := ownershipLock.Unlock(); err != nil {
-		t.Fatal(err)
+	for _, route := range []Route{{Prefix: "aa-", Path: "a"}, {Prefix: "bb-", Path: "b"}} {
+		route := route
+		go func() {
+			<-start
+			done <- UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
+				entered <- route.Prefix
+				<-release[route.Prefix]
+				return append(routes, route), nil
+			})
+		}()
 	}
+	close(start)
+	first := <-entered
+	select {
+	case second := <-entered:
+		release[first] <- struct{}{}
+		release[second] <- struct{}{}
+		t.Fatal("route update callbacks ran concurrently")
+	case <-time.After(50 * time.Millisecond):
+	}
+	release[first] <- struct{}{}
+	second := <-entered
+	release[second] <- struct{}{}
 	for range 2 {
 		if err := <-done; err != nil {
 			t.Fatal(err)
@@ -75,24 +89,6 @@ func TestAppendRouteToDirSerializesReadModifyWrite(t *testing.T) {
 	}
 	if !found["aa-"] || !found["bb-"] {
 		t.Fatalf("concurrent ownership update was lost: routes=%v", routes)
-	}
-}
-
-func waitForBlockedRouteWriters(t *testing.T, want int) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var stacks bytes.Buffer
-		if err := pprof.Lookup("goroutine").WriteTo(&stacks, 2); err != nil {
-			t.Fatal(err)
-		}
-		if strings.Count(stacks.String(), "AppendRouteToDir") >= want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("route writers did not both reach the ownership fence")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 

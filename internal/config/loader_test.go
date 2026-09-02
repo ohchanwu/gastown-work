@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
@@ -53,25 +52,34 @@ func TestUpdateRigsConfigSerializesReadModifyWrite(t *testing.T) {
 	if err := SaveRigsConfig(path, &RigsConfig{Version: CurrentRigsVersion, Rigs: map[string]RigEntry{}}); err != nil {
 		t.Fatal(err)
 	}
-	ownershipLock := flock.New(filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "ownership.lock"))
-	if err := ownershipLock.Lock(); err != nil {
-		t.Fatal(err)
-	}
-
+	entered := make(chan string, 2)
+	release := map[string]chan struct{}{"alpha": make(chan struct{}, 1), "bravo": make(chan struct{}, 1)}
+	start := make(chan struct{})
 	done := make(chan error, 2)
 	for _, name := range []string{"alpha", "bravo"} {
 		name := name
 		go func() {
+			<-start
 			done <- UpdateRigsConfig(path, func(current *RigsConfig) error {
+				entered <- name
+				<-release[name]
 				current.Rigs[name] = RigEntry{LocalRepo: name}
 				return nil
 			})
 		}()
 	}
-	waitForBlockedRigsWriters(t, 2)
-	if err := ownershipLock.Unlock(); err != nil {
-		t.Fatal(err)
+	close(start)
+	first := <-entered
+	select {
+	case second := <-entered:
+		release[first] <- struct{}{}
+		release[second] <- struct{}{}
+		t.Fatal("rig update callbacks ran concurrently")
+	case <-time.After(50 * time.Millisecond):
 	}
+	release[first] <- struct{}{}
+	second := <-entered
+	release[second] <- struct{}{}
 	for range 2 {
 		if err := <-done; err != nil {
 			t.Fatal(err)
@@ -87,24 +95,6 @@ func TestUpdateRigsConfigSerializesReadModifyWrite(t *testing.T) {
 	}
 	if _, ok := got.Rigs["bravo"]; !ok {
 		t.Fatalf("bravo update was lost: rigs=%v", got.Rigs)
-	}
-}
-
-func waitForBlockedRigsWriters(t *testing.T, want int) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var stacks bytes.Buffer
-		if err := pprof.Lookup("goroutine").WriteTo(&stacks, 2); err != nil {
-			t.Fatal(err)
-		}
-		if strings.Count(stacks.String(), "UpdateRigsConfig") >= want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("rig writers did not both reach the ownership fence")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 

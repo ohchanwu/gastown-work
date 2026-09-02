@@ -39,6 +39,7 @@ func determineRigBeadsPath(townRoot, rigName string) string {
 // and all routes point to valid locations.
 type RoutesCheck struct {
 	FixableCheck
+	afterLoad func()
 }
 
 // NewRoutesCheck creates a new routes configuration check.
@@ -309,112 +310,98 @@ func (c *RoutesCheck) Fix(ctx *CheckContext) error {
 		return fmt.Errorf(".beads directory does not exist; run 'bd init' first")
 	}
 
-	// Load existing routes
-	routes, err := beads.LoadRoutes(beadsDir)
-	if err != nil {
-		routes = []beads.Route{} // Start fresh if can't load
-	}
-
-	// Build map of existing prefixes to route index for fast lookup.
-	// NOTE: routeMap indices are only valid as long as routes is append-only
-	// (no removals or reordering within this method).
-	routeMap := make(map[string]int) // prefix -> index in routes slice
-	for i, r := range routes {
-		routeMap[r.Prefix] = i
-	}
-
-	// Ensure town root route exists (hq- -> .)
-	// This is normally created by gt install but may be missing if routes.jsonl was corrupted
-	modified := false
-	if _, exists := routeMap["hq-"]; !exists {
-		routeMap["hq-"] = len(routes)
-		routes = append(routes, beads.Route{Prefix: "hq-", Path: "."})
-		modified = true
-	}
-
-	// Ensure convoy route exists (hq-cv- -> .)
-	// Convoys use hq-cv-* IDs for visual distinction from other town beads
-	if _, exists := routeMap["hq-cv-"]; !exists {
-		routeMap["hq-cv-"] = len(routes)
-		routes = append(routes, beads.Route{Prefix: "hq-cv-", Path: "."})
-		modified = true
-	}
-
-	// Load rigs registry
-	rigsPath := filepath.Join(ctx.TownRoot, "mayor", "rigs.json")
-	rigsConfig, err := config.LoadRigsConfig(rigsPath)
-	if err != nil {
-		// No rigs config - just write town root route if we added it
-		if modified {
-			return beads.WriteRoutes(beadsDir, routes)
-		}
-		return nil
-	}
-
-	// Collect prefixes from rigs to detect duplicates (finding #5).
-	// If rigs.json has duplicate prefixes, skip auto-fix for those prefixes
-	// to avoid non-deterministic behavior from map iteration order.
-	prefixCount := make(map[string]int)
-	for _, rigEntry := range rigsConfig.Rigs {
-		if rigEntry.BeadsConfig != nil && rigEntry.BeadsConfig.Prefix != "" {
-			prefixCount[rigEntry.BeadsConfig.Prefix+"-"]++
-		}
-	}
-
-	// Add missing routes and rewrite redirect-dependent ones for each rig.
-	// Only rewrites routes that rely on .beads/redirect at the rig root —
-	// the specific legacy pattern broken by beads#1749. Routes are rewritten
-	// to the canonical path (e.g., "crom/mayor/rig") which has a real .beads
-	// directory and needs no redirect resolution.
-	for rigName, rigEntry := range rigsConfig.Rigs {
-		prefix := ""
-		if rigEntry.BeadsConfig != nil && rigEntry.BeadsConfig.Prefix != "" {
-			prefix = rigEntry.BeadsConfig.Prefix + "-"
+	return beads.UpdateRoutes(beadsDir, func(routes []beads.Route) ([]beads.Route, error) {
+		if c.afterLoad != nil {
+			c.afterLoad()
 		}
 
-		if prefix == "" {
-			continue
+		// Build map of existing prefixes to route index for fast lookup.
+		// NOTE: routeMap indices are only valid as long as routes is append-only
+		// (no removals or reordering within this method).
+		routeMap := make(map[string]int) // prefix -> index in routes slice
+		for i, r := range routes {
+			routeMap[r.Prefix] = i
 		}
 
-		// Skip duplicate prefixes to avoid non-deterministic rewrites
-		if prefixCount[prefix] > 1 {
-			fmt.Fprintf(os.Stderr, "Warning: skipping route fix for duplicate prefix %s (%d rigs share it)\n",
-				prefix, prefixCount[prefix])
-			continue
+		// Ensure town root route exists (hq- -> .)
+		// This is normally created by gt install but may be missing if routes.jsonl was corrupted
+		if _, exists := routeMap["hq-"]; !exists {
+			routeMap["hq-"] = len(routes)
+			routes = append(routes, beads.Route{Prefix: "hq-", Path: "."})
 		}
 
-		// Determine the correct canonical path based on actual rig layout
-		rigRoutePath := determineRigBeadsPath(ctx.TownRoot, rigName)
-		canonicalPath := filepath.Join(ctx.TownRoot, rigRoutePath)
+		// Ensure convoy route exists (hq-cv- -> .)
+		// Convoys use hq-cv-* IDs for visual distinction from other town beads
+		if _, exists := routeMap["hq-cv-"]; !exists {
+			routeMap["hq-cv-"] = len(routes)
+			routes = append(routes, beads.Route{Prefix: "hq-cv-", Path: "."})
+		}
 
-		if idx, exists := routeMap[prefix]; exists {
-			// Route exists — only rewrite if current path is redirect-dependent
-			// and canonical target has a real .beads directory (not a redirect).
-			if routes[idx].Path != rigRoutePath && isRedirectDependent(ctx.TownRoot, routes[idx].Path) {
+		// Load rigs registry
+		rigsPath := filepath.Join(ctx.TownRoot, "mayor", "rigs.json")
+		rigsConfig, err := config.LoadRigsConfig(rigsPath)
+		if err != nil {
+			return routes, nil
+		}
+
+		// Collect prefixes from rigs to detect duplicates (finding #5).
+		// If rigs.json has duplicate prefixes, skip auto-fix for those prefixes
+		// to avoid non-deterministic behavior from map iteration order.
+		prefixCount := make(map[string]int)
+		for _, rigEntry := range rigsConfig.Rigs {
+			if rigEntry.BeadsConfig != nil && rigEntry.BeadsConfig.Prefix != "" {
+				prefixCount[rigEntry.BeadsConfig.Prefix+"-"]++
+			}
+		}
+
+		// Add missing routes and rewrite redirect-dependent ones for each rig.
+		// Only rewrites routes that rely on .beads/redirect at the rig root —
+		// the specific legacy pattern broken by beads#1749. Routes are rewritten
+		// to the canonical path (e.g., "crom/mayor/rig") which has a real .beads
+		// directory and needs no redirect resolution.
+		for rigName, rigEntry := range rigsConfig.Rigs {
+			prefix := ""
+			if rigEntry.BeadsConfig != nil && rigEntry.BeadsConfig.Prefix != "" {
+				prefix = rigEntry.BeadsConfig.Prefix + "-"
+			}
+
+			if prefix == "" {
+				continue
+			}
+
+			// Skip duplicate prefixes to avoid non-deterministic rewrites
+			if prefixCount[prefix] > 1 {
+				fmt.Fprintf(os.Stderr, "Warning: skipping route fix for duplicate prefix %s (%d rigs share it)\n",
+					prefix, prefixCount[prefix])
+				continue
+			}
+
+			// Determine the correct canonical path based on actual rig layout
+			rigRoutePath := determineRigBeadsPath(ctx.TownRoot, rigName)
+			canonicalPath := filepath.Join(ctx.TownRoot, rigRoutePath)
+
+			if idx, exists := routeMap[prefix]; exists {
+				// Route exists — only rewrite if current path is redirect-dependent
+				// and canonical target has a real .beads directory (not a redirect).
+				if routes[idx].Path != rigRoutePath && isRedirectDependent(ctx.TownRoot, routes[idx].Path) {
+					if hasRealBeadsDir(canonicalPath) {
+						routes[idx].Path = rigRoutePath
+					} else {
+						fmt.Fprintf(os.Stderr, "Warning: cannot rewrite route %s -> %s to %s (canonical path has no .beads directory)\n",
+							prefix, routes[idx].Path, rigRoutePath)
+					}
+				}
+			} else {
+				// Route missing — add it if the canonical path has a real .beads dir
 				if hasRealBeadsDir(canonicalPath) {
-					routes[idx].Path = rigRoutePath
-					modified = true
-				} else {
-					fmt.Fprintf(os.Stderr, "Warning: cannot rewrite route %s -> %s to %s (canonical path has no .beads directory)\n",
-						prefix, routes[idx].Path, rigRoutePath)
+					routeMap[prefix] = len(routes)
+					routes = append(routes, beads.Route{
+						Prefix: prefix,
+						Path:   rigRoutePath,
+					})
 				}
 			}
-		} else {
-			// Route missing — add it if the canonical path has a real .beads dir
-			if hasRealBeadsDir(canonicalPath) {
-				routeMap[prefix] = len(routes)
-				routes = append(routes, beads.Route{
-					Prefix: prefix,
-					Path:   rigRoutePath,
-				})
-				modified = true
-			}
 		}
-	}
-
-	if modified {
-		return beads.WriteRoutes(beadsDir, routes)
-	}
-
-	return nil
+		return routes, nil
+	})
 }

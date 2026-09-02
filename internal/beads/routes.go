@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -69,12 +70,7 @@ func AppendRoute(townRoot string, route Route) error {
 // AppendRouteToDir appends a route to routes.jsonl in the given beads directory.
 // If the prefix already exists, it updates the path.
 func AppendRouteToDir(beadsDir string, route Route) error {
-	return withRoutesOwnership(beadsDir, func() error {
-		routes, err := LoadRoutes(beadsDir)
-		if err != nil {
-			return fmt.Errorf("loading routes: %w", err)
-		}
-
+	return UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
 		found := false
 		for i, existing := range routes {
 			if existing.Prefix == route.Prefix {
@@ -86,27 +82,44 @@ func AppendRouteToDir(beadsDir string, route Route) error {
 		if !found {
 			routes = append(routes, route)
 		}
-
-		return writeRoutes(beadsDir, routes)
+		return routes, nil
 	})
 }
 
 // RemoveRoute removes a route by prefix from routes.jsonl.
 func RemoveRoute(townRoot string, prefix string) error {
 	beadsDir := filepath.Join(townRoot, ".beads")
-	return withRoutesOwnership(beadsDir, func() error {
-		routes, err := LoadRoutes(beadsDir)
-		if err != nil {
-			return fmt.Errorf("loading routes: %w", err)
-		}
-
+	return UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
 		filtered := make([]Route, 0, len(routes))
 		for _, route := range routes {
 			if route.Prefix != prefix {
 				filtered = append(filtered, route)
 			}
 		}
-		return writeRoutes(beadsDir, filtered)
+		return filtered, nil
+	})
+}
+
+// UpdateRoutes applies a read-modify-write transaction while holding the town's
+// database ownership lock, preventing a concurrent publisher from being lost.
+func UpdateRoutes(beadsDir string, update func([]Route) ([]Route, error)) error {
+	if update == nil {
+		return fmt.Errorf("routes update is required")
+	}
+	return withRoutesOwnership(beadsDir, func() error {
+		routes, err := LoadRoutes(beadsDir)
+		if err != nil {
+			return fmt.Errorf("loading routes: %w", err)
+		}
+		before := slices.Clone(routes)
+		routes, err = update(routes)
+		if err != nil {
+			return err
+		}
+		if slices.Equal(before, routes) {
+			return nil
+		}
+		return writeRoutes(beadsDir, routes)
 	})
 }
 
