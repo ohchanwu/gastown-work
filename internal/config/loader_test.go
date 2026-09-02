@@ -54,22 +54,23 @@ func TestUpdateRigsConfigSerializesReadModifyWrite(t *testing.T) {
 	}
 	entered := make(chan string, 2)
 	release := map[string]chan struct{}{"alpha": make(chan struct{}, 1), "bravo": make(chan struct{}, 1)}
-	start := make(chan struct{})
 	done := make(chan error, 2)
-	for _, name := range []string{"alpha", "bravo"} {
-		name := name
-		go func() {
-			<-start
-			done <- UpdateRigsConfig(path, func(current *RigsConfig) error {
-				entered <- name
-				<-release[name]
-				current.Rigs[name] = RigEntry{LocalRepo: name}
-				return nil
-			})
-		}()
+	update := func(name string) {
+		done <- UpdateRigsConfig(path, func(current *RigsConfig) error {
+			entered <- name
+			<-release[name]
+			current.Rigs[name] = RigEntry{LocalRepo: name}
+			return nil
+		})
 	}
-	close(start)
+	go update("alpha")
 	first := <-entered
+	attempted := make(chan struct{})
+	go func() {
+		close(attempted)
+		update("bravo")
+	}()
+	<-attempted
 	select {
 	case second := <-entered:
 		release[first] <- struct{}{}

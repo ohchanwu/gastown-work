@@ -48,21 +48,22 @@ func TestAppendRouteToDirSerializesReadModifyWrite(t *testing.T) {
 
 	entered := make(chan string, 2)
 	release := map[string]chan struct{}{"aa-": make(chan struct{}, 1), "bb-": make(chan struct{}, 1)}
-	start := make(chan struct{})
 	done := make(chan error, 2)
-	for _, route := range []Route{{Prefix: "aa-", Path: "a"}, {Prefix: "bb-", Path: "b"}} {
-		route := route
-		go func() {
-			<-start
-			done <- UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
-				entered <- route.Prefix
-				<-release[route.Prefix]
-				return append(routes, route), nil
-			})
-		}()
+	update := func(route Route) {
+		done <- UpdateRoutes(beadsDir, func(routes []Route) ([]Route, error) {
+			entered <- route.Prefix
+			<-release[route.Prefix]
+			return append(routes, route), nil
+		})
 	}
-	close(start)
+	go update(Route{Prefix: "aa-", Path: "a"})
 	first := <-entered
+	attempted := make(chan struct{})
+	go func() {
+		close(attempted)
+		update(Route{Prefix: "bb-", Path: "b"})
+	}()
+	<-attempted
 	select {
 	case second := <-entered:
 		release[first] <- struct{}{}

@@ -3698,7 +3698,9 @@ type databaseMigrationReceipt struct {
 	Phase        databaseMigrationPhase `json:"phase"`
 }
 
-var databaseMigrationRename = os.Rename
+var databaseMigrationRename = func(root *os.Root, oldName, newName string) error {
+	return root.Rename(oldName, newName)
+}
 
 func databaseMigrationReceiptPath(townRoot, rigName string) string {
 	return filepath.Join(townRoot, ".runtime", "dolt-database-migrations", canonicalDatabaseName(rigName)+".json")
@@ -4176,6 +4178,14 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 	if err != nil {
 		return err
 	}
+	targetRel, err := databaseMigrationRootRelativePath(townRoot, receipt.TargetPath)
+	if err != nil {
+		return err
+	}
+	stageRel, err := databaseMigrationRootRelativePath(townRoot, receipt.StagePath)
+	if err != nil {
+		return err
+	}
 	for {
 		if err := validateDatabaseMigrationPathCustody(root, sourceRel); err != nil {
 			return err
@@ -4183,11 +4193,17 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 		if err := validateDatabaseMigrationPathCustody(root, cleanupRel); err != nil {
 			return err
 		}
+		if err := validateDatabaseMigrationPathCustody(root, targetRel); err != nil {
+			return err
+		}
+		if err := validateDatabaseMigrationPathCustody(root, stageRel); err != nil {
+			return err
+		}
 		sourceExists, sourceComplete, err := databaseMigrationRootPathState(root, sourceRel)
 		if err != nil {
 			return err
 		}
-		targetExists, targetComplete, err := databaseMigrationPathState(receipt.TargetPath)
+		targetExists, targetComplete, err := databaseMigrationRootPathState(root, targetRel)
 		if err != nil {
 			return err
 		}
@@ -4198,10 +4214,10 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 				if sourceComplete {
 					return fmt.Errorf("ambiguous prepared migration: source and target both contain Dolt databases")
 				}
-				if err := removeEmptyDatabaseMigrationStage(receipt.StagePath); err != nil {
+				if err := removeEmptyDatabaseMigrationStage(root, stageRel); err != nil {
 					return err
 				}
-				if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
+				if err := verifyDatabaseMigrationDigestAt(root, targetRel, receipt.SourceDigest); err != nil {
 					return err
 				}
 				receipt.Phase = databaseMigrationTargetReady
@@ -4213,28 +4229,28 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if !sourceExists || !sourceComplete {
 				return fmt.Errorf("prepared migration source is missing or incomplete")
 			}
-			if err := verifyDatabaseMigrationDigest(receipt.SourcePath, receipt.SourceDigest); err != nil {
+			if err := verifyDatabaseMigrationDigestAt(root, sourceRel, receipt.SourceDigest); err != nil {
 				return err
 			}
 			if targetExists {
-				if err := os.RemoveAll(receipt.TargetPath); err != nil {
+				if err := root.RemoveAll(targetRel); err != nil {
 					return fmt.Errorf("removing receipt-owned partial migration target: %w", err)
 				}
-				if err := syncDatabaseCleanupDirectory(filepath.Dir(receipt.TargetPath)); err != nil {
+				if err := syncDatabaseMigrationDirectory(root, filepath.Dir(targetRel)); err != nil {
 					return err
 				}
 			}
-			if err := os.MkdirAll(filepath.Dir(receipt.TargetPath), 0o755); err != nil {
+			if err := root.MkdirAll(filepath.Dir(targetRel), 0o755); err != nil {
 				return fmt.Errorf("creating data directory: %w", err)
 			}
-			if err := databaseMigrationRename(receipt.SourcePath, receipt.TargetPath); err == nil {
+			if err := databaseMigrationRename(root, sourceRel, targetRel); err == nil {
 				if err := errors.Join(
-					syncDatabaseCleanupDirectory(filepath.Dir(receipt.SourcePath)),
-					syncDatabaseCleanupDirectory(filepath.Dir(receipt.TargetPath)),
+					syncDatabaseMigrationDirectory(root, filepath.Dir(sourceRel)),
+					syncDatabaseMigrationDirectory(root, filepath.Dir(targetRel)),
 				); err != nil {
 					return err
 				}
-				if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
+				if err := verifyDatabaseMigrationDigestAt(root, targetRel, receipt.SourceDigest); err != nil {
 					return err
 				}
 				receipt.Phase = databaseMigrationTargetReady
@@ -4245,7 +4261,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			} else if !errors.Is(err, syscall.EXDEV) {
 				return fmt.Errorf("moving database: %w", err)
 			}
-			if err := copyDatabaseMigrationToStage(receipt); err != nil {
+			if err := copyDatabaseMigrationToStage(root, sourceRel, targetRel, stageRel, receipt.SourceDigest); err != nil {
 				return err
 			}
 			receipt.Phase = databaseMigrationStaged
@@ -4255,10 +4271,10 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 
 		case databaseMigrationStaged:
 			if targetComplete {
-				if err := removeEmptyDatabaseMigrationStage(receipt.StagePath); err != nil {
+				if err := removeEmptyDatabaseMigrationStage(root, stageRel); err != nil {
 					return err
 				}
-				if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
+				if err := verifyDatabaseMigrationDigestAt(root, targetRel, receipt.SourceDigest); err != nil {
 					return err
 				}
 				receipt.Phase = databaseMigrationTargetReady
@@ -4267,7 +4283,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 				}
 				continue
 			}
-			_, stageComplete, err := databaseMigrationPathState(receipt.StagePath)
+			_, stageComplete, err := databaseMigrationRootPathState(root, stageRel)
 			if err != nil {
 				return err
 			}
@@ -4276,7 +4292,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 					return fmt.Errorf("staged migration has neither a complete stage nor source")
 				}
 				if targetExists {
-					if err := os.RemoveAll(receipt.TargetPath); err != nil {
+					if err := root.RemoveAll(targetRel); err != nil {
 						return err
 					}
 				}
@@ -4286,14 +4302,14 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 				}
 				continue
 			}
-			if err := verifyDatabaseMigrationDigest(receipt.StagePath, receipt.SourceDigest); err != nil {
+			if err := verifyDatabaseMigrationDigestAt(root, stageRel, receipt.SourceDigest); err != nil {
 				if !sourceComplete {
 					return err
 				}
-				if sourceErr := verifyDatabaseMigrationDigest(receipt.SourcePath, receipt.SourceDigest); sourceErr != nil {
+				if sourceErr := verifyDatabaseMigrationDigestAt(root, sourceRel, receipt.SourceDigest); sourceErr != nil {
 					return errors.Join(err, sourceErr)
 				}
-				if err := os.RemoveAll(receipt.TargetPath); err != nil {
+				if err := root.RemoveAll(targetRel); err != nil {
 					return err
 				}
 				receipt.Phase = databaseMigrationPrepared
@@ -4302,10 +4318,10 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 				}
 				continue
 			}
-			if err := promoteDatabaseMigrationStage(receipt); err != nil {
+			if err := promoteDatabaseMigrationStage(root, targetRel, stageRel); err != nil {
 				return err
 			}
-			if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
+			if err := verifyDatabaseMigrationDigestAt(root, targetRel, receipt.SourceDigest); err != nil {
 				return err
 			}
 			receipt.Phase = databaseMigrationTargetReady
@@ -4317,10 +4333,10 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if !targetComplete {
 				return fmt.Errorf("target-ready migration target is missing or incomplete")
 			}
-			if err := removeEmptyDatabaseMigrationStage(receipt.StagePath); err != nil {
+			if err := removeEmptyDatabaseMigrationStage(root, stageRel); err != nil {
 				return err
 			}
-			if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
+			if err := verifyDatabaseMigrationDigestAt(root, targetRel, receipt.SourceDigest); err != nil {
 				return err
 			}
 			cleanupExists, cleanupComplete, err := databaseMigrationRootPathState(root, cleanupRel)
@@ -4334,7 +4350,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 				if !sourceComplete {
 					return fmt.Errorf("migration source became incomplete before cleanup")
 				}
-				if err := verifyDatabaseMigrationDigest(receipt.SourcePath, receipt.SourceDigest); err != nil {
+				if err := verifyDatabaseMigrationDigestAt(root, sourceRel, receipt.SourceDigest); err != nil {
 					return err
 				}
 				token, err := newDatabaseMigrationCleanupToken()
@@ -4363,7 +4379,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if !targetComplete {
 				return fmt.Errorf("cleanup-ready migration target is missing or incomplete")
 			}
-			if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
+			if err := verifyDatabaseMigrationDigestAt(root, targetRel, receipt.SourceDigest); err != nil {
 				return err
 			}
 			cleanupExists, cleanupComplete, err := databaseMigrationRootPathState(root, cleanupRel)
@@ -4377,13 +4393,24 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 				if !sourceComplete {
 					return fmt.Errorf("migration source became incomplete before cleanup")
 				}
-				if err := verifyDatabaseMigrationDigest(receipt.SourcePath, receipt.SourceDigest); err != nil {
+				claimRel := filepath.Join(sourceRel, databaseMigrationCleanupClaimName)
+				if _, err := root.Lstat(claimRel); os.IsNotExist(err) {
+					if err := verifyDatabaseMigrationDigestAt(root, sourceRel, receipt.SourceDigest); err != nil {
+						return err
+					}
+					if err := writeDatabaseMigrationCleanupClaim(root, sourceRel, receipt.CleanupToken); err != nil {
+						return err
+					}
+				} else if err != nil {
+					return err
+				}
+				if err := verifyDatabaseMigrationCleanupClaim(root, sourceRel, receipt.SourceDigest, receipt.CleanupToken); err != nil {
 					return err
 				}
 				if err := root.Rename(sourceRel, cleanupRel); err != nil {
 					return fmt.Errorf("claiming verified migration source for cleanup: %w", err)
 				}
-				if err := syncDatabaseCleanupDirectory(filepath.Dir(receipt.SourcePath)); err != nil {
+				if err := syncDatabaseMigrationDirectory(root, filepath.Dir(sourceRel)); err != nil {
 					return err
 				}
 				continue
@@ -4396,21 +4423,7 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			}
 			claimRel := filepath.Join(cleanupRel, databaseMigrationCleanupClaimName)
 			if _, err := root.Lstat(claimRel); os.IsNotExist(err) {
-				cleanupRoot, err := root.OpenRoot(cleanupRel)
-				if err != nil {
-					return err
-				}
-				cleanupDigest, digestErr := databaseMigrationTreeDigestFromRoot(cleanupRoot, false)
-				closeErr := cleanupRoot.Close()
-				if err := errors.Join(digestErr, closeErr); err != nil {
-					return err
-				}
-				if cleanupDigest != receipt.SourceDigest {
-					return fmt.Errorf("migration cleanup claim digest mismatch")
-				}
-				if err := writeDatabaseMigrationCleanupClaim(root, cleanupRel, receipt.CleanupToken); err != nil {
-					return err
-				}
+				return fmt.Errorf("migration cleanup claim has no durable identity")
 			} else if err != nil {
 				return err
 			}
@@ -4425,9 +4438,6 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 		case databaseMigrationCleanupRemoving:
 			if !targetComplete {
 				return fmt.Errorf("cleanup-removing migration target is missing or incomplete")
-			}
-			if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
-				return err
 			}
 			if sourceExists {
 				return fmt.Errorf("migration source reappeared during cleanup")
@@ -4446,22 +4456,24 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if !cleanupComplete {
 				return fmt.Errorf("migration cleanup claim is incomplete")
 			}
-			if err := verifyDatabaseMigrationCleanupClaim(root, cleanupRel, receipt.SourceDigest, receipt.CleanupToken); err != nil {
+			if err := withVerifiedDatabaseMigrationRoot(root, targetRel, receipt.SourceDigest, func() error {
+				if err := verifyDatabaseMigrationCleanupClaim(root, cleanupRel, receipt.SourceDigest, receipt.CleanupToken); err != nil {
+					return err
+				}
+				if err := root.RemoveAll(cleanupRel); err != nil {
+					return fmt.Errorf("removing claimed migration source: %w", err)
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
-			if err := root.RemoveAll(cleanupRel); err != nil {
-				return fmt.Errorf("removing claimed migration source: %w", err)
-			}
-			if err := syncDatabaseCleanupDirectory(filepath.Dir(receipt.CleanupPath)); err != nil {
+			if err := syncDatabaseMigrationDirectory(root, filepath.Dir(cleanupRel)); err != nil {
 				return err
 			}
 
 		case databaseMigrationSourceCleaned:
 			if !targetComplete {
 				return fmt.Errorf("source-cleaned migration target is missing or incomplete")
-			}
-			if err := verifyDatabaseMigrationDigest(receipt.TargetPath, receipt.SourceDigest); err != nil {
-				return err
 			}
 			cleanupExists, _, err := databaseMigrationRootPathState(root, cleanupRel)
 			if err != nil {
@@ -4470,15 +4482,20 @@ func resumeDatabaseMigrationLocked(townRoot, receiptPath string, receipt databas
 			if sourceExists || cleanupExists {
 				return fmt.Errorf("source-cleaned migration still has source data")
 			}
-			beadsDir, err := FindOrCreateRigBeadsDir(townRoot, receipt.RigName)
-			if err == nil {
-				err = ensureMetadataForBeadsDirLocked(townRoot, beadsDir, receipt.RigName)
-			}
-			if err != nil {
-				return fmt.Errorf("publishing migrated database ownership: %w", err)
-			}
-			if err := clearDatabaseCleanupReceipt(receiptPath); err != nil {
-				return fmt.Errorf("clearing database migration receipt: %w", err)
+			if err := withVerifiedDatabaseMigrationRoot(root, targetRel, receipt.SourceDigest, func() error {
+				beadsDir, err := FindOrCreateRigBeadsDir(townRoot, receipt.RigName)
+				if err == nil {
+					err = ensureMetadataForBeadsDirLocked(townRoot, beadsDir, receipt.RigName)
+				}
+				if err != nil {
+					return fmt.Errorf("publishing migrated database ownership: %w", err)
+				}
+				if err := clearDatabaseCleanupReceipt(receiptPath); err != nil {
+					return fmt.Errorf("clearing database migration receipt: %w", err)
+				}
+				return nil
+			}); err != nil {
+				return err
 			}
 			InvalidateDBCache()
 			return nil
@@ -4507,15 +4524,46 @@ func databaseMigrationPathState(path string) (exists, complete bool, err error) 
 	return true, info.IsDir() && info.Mode()&os.ModeSymlink == 0, nil
 }
 
-func verifyDatabaseMigrationDigest(path, want string) error {
-	got, err := databaseMigrationTreeDigest(path)
+func verifyDatabaseMigrationDigestAt(root *os.Root, rel, want string) error {
+	databaseRoot, err := root.OpenRoot(rel)
 	if err != nil {
-		return fmt.Errorf("hashing migrated database at %s: %w", path, err)
+		return fmt.Errorf("opening migrated database at %s: %w", rel, err)
+	}
+	got, digestErr := databaseMigrationTreeDigestFromRoot(databaseRoot, false)
+	closeErr := databaseRoot.Close()
+	if err := errors.Join(digestErr, closeErr); err != nil {
+		return fmt.Errorf("hashing migrated database at %s: %w", rel, err)
 	}
 	if got != want {
-		return fmt.Errorf("migrated database digest mismatch at %s", path)
+		return fmt.Errorf("migrated database digest mismatch at %s", rel)
 	}
 	return nil
+}
+
+func withVerifiedDatabaseMigrationRoot(root *os.Root, rel, want string, operation func() error) error {
+	databaseRoot, err := root.OpenRoot(rel)
+	if err != nil {
+		return err
+	}
+	got, err := databaseMigrationTreeDigestFromRoot(databaseRoot, false)
+	if err != nil || got != want {
+		_ = databaseRoot.Close()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("migrated database digest mismatch at %s", rel)
+	}
+	openedInfo, err := databaseRoot.Stat(".")
+	if err != nil {
+		_ = databaseRoot.Close()
+		return err
+	}
+	currentInfo, err := root.Stat(rel)
+	if err != nil || !os.SameFile(openedInfo, currentInfo) {
+		_ = databaseRoot.Close()
+		return fmt.Errorf("migration target identity changed")
+	}
+	return errors.Join(operation(), databaseRoot.Close())
 }
 
 func newDatabaseMigrationCleanupToken() (string, error) {
@@ -4575,39 +4623,76 @@ func verifyDatabaseMigrationCleanupClaim(root *os.Root, cleanupRel, digest, toke
 	return nil
 }
 
-func copyDatabaseMigrationToStage(receipt databaseMigrationReceipt) error {
-	if err := os.MkdirAll(receipt.TargetPath, 0o755); err != nil {
+func copyDatabaseMigrationToStage(root *os.Root, sourceRel, targetRel, stageRel, digest string) error {
+	sourceRoot, err := root.OpenRoot(sourceRel)
+	if err != nil {
 		return err
 	}
-	if err := copyDatabaseMigrationDirectory(receipt.SourcePath, receipt.StagePath); err != nil {
-		return fmt.Errorf("copying database to migration stage: %w", err)
-	}
-	if err := verifyDatabaseMigrationDigest(receipt.StagePath, receipt.SourceDigest); err != nil {
+	defer sourceRoot.Close()
+	sourceInfo, err := sourceRoot.Stat(".")
+	if err != nil {
 		return err
 	}
-	return syncDatabaseMigrationTree(receipt.StagePath)
-}
-
-func copyDatabaseMigrationDirectory(source, target string) error {
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command("robocopy", source, target, "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:1", "/W:1")
-		setProcessGroup(cmd)
-		if err := cmd.Run(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() <= 7 {
-				return nil
-			}
+	if err := root.MkdirAll(targetRel, 0o755); err != nil {
+		return err
+	}
+	if err := root.Mkdir(stageRel, sourceInfo.Mode().Perm()); err != nil {
+		return err
+	}
+	stageRoot, err := root.OpenRoot(stageRel)
+	if err != nil {
+		return err
+	}
+	defer stageRoot.Close()
+	err = fs.WalkDir(sourceRoot.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == "." {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
 			return err
 		}
-		return nil
+		name := filepath.FromSlash(path)
+		switch {
+		case info.IsDir():
+			return stageRoot.Mkdir(name, info.Mode().Perm())
+		case info.Mode().IsRegular():
+			source, err := sourceRoot.Open(name)
+			if err != nil {
+				return err
+			}
+			target, err := stageRoot.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+			if err != nil {
+				_ = source.Close()
+				return err
+			}
+			_, copyErr := io.Copy(target, source)
+			return errors.Join(copyErr, target.Sync(), target.Close(), source.Close())
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := sourceRoot.Readlink(name)
+			if err != nil {
+				return err
+			}
+			return stageRoot.Symlink(target, name)
+		default:
+			return fmt.Errorf("unsupported database migration entry %s", path)
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("copying database to migration stage: %w", err)
 	}
-	cmd := exec.Command("cp", "-a", source, target)
-	setProcessGroup(cmd)
-	return cmd.Run()
+	if err := verifyDatabaseMigrationDigestAt(root, stageRel, digest); err != nil {
+		return err
+	}
+	return syncDatabaseMigrationTree(stageRoot)
 }
 
-func syncDatabaseMigrationTree(root string) error {
+func syncDatabaseMigrationTree(root *os.Root) error {
 	var dirs []string
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+	err := fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -4616,77 +4701,100 @@ func syncDatabaseMigrationTree(root string) error {
 			return nil
 		}
 		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() {
-			return err
-		}
-		file, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		syncErr := file.Sync()
-		return errors.Join(syncErr, file.Close())
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported database migration entry %s", path)
+		}
+		file, err := root.Open(filepath.FromSlash(path))
+		if err != nil {
+			return err
+		}
+		return errors.Join(file.Sync(), file.Close())
 	})
 	if err != nil {
 		return err
 	}
 	for i := len(dirs) - 1; i >= 0; i-- {
-		if err := syncDatabaseCleanupDirectory(dirs[i]); err != nil {
+		if err := syncDatabaseMigrationDirectory(root, filepath.FromSlash(dirs[i])); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func promoteDatabaseMigrationStage(receipt databaseMigrationReceipt) error {
-	entries, err := os.ReadDir(receipt.StagePath)
+func promoteDatabaseMigrationStage(root *os.Root, targetRel, stageRel string) error {
+	stageRoot, err := root.OpenRoot(stageRel)
 	if err != nil {
+		return err
+	}
+	entries, readErr := fs.ReadDir(stageRoot.FS(), ".")
+	closeErr := stageRoot.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
 		return err
 	}
 	for _, entry := range entries {
 		if entry.Name() == ".dolt" {
 			continue
 		}
-		if entry.Name() == filepath.Base(receipt.StagePath) {
+		if entry.Name() == filepath.Base(stageRel) {
 			return fmt.Errorf("database contains reserved migration stage entry %q", entry.Name())
 		}
-		source := filepath.Join(receipt.StagePath, entry.Name())
-		target := filepath.Join(receipt.TargetPath, entry.Name())
-		if err := os.RemoveAll(target); err != nil {
+		source := filepath.Join(stageRel, entry.Name())
+		target := filepath.Join(targetRel, entry.Name())
+		if err := root.RemoveAll(target); err != nil {
 			return err
 		}
-		if err := os.Rename(source, target); err != nil {
+		if err := root.Rename(source, target); err != nil {
 			return err
 		}
 	}
-	if _, err := os.Lstat(filepath.Join(receipt.TargetPath, ".dolt")); err == nil {
+	if _, err := root.Lstat(filepath.Join(targetRel, ".dolt")); err == nil {
 		return fmt.Errorf("migration target became complete before stage promotion")
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.Rename(filepath.Join(receipt.StagePath, ".dolt"), filepath.Join(receipt.TargetPath, ".dolt")); err != nil {
+	if err := root.Rename(filepath.Join(stageRel, ".dolt"), filepath.Join(targetRel, ".dolt")); err != nil {
 		return err
 	}
-	if err := syncDatabaseCleanupDirectory(receipt.TargetPath); err != nil {
+	if err := syncDatabaseMigrationDirectory(root, targetRel); err != nil {
 		return err
 	}
-	return removeEmptyDatabaseMigrationStage(receipt.StagePath)
+	return removeEmptyDatabaseMigrationStage(root, stageRel)
 }
 
-func removeEmptyDatabaseMigrationStage(stagePath string) error {
-	entries, err := os.ReadDir(stagePath)
+func removeEmptyDatabaseMigrationStage(root *os.Root, stageRel string) error {
+	stageRoot, err := root.OpenRoot(stageRel)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
+	entries, readErr := fs.ReadDir(stageRoot.FS(), ".")
+	closeErr := stageRoot.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return err
+	}
 	if len(entries) != 0 {
 		return fmt.Errorf("database migration stage is not empty")
 	}
-	if err := os.Remove(stagePath); err != nil {
+	if err := root.Remove(stageRel); err != nil {
 		return err
 	}
-	return syncDatabaseCleanupDirectory(filepath.Dir(stagePath))
+	return syncDatabaseMigrationDirectory(root, filepath.Dir(stageRel))
+}
+
+func syncDatabaseMigrationDirectory(root *os.Root, rel string) error {
+	dir, err := root.Open(rel)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
 }
 
 // DatabaseExists checks whether a rig database exists on the host filesystem

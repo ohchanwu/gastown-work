@@ -251,9 +251,12 @@ func TestRoutesCheckFixSerializesConcurrentRoutePublication(t *testing.T) {
 	<-loaded
 
 	appendDone := make(chan error, 1)
+	attempted := make(chan struct{})
 	go func() {
+		close(attempted)
 		appendDone <- beads.AppendRouteToDir(beadsDir, beads.Route{Prefix: "new-", Path: "new"})
 	}()
+	<-attempted
 	select {
 	case err := <-appendDone:
 		close(release)

@@ -1927,7 +1927,7 @@ func TestMigrateRigFromBeadsCrossFilesystemStagesBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	previousRename := databaseMigrationRename
-	databaseMigrationRename = func(_, _ string) error { return syscall.EXDEV }
+	databaseMigrationRename = func(_ *os.Root, _, _ string) error { return syscall.EXDEV }
 	t.Cleanup(func() { databaseMigrationRename = previousRename })
 
 	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
@@ -2145,6 +2145,40 @@ func TestMigrateRigFromBeadsPreservesAbsentCleanupClaim(t *testing.T) {
 	}
 }
 
+func TestMigrateRigFromBeadsPreservesIdentityFreeCleanupClaim(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "identity-free-cleanup"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	cleanupPath := setupDoltDB(t, filepath.Dir(sourcePath), filepath.Base(sourcePath)+".migration-cleanup")
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		CleanupToken: strings.Repeat("a", 64),
+		Phase:        databaseMigrationCleanupReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if err == nil || !strings.Contains(err.Error(), "durable identity") {
+		t.Fatalf("resume migration error = %v, want identity-free-claim refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(cleanupPath, ".dolt")); err != nil {
+		t.Fatalf("identity-free cleanup claim was not preserved: %v", err)
+	}
+}
+
 func TestMigrateRigFromBeadsPreservesMismatchedCleanupClaim(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
@@ -2263,6 +2297,49 @@ func TestMigrateRigFromBeadsRejectsSymlinkedSourceAncestorOnResume(t *testing.T)
 	}
 	if _, err := os.Stat(filepath.Join(realLegacy, rigName, ".dolt")); err != nil {
 		t.Fatalf("symlinked source was mutated: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsRejectsSymlinkedTargetAncestorOnResume(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	externalData := t.TempDir()
+	rigName := "target-symlink-swap"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	cleanupPath := setupDoltDB(t, filepath.Dir(sourcePath), filepath.Base(sourcePath)+".migration-cleanup")
+	externalTarget := setupDoltDB(t, externalData, rigName)
+	digest, err := databaseMigrationTreeDigest(externalTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Repeat("a", 64)
+	if err := os.WriteFile(filepath.Join(cleanupPath, databaseMigrationCleanupClaimName), []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(externalData, filepath.Join(townRoot, ".dolt-data")); err != nil {
+		t.Fatal(err)
+	}
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		CleanupToken: token,
+		Phase:        databaseMigrationCleanupRemoving,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("resume migration error = %v, want target symlink-ancestor refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(cleanupPath, ".dolt")); err != nil {
+		t.Fatalf("cleanup claim was removed through symlinked target custody: %v", err)
 	}
 }
 
