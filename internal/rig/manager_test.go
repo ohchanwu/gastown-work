@@ -1118,10 +1118,7 @@ func TestDropRigOrphanDBs_RemovesPrefixDB(t *testing.T) {
 
 	// Simulate post-init state: rigName DB (correct) and prefix DB (orphan).
 	for _, db := range []string{rigName, prefix} {
-		doltDir := filepath.Join(dataDir, db, ".dolt")
-		if err := os.MkdirAll(doltDir, 0755); err != nil {
-			t.Fatalf("seed %s: %v", db, err)
-		}
+		seedOfflineDoltDatabase(t, dataDir, db)
 	}
 
 	if err := dropRigOrphanDBs(townRoot, prefix, rigName); err != nil {
@@ -1154,9 +1151,7 @@ func TestDropRigOrphanDBs_RemovesLegacyBeadsPrefixDB(t *testing.T) {
 	const legacyOrphan = "beads_ma"
 
 	for _, db := range []string{rigName, legacyOrphan} {
-		if err := os.MkdirAll(filepath.Join(dataDir, db, ".dolt"), 0755); err != nil {
-			t.Fatalf("seed %s: %v", db, err)
-		}
+		seedOfflineDoltDatabase(t, dataDir, db)
 	}
 
 	if err := dropRigOrphanDBs(townRoot, prefix, rigName); err != nil {
@@ -1168,6 +1163,17 @@ func TestDropRigOrphanDBs_RemovesLegacyBeadsPrefixDB(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, rigName, ".dolt")); err != nil {
 		t.Errorf("rig DB %q should be preserved; stat err = %v", rigName, err)
+	}
+}
+
+func seedOfflineDoltDatabase(t *testing.T, dataDir, name string) {
+	t.Helper()
+	manifest := filepath.Join(dataDir, name, ".dolt", "noms", "manifest")
+	if err := os.MkdirAll(filepath.Dir(manifest), 0o755); err != nil {
+		t.Fatalf("seed %s: %v", name, err)
+	}
+	if err := os.WriteFile(manifest, []byte(name), 0o600); err != nil {
+		t.Fatalf("seed %s manifest: %v", name, err)
 	}
 }
 
