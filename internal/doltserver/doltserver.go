@@ -2423,7 +2423,7 @@ func tryLockDoltLifecycle(townRoot string) (*flock.Flock, error) {
 		return nil, fmt.Errorf("acquiring Dolt lifecycle lock: %w", err)
 	}
 	if !locked {
-		return nil, fmt.Errorf("Dolt start is in progress")
+		return nil, fmt.Errorf("Dolt start or cleanup is in progress")
 	}
 	return lock, nil
 }
@@ -2530,7 +2530,7 @@ func Start(townRoot string) error {
 		// deleted ~/gt and re-ran gt install). Kill it so we can start fresh.
 		if _, statErr := os.Stat(config.DataDir); os.IsNotExist(statErr) {
 			fmt.Fprintf(os.Stderr, "Warning: Dolt server (PID %d) is running but data directory %s does not exist — stopping orphaned server\n", pid, config.DataDir)
-			if stopErr := Stop(townRoot); stopErr != nil {
+			if stopErr := stopLocked(townRoot); stopErr != nil {
 				if pid > 0 {
 					if proc, findErr := os.FindProcess(pid); findErr == nil {
 						_ = proc.Kill()
@@ -2827,6 +2827,17 @@ func drainConnectionsBeforeStop(config *Config) {
 // Stop stops the Dolt SQL server.
 // Works for both servers started via gt dolt start AND externally-started servers.
 func Stop(townRoot string) error {
+	doltLifecycleMu.Lock()
+	defer doltLifecycleMu.Unlock()
+	lifecycleLock, err := tryLockDoltLifecycle(townRoot)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lifecycleLock.Unlock() }()
+	return stopLocked(townRoot)
+}
+
+func stopLocked(townRoot string) error {
 	config := DefaultConfig(townRoot)
 
 	running, pid, err := IsRunning(townRoot)
@@ -3337,85 +3348,73 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 		}
 	}
 
-	rigDir := filepath.Join(config.DataDir, rigName)
-
-	// Check if already exists on disk — idempotent for callers like gt install.
-	// Still run EnsureMetadata to repair missing/corrupt metadata.json.
-	if _, err := os.Stat(filepath.Join(rigDir, ".dolt")); err == nil {
-		running, _, _ := IsRunning(townRoot)
-		if err := EnsureMetadata(townRoot, rigName); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: metadata.json update failed for existing database %q: %v\n", rigName, err)
-		}
-		if err := EnsureRigIssuePrefix(townRoot, rigName, running); err != nil {
-			return running, false, fmt.Errorf("ensuring issue_prefix for existing database %q: %w", rigName, err)
-		}
-		return running, false, nil
+	// Resolve the orphaned-server case before taking the ownership lock. Stop
+	// takes the lifecycle lock first, matching cleanup's lifecycle -> ownership
+	// order and avoiding a lock inversion.
+	running, runningPID, runningErr := IsRunning(townRoot)
+	if runningErr != nil {
+		return false, false, fmt.Errorf("checking Dolt server before rig initialization: %w", runningErr)
 	}
-
-	// Check if server is running
-	running, runningPID, _ := IsRunning(townRoot)
-
 	if running {
-		// If the data directory doesn't exist, the server is orphaned (e.g., user
-		// deleted ~/gt and re-ran gt install while an old server was still running).
-		// Stop the orphaned server and fall through to the offline init path.
 		if _, err := os.Stat(config.DataDir); os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "Warning: Dolt server (PID %d) is running but data directory %s does not exist — stopping orphaned server\n", runningPID, config.DataDir)
 			if stopErr := Stop(townRoot); stopErr != nil {
-				// Force-kill if graceful stop fails (no PID file for orphaned server)
-				if runningPID > 0 {
-					if proc, err := os.FindProcess(runningPID); err == nil {
-						_ = proc.Kill()
-					}
+				return false, false, fmt.Errorf("stopping orphaned Dolt server: %w", stopErr)
+			}
+		}
+	}
+
+	err = WithDatabaseOwnershipTransaction(townRoot, func() error {
+		rigDir := filepath.Join(config.DataDir, rigName)
+		running, _, err = IsRunning(townRoot)
+		if err != nil {
+			return fmt.Errorf("checking Dolt server: %w", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(rigDir, ".dolt")); statErr == nil {
+			created = false
+		} else if !os.IsNotExist(statErr) {
+			return fmt.Errorf("checking existing rig database: %w", statErr)
+		} else {
+			created = true
+			if running {
+				if err := serverExecSQL(townRoot, fmt.Sprintf("CREATE DATABASE `%s`", rigName)); err != nil {
+					return fmt.Errorf("creating database on running server: %w", err)
+				}
+				if err := waitForCatalog(townRoot, rigName); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: catalog visibility wait timed out (will retry on use): %v\n", err)
+				}
+			} else {
+				if err := os.MkdirAll(rigDir, 0o755); err != nil {
+					return fmt.Errorf("creating rig directory: %w", err)
+				}
+				cmd := exec.Command("dolt", "init")
+				cmd.Dir = rigDir
+				setProcessGroup(cmd)
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					return fmt.Errorf("initializing Dolt database: %w\n%s", err, output)
 				}
 			}
-			running = false
-		}
-	}
-
-	if running {
-		// Server is running: use CREATE DATABASE which both creates the
-		// directory and registers the database with the live server.
-		if err := serverExecSQL(townRoot, fmt.Sprintf("CREATE DATABASE `%s`", rigName)); err != nil {
-			return true, false, fmt.Errorf("creating database on running server: %w", err)
-		}
-		// Wait for the new database to appear in the server's in-memory catalog.
-		// CREATE DATABASE returns before the catalog is fully updated, so
-		// subsequent USE/query operations can fail with "Unknown database".
-		// Non-fatal: the database was created, so we log a warning and continue
-		// to EnsureMetadata. The retry wrappers (doltSQLWithRetry) will handle
-		// any residual catalog propagation delays in subsequent operations.
-		if err := waitForCatalog(townRoot, rigName); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: catalog visibility wait timed out (will retry on use): %v\n", err)
-		}
-	} else {
-		// Server not running: create directory and init manually.
-		// The database will be picked up when the server starts.
-		if err := os.MkdirAll(rigDir, 0755); err != nil {
-			return false, false, fmt.Errorf("creating rig directory: %w", err)
+			InvalidateDBCache()
 		}
 
-		cmd := exec.Command("dolt", "init")
-		cmd.Dir = rigDir
-		setProcessGroup(cmd)
-		output, err := cmd.CombinedOutput()
+		beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
 		if err != nil {
-			return false, false, fmt.Errorf("initializing Dolt database: %w\n%s", err, output)
+			return fmt.Errorf("resolving beads directory: %w", err)
 		}
-	}
-
-	InvalidateDBCache() // New database created — bust the cache.
-
-	// Update metadata.json to point to the server
-	if err := EnsureMetadata(townRoot, rigName); err != nil {
-		// Non-fatal: init succeeded, metadata update failed
-		fmt.Fprintf(os.Stderr, "Warning: database initialized but metadata.json update failed: %v\n", err)
+		if err := ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName); err != nil {
+			return fmt.Errorf("publishing database ownership: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return running, created, err
 	}
 	if err := EnsureRigIssuePrefix(townRoot, rigName, running); err != nil {
-		return running, true, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
+		return running, created, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
 	}
 
-	return running, true, nil
+	return running, created, nil
 }
 
 // EnsureRigIssuePrefix initializes the beads schema for a rig database and
@@ -3659,36 +3658,35 @@ func FindMigratableDatabases(townRoot string) []Migration {
 // centralized .dolt-data/<rigname> layout.
 func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 	config := DefaultConfig(townRoot)
+	return WithDatabaseOwnershipTransaction(townRoot, func() error {
+		targetDir := filepath.Join(config.DataDir, rigName)
+		if _, err := os.Stat(filepath.Join(targetDir, ".dolt")); err == nil {
+			return fmt.Errorf("rig database %q already exists at %s", rigName, targetDir)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("checking target database: %w", err)
+		}
+		if _, err := os.Stat(filepath.Join(sourcePath, ".dolt")); err != nil {
+			return fmt.Errorf("checking source database: %w", err)
+		}
+		if err := os.MkdirAll(config.DataDir, 0o755); err != nil {
+			return fmt.Errorf("creating data directory: %w", err)
+		}
+		if err := moveDir(sourcePath, targetDir); err != nil {
+			return fmt.Errorf("moving database: %w", err)
+		}
 
-	targetDir := filepath.Join(config.DataDir, rigName)
-
-	// Check if target already exists
-	if _, err := os.Stat(filepath.Join(targetDir, ".dolt")); err == nil {
-		return fmt.Errorf("rig database %q already exists at %s", rigName, targetDir)
-	}
-
-	// Check if source exists
-	if _, err := os.Stat(filepath.Join(sourcePath, ".dolt")); os.IsNotExist(err) {
-		return fmt.Errorf("source database not found at %s", sourcePath)
-	}
-
-	// Ensure data directory exists
-	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
-		return fmt.Errorf("creating data directory: %w", err)
-	}
-
-	// Move the database directory (with cross-filesystem fallback)
-	if err := moveDir(sourcePath, targetDir); err != nil {
-		return fmt.Errorf("moving database: %w", err)
-	}
-
-	// Update metadata.json to point to the server
-	if err := EnsureMetadata(townRoot, rigName); err != nil {
-		// Non-fatal: migration succeeded, metadata update failed
-		fmt.Fprintf(os.Stderr, "Warning: database migrated but metadata.json update failed: %v\n", err)
-	}
-
-	return nil
+		beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
+		if err == nil {
+			err = ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName)
+		}
+		if err != nil {
+			if rollbackErr := moveDir(targetDir, sourcePath); rollbackErr != nil {
+				return fmt.Errorf("publishing migrated database ownership: %w; rollback failed: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("publishing migrated database ownership: %w", err)
+		}
+		return nil
+	})
 }
 
 // DatabaseExists checks whether a rig database exists on the host filesystem
@@ -3855,22 +3853,33 @@ func collectReferencedDatabases(townRoot string) (map[string]bool, error) {
 		return nil, err
 	}
 
-	// Check all rigs from rigs.json
+	// Check all rigs from rigs.json. A configured rig that cannot be resolved is
+	// ownership uncertainty, not evidence that its database is orphaned.
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
-	data, err := os.ReadFile(rigsPath)
-	if err == nil {
-		var config struct {
-			Rigs map[string]interface{} `json:"rigs"`
-		}
-		if err := json.Unmarshal(data, &config); err == nil {
-			for rigName := range config.Rigs {
-				beadsDir := FindRigBeadsDir(townRoot, rigName)
-				if beadsDir == "" {
-					continue
-				}
-				if err := addReference(beadsDir); err != nil {
-					return nil, err
-				}
+	rigsConfig, err := configpkg.LoadRigsConfig(rigsPath)
+	if err != nil && !errors.Is(err, configpkg.ErrNotFound) {
+		return nil, fmt.Errorf("loading rig ownership registry: %w", err)
+	}
+	if rigsConfig != nil {
+		for rigName, entry := range rigsConfig.Rigs {
+			beadsDir := FindRigBeadsDir(townRoot, rigName)
+			if beadsDir == "" {
+				return nil, fmt.Errorf("configured rig %q has no resolvable beads directory", rigName)
+			}
+			if _, err := os.Stat(beadsDir); err != nil {
+				return nil, fmt.Errorf("resolving configured rig %q ownership: %w", rigName, err)
+			}
+			db, err := readExistingDoltDatabase(beadsDir)
+			if err != nil {
+				return nil, err
+			}
+			if db != "" {
+				referenced[canonicalDatabaseName(db)] = true
+			}
+			if entry.BeadsConfig != nil && entry.BeadsConfig.Prefix != "" {
+				referenced[canonicalDatabaseName(strings.TrimSuffix(entry.BeadsConfig.Prefix, "-"))] = true
+			} else if db == "" {
+				return nil, fmt.Errorf("configured rig %q has no database ownership identity", rigName)
 			}
 		}
 	}
@@ -3879,49 +3888,62 @@ func collectReferencedDatabases(townRoot string) (map[string]bool, error) {
 	// rigs.json yet (e.g., hop before gt rig add). (gt-q8f6n fix)
 	routesPath := filepath.Join(townRoot, ".beads", "routes.jsonl")
 	if routesData, readErr := os.ReadFile(routesPath); readErr == nil {
-		for _, line := range strings.Split(string(routesData), "\n") {
+		for lineNumber, line := range strings.Split(string(routesData), "\n") {
 			line = strings.TrimSpace(line)
-			if line == "" {
+			if line == "" || strings.HasPrefix(line, "#") {
 				continue
 			}
 			var route struct {
-				Path string `json:"path"`
+				Prefix string `json:"prefix"`
+				Path   string `json:"path"`
 			}
-			if json.Unmarshal([]byte(line), &route) != nil || route.Path == "" {
-				continue
+			if err := json.Unmarshal([]byte(line), &route); err != nil {
+				return nil, fmt.Errorf("parsing route ownership registry %s:%d: %w", routesPath, lineNumber+1, err)
+			}
+			cleanPath := filepath.Clean(route.Path)
+			if route.Path == "" || filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+				return nil, fmt.Errorf("parsing route ownership registry %s:%d: invalid path %q", routesPath, lineNumber+1, route.Path)
 			}
 			// route.Path is relative to town root, e.g., "hop", "beads/mayor/rig"
-			beadsDir := filepath.Join(townRoot, route.Path, ".beads")
-			if err := addReference(beadsDir); err != nil {
+			beadsDir := filepath.Join(townRoot, cleanPath, ".beads")
+			if _, err := os.Stat(beadsDir); err != nil {
+				return nil, fmt.Errorf("resolving route ownership registry %s:%d: %w", routesPath, lineNumber+1, err)
+			}
+			db, err := readExistingDoltDatabase(beadsDir)
+			if err != nil {
 				return nil, err
 			}
+			if db != "" {
+				referenced[canonicalDatabaseName(db)] = true
+			}
+			if route.Prefix != "" {
+				referenced[canonicalDatabaseName(strings.TrimSuffix(route.Prefix, "-"))] = true
+			} else if db == "" {
+				return nil, fmt.Errorf("route ownership registry %s:%d has no database identity", routesPath, lineNumber+1)
+			}
 		}
+	} else if !os.IsNotExist(readErr) {
+		return nil, fmt.Errorf("reading route ownership registry: %w", readErr)
 	}
 
 	// Scan top-level directories for any .beads/metadata.json with dolt_database.
 	// This catches rigs that exist on disk but aren't in rigs.json or routes.jsonl.
-	if entries, readErr := os.ReadDir(townRoot); readErr == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() || entry.Name() == ".beads" || entry.Name() == "mayor" {
-				continue
-			}
-			// Check <rig>/.beads/metadata.json
-			if err := addReference(filepath.Join(townRoot, entry.Name(), ".beads")); err != nil {
-				return nil, err
-			}
-			// Check <rig>/mayor/rig/.beads/metadata.json
-			if err := addReference(filepath.Join(townRoot, entry.Name(), "mayor", "rig", ".beads")); err != nil {
-				return nil, err
-			}
-		}
+	entries, err := os.ReadDir(townRoot)
+	if err != nil {
+		return nil, fmt.Errorf("enumerating town ownership metadata: %w", err)
 	}
-
-	// Safety net: also mark all rig prefixes from rigs.json as referenced.
-	// Some rigs use their prefix as the database name (e.g., "lc" for laneassist,
-	// "gt" for gastown). If metadata.json is missing or corrupted, the prefix-named
-	// DB would appear orphaned without this fallback. (gt-85w7)
-	for _, prefix := range configpkg.AllRigPrefixes(townRoot) {
-		referenced[canonicalDatabaseName(prefix)] = true
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == ".beads" || entry.Name() == "mayor" {
+			continue
+		}
+		// Check <rig>/.beads/metadata.json
+		if err := addReference(filepath.Join(townRoot, entry.Name(), ".beads")); err != nil {
+			return nil, err
+		}
+		// Check <rig>/mayor/rig/.beads/metadata.json
+		if err := addReference(filepath.Join(townRoot, entry.Name(), "mayor", "rig", ".beads")); err != nil {
+			return nil, err
+		}
 	}
 
 	return referenced, nil
@@ -4080,6 +4102,22 @@ func lockDatabaseCleanupOwnership(townRoot string) (*flock.Flock, error) {
 	return lock, nil
 }
 
+// WithDatabaseOwnershipTransaction excludes destructive cleanup while a caller
+// creates, renames, or publishes ownership for a Dolt database.
+func WithDatabaseOwnershipTransaction(townRoot string, operation func() error) error {
+	if operation == nil {
+		return fmt.Errorf("database ownership operation is required")
+	}
+	databaseCleanupMu.Lock()
+	defer databaseCleanupMu.Unlock()
+	ownershipLock, err := lockDatabaseCleanupOwnership(townRoot)
+	if err != nil {
+		return fmt.Errorf("locking database ownership: %w", err)
+	}
+	defer func() { _ = ownershipLock.Unlock() }()
+	return operation()
+}
+
 // RemoveDatabase removes an orphaned database directory from .dolt-data/.
 // The caller should verify the database is actually orphaned before calling this.
 // If the Dolt server is running, it will DROP the database first.
@@ -4100,28 +4138,23 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 	}
 	defer func() { _ = lifecycleLock.Unlock() }()
 
-	databaseCleanupMu.Lock()
-	defer databaseCleanupMu.Unlock()
-	ownershipLock, err := lockDatabaseCleanupOwnership(townRoot)
-	if err != nil {
-		return fmt.Errorf("locking database ownership for cleanup: %w", err)
-	}
-	defer func() { _ = ownershipLock.Unlock() }()
-	lockDir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup")
-	if err := ensurePrivateDatabaseCleanupDirectory(lockDir); err != nil {
-		return fmt.Errorf("creating database cleanup lock directory: %w", err)
-	}
-	databaseLockPath := filepath.Join(lockDir, canonicalDatabaseName(dbName)+".lock")
-	fileLock := flock.New(databaseLockPath)
-	if err := fileLock.Lock(); err != nil {
-		return fmt.Errorf("locking database cleanup for %q: %w", dbName, err)
-	}
-	defer func() { _ = fileLock.Unlock() }()
-	if err := os.Chmod(databaseLockPath, 0o600); err != nil {
-		return fmt.Errorf("tightening database cleanup lock for %q: %w", dbName, err)
-	}
+	return WithDatabaseOwnershipTransaction(townRoot, func() error {
+		lockDir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup")
+		if err := ensurePrivateDatabaseCleanupDirectory(lockDir); err != nil {
+			return fmt.Errorf("creating database cleanup lock directory: %w", err)
+		}
+		databaseLockPath := filepath.Join(lockDir, canonicalDatabaseName(dbName)+".lock")
+		fileLock := flock.New(databaseLockPath)
+		if err := fileLock.Lock(); err != nil {
+			return fmt.Errorf("locking database cleanup for %q: %w", dbName, err)
+		}
+		defer func() { _ = fileLock.Unlock() }()
+		if err := os.Chmod(databaseLockPath, 0o600); err != nil {
+			return fmt.Errorf("tightening database cleanup lock for %q: %w", dbName, err)
+		}
 
-	return removeDatabaseLocked(townRoot, dbName, force)
+		return removeDatabaseLocked(townRoot, dbName, force)
+	})
 }
 
 func removeDatabaseLocked(townRoot, dbName string, force bool) error {
@@ -4130,7 +4163,7 @@ func removeDatabaseLocked(townRoot, dbName string, force bool) error {
 	receiptPath := databaseCleanupReceiptPath(townRoot, dbName)
 	receipt, receiptErr := readDatabaseCleanupReceipt(receiptPath)
 	if receiptErr == nil {
-		if !strings.EqualFold(receipt.Database, dbName) {
+		if receipt.Database != dbName {
 			return fmt.Errorf("database cleanup receipt does not match %q", dbName)
 		}
 		if receipt.Force && !force {
@@ -4958,6 +4991,12 @@ func EnsureMetadata(townRoot, rigName string, doltDatabase ...string) error {
 // database to exist, so callers can leave a recoverable rig behind after partial
 // initialization failures.
 func EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName string, doltDatabase ...string) error {
+	return WithDatabaseOwnershipTransaction(townRoot, func() error {
+		return ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName, doltDatabase...)
+	})
+}
+
+func ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName string, doltDatabase ...string) error {
 	if beadsDir == "" {
 		return fmt.Errorf("beads directory is required")
 	}
@@ -4981,13 +5020,6 @@ func EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName string, doltDatabase 
 	}
 
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
-	databaseCleanupMu.Lock()
-	defer databaseCleanupMu.Unlock()
-	ownershipLock, err := lockDatabaseCleanupOwnership(townRoot)
-	if err != nil {
-		return fmt.Errorf("locking database ownership metadata: %w", err)
-	}
-	defer func() { _ = ownershipLock.Unlock() }()
 
 	// Acquire per-path mutex for goroutine synchronization.
 	// EnsureAllMetadata calls EnsureMetadata concurrently; flock (inter-process)

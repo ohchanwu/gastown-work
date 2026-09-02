@@ -6,6 +6,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gofrs/flock"
 )
 
 func TestRigConfigSyncCheck_MissingConfig(t *testing.T) {
@@ -49,6 +52,106 @@ func TestRigConfigSyncCheck_MissingConfig(t *testing.T) {
 	}
 	if len(check.missingConfig) != 1 {
 		t.Errorf("expected 1 missing config, got %d", len(check.missingConfig))
+	}
+}
+
+func TestRigConfigSyncFixHoldsOwnershipFenceAcrossRenameAndMetadata(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registry := `{"version":1,"rigs":{"testrig":{"git_url":"local","beads":{"repo":"local","prefix":"tr-"}}}}`
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beadsDir := filepath.Join(townRoot, "testrig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, []byte("{\"dolt_database\":\"old_db\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDBPath := filepath.Join(townRoot, ".dolt-data", "old_db")
+	if err := os.MkdirAll(filepath.Join(oldDBPath, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	lockPath := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "ownership.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ownershipLock := flock.New(lockPath)
+	if err := ownershipLock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewRigConfigSyncCheck()
+	check.dbNameMismatches = []dbMismatch{{rigName: "testrig", currentDB: "old_db", expectedDB: "testrig"}}
+	done := make(chan error, 1)
+	go func() { done <- check.Fix(&CheckContext{TownRoot: townRoot}) }()
+	select {
+	case err := <-done:
+		_ = ownershipLock.Unlock()
+		t.Fatalf("Fix() bypassed ownership fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := ownershipLock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Fix() after ownership release: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", "testrig", ".dolt")); err != nil {
+		t.Fatalf("database was not renamed: %v", err)
+	}
+	if _, err := os.Stat(oldDBPath); !os.IsNotExist(err) {
+		t.Fatalf("old database path remains: %v", err)
+	}
+	metadata, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(metadata), `"dolt_database": "testrig"`) {
+		t.Fatalf("metadata ownership not updated: %s", metadata)
+	}
+}
+
+func TestRigConfigSyncFixRejectsStaleDatabaseOwnership(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registry := `{"version":1,"rigs":{"testrig":{"git_url":"local","beads":{"repo":"local","prefix":"tr-"}}}}`
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beadsDir := filepath.Join(townRoot, "testrig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, []byte("{\"dolt_database\":\"new_owner\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDBPath := filepath.Join(townRoot, ".dolt-data", "old_db")
+	if err := os.MkdirAll(filepath.Join(oldDBPath, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewRigConfigSyncCheck()
+	check.dbNameMismatches = []dbMismatch{{rigName: "testrig", currentDB: "old_db", expectedDB: "testrig"}}
+	err := check.Fix(&CheckContext{TownRoot: townRoot})
+	if err == nil || !strings.Contains(err.Error(), "ownership changed") {
+		t.Fatalf("Fix() error = %v, want stale ownership refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(oldDBPath, ".dolt")); err != nil {
+		t.Fatalf("stale source database was mutated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", "testrig")); !os.IsNotExist(err) {
+		t.Fatalf("stale target database was created: %v", err)
 	}
 }
 

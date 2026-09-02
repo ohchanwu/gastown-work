@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -427,74 +428,99 @@ func (c *RigConfigSyncCheck) Fix(ctx *CheckContext) error {
 		if beadsDir == filepath.Join(mayorRigPath, ".beads") {
 			cmdDir = mayorRigPath
 		}
-		if exists, err := c.doltDatabaseExists(ctx, rigName); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: skipping Dolt DB initialization for %s because database status could not be verified: %v\n", rigName, err)
-			continue
-		} else if exists {
+		databaseExists := false
+		var statusErr error
+		if err := doltserver.WithDatabaseOwnershipTransaction(ctx.TownRoot, func() error {
+			exists, err := c.doltDatabaseExists(ctx, rigName)
+			if err != nil {
+				statusErr = err
+				return nil
+			}
+			databaseExists = exists
+			if exists {
+				return nil
+			}
+
+			// Run bd init against the rig-name database, not the prefix-derived default.
+			doltCfg := doltserver.DefaultConfig(ctx.TownRoot)
+			destroyToken := fmt.Sprintf("DESTROY-%s", entry.BeadsConfig.Prefix)
+			cmd := exec.Command("bd", "init", "--prefix", entry.BeadsConfig.Prefix, "--database", rigName, "--server", "--server-port", strconv.Itoa(doltCfg.Port), "--force", "--destroy-token="+destroyToken)
+			cmd.Dir = cmdDir
+			cmd.Env = append(stripEnvPrefixes(os.Environ(), "BEADS_DIR=", "BEADS_DB=", "BEADS_DOLT_SERVER_DATABASE="),
+				"BEADS_DIR="+beadsDir,
+				"BEADS_DOLT_SERVER_DATABASE="+rigName,
+			)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("could not initialize Dolt DB: %w\n%s", err, string(output))
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("could not initialize Dolt DB for %s: %w", rigName, err)
+		}
+		if statusErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: skipping Dolt DB initialization for %s because database status could not be verified: %v\n", rigName, statusErr)
 			continue
 		}
-
-		// Run bd init against the rig-name database, not the prefix-derived default.
-		doltCfg := doltserver.DefaultConfig(ctx.TownRoot)
-		destroyToken := fmt.Sprintf("DESTROY-%s", entry.BeadsConfig.Prefix)
-		cmd := exec.Command("bd", "init", "--prefix", entry.BeadsConfig.Prefix, "--database", rigName, "--server", "--server-port", strconv.Itoa(doltCfg.Port), "--force", "--destroy-token="+destroyToken)
-		cmd.Dir = cmdDir
-		cmd.Env = append(stripEnvPrefixes(os.Environ(), "BEADS_DIR=", "BEADS_DB=", "BEADS_DOLT_SERVER_DATABASE="),
-			"BEADS_DIR="+beadsDir,
-			"BEADS_DOLT_SERVER_DATABASE="+rigName,
-		)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("could not initialize Dolt DB for %s: %w\n%s", rigName, err, string(output))
+		if databaseExists {
+			continue
 		}
 	}
 
 	// Fix database name mismatches - rename database to match rig directory name
 	renamedDBs := false
 	for _, mismatch := range c.dbNameMismatches {
-		metadataPath := filepath.Join(doltserver.FindRigBeadsDir(ctx.TownRoot, mismatch.rigName), "metadata.json")
-
-		// Read current metadata
-		metadataBytes, err := os.ReadFile(metadataPath)
-		if err != nil {
-			return fmt.Errorf("could not read metadata.json for %s: %w", mismatch.rigName, err)
-		}
-
-		var metadata map[string]interface{}
-		if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
-			return fmt.Errorf("could not parse metadata.json for %s: %w", mismatch.rigName, err)
-		}
-
-		// Update database name to match rig directory name
-		metadata["dolt_database"] = mismatch.expectedDB
-
-		// Write updated metadata
-		newMetadata, err := json.MarshalIndent(metadata, "", "  ")
-		if err != nil {
-			return fmt.Errorf("could not serialize metadata.json for %s: %w", mismatch.rigName, err)
-		}
-
-		if err := os.WriteFile(metadataPath, newMetadata, 0644); err != nil {
-			return fmt.Errorf("could not write metadata.json for %s: %w", mismatch.rigName, err)
-		}
-
-		// Rename the Dolt database directory
-		dataDir := filepath.Join(ctx.TownRoot, ".dolt-data")
-		oldDBPath := filepath.Join(dataDir, mismatch.currentDB)
-		newDBPath := filepath.Join(dataDir, mismatch.expectedDB)
-
-		if _, err := os.Stat(oldDBPath); err == nil {
-			// Check if new path already exists
-			if _, err := os.Stat(newDBPath); err == nil {
-				// New path exists - this is a conflict, skip rename
-				// The database with the correct name already exists
-			} else {
-				// Rename the database directory
-				if err := os.Rename(oldDBPath, newDBPath); err != nil {
-					return fmt.Errorf("could not rename database %s to %s: %w", mismatch.currentDB, mismatch.expectedDB, err)
-				}
-				renamedDBs = true
+		renamed := false
+		if err := doltserver.WithDatabaseOwnershipTransaction(ctx.TownRoot, func() error {
+			metadataPath := filepath.Join(doltserver.FindRigBeadsDir(ctx.TownRoot, mismatch.rigName), "metadata.json")
+			metadataBytes, err := os.ReadFile(metadataPath)
+			if err != nil {
+				return fmt.Errorf("reading metadata.json: %w", err)
 			}
+			var metadata map[string]interface{}
+			if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+				return fmt.Errorf("parsing metadata.json: %w", err)
+			}
+			currentDB, ok := metadata["dolt_database"].(string)
+			if !ok || currentDB != mismatch.currentDB {
+				return fmt.Errorf("database ownership changed from %q to %q", mismatch.currentDB, currentDB)
+			}
+
+			dataDir := filepath.Join(ctx.TownRoot, ".dolt-data")
+			oldDBPath := filepath.Join(dataDir, mismatch.currentDB)
+			newDBPath := filepath.Join(dataDir, mismatch.expectedDB)
+			if _, err := os.Stat(oldDBPath); err == nil {
+				if _, err := os.Stat(newDBPath); err == nil {
+					return fmt.Errorf("database path conflict: %s already exists", mismatch.expectedDB)
+				} else if !os.IsNotExist(err) {
+					return fmt.Errorf("checking target database path: %w", err)
+				}
+				if err := os.Rename(oldDBPath, newDBPath); err != nil {
+					return fmt.Errorf("renaming database %s to %s: %w", mismatch.currentDB, mismatch.expectedDB, err)
+				}
+				renamed = true
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("checking source database path: %w", err)
+			}
+
+			metadata["dolt_database"] = mismatch.expectedDB
+			newMetadata, err := json.MarshalIndent(metadata, "", "  ")
+			if err != nil {
+				return fmt.Errorf("serializing metadata.json: %w", err)
+			}
+			if err := atomicfile.WriteFile(metadataPath, append(newMetadata, '\n'), 0o600); err != nil {
+				if renamed {
+					if rollbackErr := os.Rename(newDBPath, oldDBPath); rollbackErr != nil {
+						return fmt.Errorf("writing metadata.json: %w; database rename rollback failed: %v", err, rollbackErr)
+					}
+					renamed = false
+				}
+				return fmt.Errorf("writing metadata.json: %w", err)
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("could not reconcile Dolt database ownership for %s: %w", mismatch.rigName, err)
 		}
+		renamedDBs = renamedDBs || renamed
 	}
 
 	// If we renamed databases, restart the Dolt server to pick up the changes.

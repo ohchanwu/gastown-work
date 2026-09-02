@@ -4209,7 +4209,7 @@ func TestRemoveDatabaseOfflineRestoresClaimAfterOwnershipRace(t *testing.T) {
 
 func TestRemoveDatabaseRunningRestoresClaimAfterOwnershipRace(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
-	t.Setenv("GT_TEST_SHOW_DATABASES_JSON", `{"rows":[{"Database":"control_db"}]}`)
+	t.Setenv("GT_TEST_SHOW_DATABASES_JSON", `{"rows":[{"Database":"testdb_remove"},{"Database":"control_db"}]}`)
 	claimDir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "claimed")
 	oldSync := databaseCleanupDirSync
 	injected := false
@@ -4240,6 +4240,58 @@ func TestRemoveDatabaseRunningRestoresClaimAfterOwnershipRace(t *testing.T) {
 	}
 	if len(claimed) != 0 {
 		t.Fatalf("claimed database remained stranded: %v", claimed)
+	}
+}
+
+func TestFindOrphanedDatabasesFailsClosedOnMalformedRigRegistry(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), "lc")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte("{malformed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	orphans, err := FindOrphanedDatabases(townRoot)
+	if err == nil {
+		t.Fatalf("malformed ownership registry failed open: orphans=%v", orphans)
+	}
+}
+
+func TestFindOrphanedDatabasesFailsClosedOnMalformedRouteRegistry(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), "lc")
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte("{malformed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	orphans, err := FindOrphanedDatabases(townRoot)
+	if err == nil {
+		t.Fatalf("malformed route registry failed open: orphans=%v", orphans)
+	}
+}
+
+func TestFindOrphanedDatabasesFailsClosedOnUnresolvedConfiguredRig(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), "lc")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registry := `{"version":1,"rigs":{"laneassist":{"git_url":"local","beads":{"repo":"local","prefix":"lc-"}}}}`
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	orphans, err := FindOrphanedDatabases(townRoot)
+	if err == nil {
+		t.Fatalf("unresolved configured rig failed open: orphans=%v", orphans)
 	}
 }
 
@@ -4306,6 +4358,24 @@ func TestRemoveDatabaseFailsClosedWhileDoltStartLockHeld(t *testing.T) {
 	}
 }
 
+func TestStopFailsClosedWhileDoltLifecycleLockHeld(t *testing.T) {
+	townRoot := t.TempDir()
+	lockPath := doltLifecycleLockPath(townRoot)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lifecycleLock := flock.New(lockPath)
+	if err := lifecycleLock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lifecycleLock.Unlock() })
+
+	err := Stop(townRoot)
+	if err == nil || !strings.Contains(err.Error(), "start") {
+		t.Fatalf("Stop() error = %v, want lifecycle-lock refusal", err)
+	}
+}
+
 func TestEnsureMetadataWaitsForDatabaseCleanupOwnership(t *testing.T) {
 	townRoot := t.TempDir()
 	databaseCleanupMu.Lock()
@@ -4320,6 +4390,82 @@ func TestEnsureMetadataWaitsForDatabaseCleanupOwnership(t *testing.T) {
 	databaseCleanupMu.Unlock()
 	if err := <-done; err != nil {
 		t.Fatalf("EnsureMetadata() after cleanup ownership release: %v", err)
+	}
+}
+
+func TestDatabaseOwnershipTransactionWaitsForCleanup(t *testing.T) {
+	townRoot := t.TempDir()
+	databaseCleanupMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- WithDatabaseOwnershipTransaction(townRoot, func() error { return nil })
+	}()
+	select {
+	case err := <-done:
+		databaseCleanupMu.Unlock()
+		t.Fatalf("ownership transaction bypassed cleanup lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	databaseCleanupMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("ownership transaction after cleanup release: %v", err)
+	}
+}
+
+func TestInitRigWaitsForDatabaseOwnershipTransaction(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte("#!/bin/sh\nexit 23\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	databaseCleanupMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := InitRig(townRoot, "newrig")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		databaseCleanupMu.Unlock()
+		t.Fatalf("InitRig() bypassed ownership transaction: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	databaseCleanupMu.Unlock()
+	if err := <-done; err == nil {
+		t.Fatal("InitRig() unexpectedly succeeded with failing dolt fixture")
+	}
+}
+
+func TestRemoveDatabaseRejectsOfflineReceiptCallerCaseMismatch(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	dbPath := filepath.Join(townRoot, ".dolt-data", "Foo")
+	setupDoltDB(t, filepath.Dir(dbPath), filepath.Base(dbPath))
+	incarnation, err := databaseCleanupIncarnation(townRoot, "Foo", dbPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := databaseCleanupReceiptPath(townRoot, "Foo")
+	receipt := databaseCleanupReceipt{
+		Version: databaseCleanupReceiptVersion, Database: "Foo", Force: true,
+		Phase: databaseCleanupOfflineReady, Incarnation: incarnation,
+	}
+	if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	err = RemoveDatabase(townRoot, "foo", true)
+	if err == nil {
+		t.Fatal("RemoveDatabase() accepted case-mismatched caller for pending receipt")
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("physical database was not preserved: %v", err)
+	}
+	if _, err := os.Stat(receiptPath); err != nil {
+		t.Fatalf("cleanup receipt was not preserved: %v", err)
 	}
 }
 
@@ -5105,14 +5251,13 @@ func TestCollectReferencedDatabases_CustomDatabaseName(t *testing.T) {
 func TestCollectReferencedDatabases_NoMetadata(t *testing.T) {
 	townRoot := t.TempDir()
 	setupRigsJSON(t, townRoot, []string{"gastown"})
-	// No metadata.json for gastown — should not crash
-
-	referenced, err := collectReferencedDatabases(townRoot)
-	if err != nil {
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", ".beads"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if len(referenced) != 0 {
-		t.Errorf("expected 0 referenced with no metadata, got %d: %v", len(referenced), referenced)
+	// With neither metadata nor a configured prefix, ownership is unresolved.
+	referenced, err := collectReferencedDatabases(townRoot)
+	if err == nil {
+		t.Fatalf("missing ownership identity failed open: %v", referenced)
 	}
 }
 

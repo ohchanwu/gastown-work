@@ -12,7 +12,6 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
-	"github.com/steveyegge/gastown/internal/atomicfile"
 )
 
 var verifyExpectedDatabasesAtConfig = doltserver.VerifyExpectedDatabasesAtConfig
@@ -169,49 +168,7 @@ func (c *DoltMetadataCheck) hasDoltMetadata(beadsDir, expectedDB string) bool {
 
 // writeDoltMetadata writes dolt server config to a rig's metadata.json.
 func (c *DoltMetadataCheck) writeDoltMetadata(townRoot, rigName string) error {
-	// Use FindOrCreateRigBeadsDir to atomically resolve and create the directory,
-	// avoiding the TOCTOU race in the stat-then-use pattern.
-	beadsDir, err := c.findOrCreateRigBeadsDir(townRoot, rigName)
-	if err != nil {
-		return fmt.Errorf("resolving beads directory for rig %q: %w", rigName, err)
-	}
-
-	metadataPath := filepath.Join(beadsDir, "metadata.json")
-
-	// Load existing metadata if present
-	existing := make(map[string]interface{})
-	if data, err := os.ReadFile(metadataPath); err == nil {
-		_ = json.Unmarshal(data, &existing)
-	}
-
-	// Resolve the correct database name. Some rigs use their prefix as the
-	// DB name (e.g., "lc" for laneassist). Preserve existing dolt_database
-	// if it matches a known prefix; otherwise fall back to rig name. (gt-85w7)
-	dbName := rigName
-	if existingDB, ok := existing["dolt_database"].(string); ok && existingDB != "" {
-		// Preserve the existing DB name if it's a known prefix
-		prefix := config.GetRigPrefix(townRoot, rigName)
-		if existingDB == prefix {
-			dbName = existingDB
-		}
-	}
-
-	// Set dolt server fields
-	existing["database"] = "dolt"
-	existing["backend"] = "dolt"
-	existing["dolt_mode"] = "server"
-	existing["dolt_database"] = dbName
-
-	data, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling metadata: %w", err)
-	}
-
-	if err := atomicfile.WriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
-		return fmt.Errorf("writing metadata.json: %w", err)
-	}
-
-	return nil
+	return doltserver.EnsureMetadata(townRoot, rigName)
 }
 
 // findRigBeadsDir delegates to the canonical read-only implementation in doltserver.
