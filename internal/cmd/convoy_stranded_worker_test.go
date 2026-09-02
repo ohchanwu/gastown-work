@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -125,11 +124,11 @@ esac
 		t.Fatalf("issue detail route-group process launches = %d, want 2", scans)
 	}
 	data, err = os.ReadFile(workerLog)
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
-	if scans := strings.Count(string(data), "scan\n"); scans != 2 {
-		t.Fatalf("worker inventory route scans = %d, want 2", scans)
+	if scans := strings.Count(string(data), "scan\n"); scans != 0 {
+		t.Fatalf("worker inventory route scans = %d, want 0", scans)
 	}
 	data, err = os.ReadFile(tmuxLog)
 	if err != nil {
@@ -150,69 +149,6 @@ esac
 	}
 	if _, err := findStrandedConvoysContext(context.Background(), townRoot); err == nil {
 		t.Fatal("unreadable route snapshot published a complete stranded inventory")
-	}
-}
-
-func TestEnrichConvoyWorkersScansOnce(t *testing.T) {
-	results := []convoyLookupResult{
-		{done: true, tracked: []trackedIssueInfo{{ID: "gt-a", Status: "open"}, {ID: "gt-closed", Status: "closed"}}},
-		{done: true, tracked: []trackedIssueInfo{{ID: "gt-b", Status: "in_progress"}, {ID: "gt-a", Status: "open"}}},
-	}
-
-	calls := 0
-	var gotIDs []string
-	err := enrichConvoyWorkersContext(context.Background(), "/town", results,
-		func(_ context.Context, townRoot string, ids []string) (map[string]*workerInfo, error) {
-			calls++
-			if townRoot != "/town" {
-				t.Fatalf("town root = %q", townRoot)
-			}
-			gotIDs = append([]string(nil), ids...)
-			return map[string]*workerInfo{
-				"gt-a": {Worker: "rig/a"},
-				"gt-b": {Worker: "rig/b"},
-			}, nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if calls != 1 {
-		t.Fatalf("worker inventory calls = %d, want 1", calls)
-	}
-	if want := []string{"gt-a", "gt-b"}; !reflect.DeepEqual(gotIDs, want) {
-		t.Fatalf("worker inventory IDs = %v, want %v", gotIDs, want)
-	}
-	if results[0].tracked[0].Worker != "rig/a" || results[1].tracked[0].Worker != "rig/b" {
-		t.Fatalf("workers not attached to ordered results: %#v", results)
-	}
-}
-
-func TestEnrichConvoyWorkersUsesTownRootForRealScan(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell fixture")
-	}
-
-	townRoot := t.TempDir()
-	for _, suffix := range []string{"polecats", filepath.Join("mayor", "rig", ".beads")} {
-		if err := os.MkdirAll(filepath.Join(townRoot, "alpha", suffix), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	binDir := t.TempDir()
-	script := `#!/bin/sh
-printf '%s\n' '[{"id":"gt-alpha-polecat-worker","hook_bead":"gt-a"}]'
-`
-	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	results := []convoyLookupResult{{done: true, tracked: []trackedIssueInfo{{ID: "gt-a", Status: "open"}}}}
-	if err := enrichConvoyWorkersContext(context.Background(), townRoot, results, getWorkersForIssuesContext); err != nil {
-		t.Fatal(err)
-	}
-	if got := results[0].tracked[0].Worker; got != "alpha/polecat/worker" {
-		t.Fatalf("worker from town-root rig scan = %q", got)
 	}
 }
 

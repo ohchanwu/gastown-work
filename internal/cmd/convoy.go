@@ -2101,9 +2101,6 @@ func findStrandedConvoysContext(ctx context.Context, townRoot string) ([]strande
 			trackedIDs = append(trackedIDs, tracked.ID)
 		}
 	}
-	if err := enrichConvoyWorkersContext(ctx, townRoot, results, getWorkersForIssuesContext); err != nil {
-		return nil, convoyStrandedScanError(ctx)
-	}
 	scheduledSet, err := areScheduledContext(ctx, trackedIDs)
 	if err != nil {
 		return nil, convoyStrandedScanError(ctx)
@@ -2211,38 +2208,6 @@ func convoyStrandedScanError(ctx context.Context) error {
 		return fmt.Errorf("convoy stranded scan incomplete: %w", err)
 	}
 	return errors.New("convoy stranded scan incomplete")
-}
-
-func enrichConvoyWorkersContext(
-	ctx context.Context,
-	townRoot string,
-	results []convoyLookupResult,
-	lookup func(context.Context, string, []string) (map[string]*workerInfo, error),
-) error {
-	seen := make(map[string]bool)
-	var issueIDs []string
-	for _, result := range results {
-		for _, tracked := range result.tracked {
-			if tracked.Status == "closed" || seen[tracked.ID] {
-				continue
-			}
-			seen[tracked.ID] = true
-			issueIDs = append(issueIDs, tracked.ID)
-		}
-	}
-	workers, err := lookup(ctx, townRoot, issueIDs)
-	if err != nil {
-		return err
-	}
-	for i := range results {
-		for j := range results[i].tracked {
-			if worker := workers[results[i].tracked[j].ID]; worker != nil {
-				results[i].tracked[j].Worker = worker.Worker
-				results[i].tracked[j].WorkerAge = worker.Age
-			}
-		}
-	}
-	return nil
 }
 
 // isReadyIssue checks if an issue is ready for dispatch (stranded).
