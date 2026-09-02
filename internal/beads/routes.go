@@ -69,55 +69,53 @@ func AppendRoute(townRoot string, route Route) error {
 // AppendRouteToDir appends a route to routes.jsonl in the given beads directory.
 // If the prefix already exists, it updates the path.
 func AppendRouteToDir(beadsDir string, route Route) error {
-	// Load existing routes
-	routes, err := LoadRoutes(beadsDir)
-	if err != nil {
-		return fmt.Errorf("loading routes: %w", err)
-	}
-
-	// Check if prefix already exists
-	found := false
-	for i, r := range routes {
-		if r.Prefix == route.Prefix {
-			routes[i].Path = route.Path
-			found = true
-			break
+	return withRoutesOwnership(beadsDir, func() error {
+		routes, err := LoadRoutes(beadsDir)
+		if err != nil {
+			return fmt.Errorf("loading routes: %w", err)
 		}
-	}
 
-	if !found {
-		routes = append(routes, route)
-	}
+		found := false
+		for i, existing := range routes {
+			if existing.Prefix == route.Prefix {
+				routes[i].Path = route.Path
+				found = true
+				break
+			}
+		}
+		if !found {
+			routes = append(routes, route)
+		}
 
-	// Write back
-	return WriteRoutes(beadsDir, routes)
+		return writeRoutes(beadsDir, routes)
+	})
 }
 
 // RemoveRoute removes a route by prefix from routes.jsonl.
 func RemoveRoute(townRoot string, prefix string) error {
 	beadsDir := filepath.Join(townRoot, ".beads")
-
-	// Load existing routes
-	routes, err := LoadRoutes(beadsDir)
-	if err != nil {
-		return fmt.Errorf("loading routes: %w", err)
-	}
-
-	// Filter out the prefix
-	var filtered []Route
-	for _, r := range routes {
-		if r.Prefix != prefix {
-			filtered = append(filtered, r)
+	return withRoutesOwnership(beadsDir, func() error {
+		routes, err := LoadRoutes(beadsDir)
+		if err != nil {
+			return fmt.Errorf("loading routes: %w", err)
 		}
-	}
 
-	// Write back
-	return WriteRoutes(beadsDir, filtered)
+		filtered := make([]Route, 0, len(routes))
+		for _, route := range routes {
+			if route.Prefix != prefix {
+				filtered = append(filtered, route)
+			}
+		}
+		return writeRoutes(beadsDir, filtered)
+	})
 }
 
 // WriteRoutes writes routes to routes.jsonl, overwriting existing content.
 func WriteRoutes(beadsDir string, routes []Route) error {
-	operation := func() error { return writeRoutes(beadsDir, routes) }
+	return withRoutesOwnership(beadsDir, func() error { return writeRoutes(beadsDir, routes) })
+}
+
+func withRoutesOwnership(beadsDir string, operation func() error) error {
 	cleanDir := filepath.Clean(beadsDir)
 	if filepath.Base(cleanDir) != ".beads" {
 		return operation()

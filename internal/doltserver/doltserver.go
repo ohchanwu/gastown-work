@@ -191,6 +191,11 @@ var metadataMu sync.Map // map[string]*sync.Mutex
 // flock is inter-process and is not a reliable goroutine mutex on every OS.
 var doltLifecycleMu sync.Mutex
 
+type doltServerIncarnation struct {
+	PID               int
+	ProcessStartToken string
+}
+
 // getMetadataMu returns a mutex for the given metadata file path, creating one if needed.
 func getMetadataMu(path string) *sync.Mutex {
 	mu, _ := metadataMu.LoadOrStore(path, &sync.Mutex{})
@@ -2442,8 +2447,23 @@ func tryLockDoltLifecycle(townRoot string) (*flock.Flock, error) {
 	return lock, nil
 }
 
+func withDoltLifecycle(townRoot string, operation func() error) error {
+	doltLifecycleMu.Lock()
+	defer doltLifecycleMu.Unlock()
+	lifecycleLock, err := tryLockDoltLifecycle(townRoot)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lifecycleLock.Unlock() }()
+	return operation()
+}
+
 // Start starts the Dolt SQL server.
 func Start(townRoot string) error {
+	return start(townRoot, nil)
+}
+
+func start(townRoot string, started func(doltServerIncarnation)) error {
 	doltLifecycleMu.Lock()
 	defer doltLifecycleMu.Unlock()
 
@@ -2736,7 +2756,10 @@ func Start(townRoot string) error {
 		if len(databases) == 0 {
 			applyWaitTimeout(townRoot, config) // Best-effort; see gh-3623.
 			applyTimeZone(townRoot, config)    // Best-effort; see hq-57jr8.
-			return nil                         // Nothing to verify — fresh install or empty data dir
+			if started != nil {
+				started(doltServerIncarnation{PID: cmd.Process.Pid, ProcessStartToken: getProcessStartToken(cmd.Process.Pid)})
+			}
+			return nil // Nothing to verify — fresh install or empty data dir
 		}
 		_, missing, verifyErr := VerifyDatabases(townRoot)
 		if verifyErr != nil {
@@ -2746,7 +2769,10 @@ func Start(townRoot string) error {
 		if len(missing) == 0 {
 			applyWaitTimeout(townRoot, config) // Best-effort; see gh-3623.
 			applyTimeZone(townRoot, config)    // Best-effort; see hq-57jr8.
-			return nil                         // Server is up and serving every expected database
+			if started != nil {
+				started(doltServerIncarnation{PID: cmd.Process.Pid, ProcessStartToken: getProcessStartToken(cmd.Process.Pid)})
+			}
+			return nil // Server is up and serving every expected database
 		}
 		lastErr = fmt.Errorf("server is reachable but %d/%d databases not yet served (missing: %v)",
 			len(missing), len(databases), missing)
@@ -2849,6 +2875,28 @@ func Stop(townRoot string) error {
 	}
 	defer func() { _ = lifecycleLock.Unlock() }()
 	return stopLocked(townRoot)
+}
+
+func stopDoltIncarnation(townRoot string, incarnation doltServerIncarnation) error {
+	if incarnation.PID <= 0 {
+		return nil
+	}
+	return withDoltLifecycle(townRoot, func() error {
+		running, pid, err := IsRunning(townRoot)
+		if err != nil {
+			return fmt.Errorf("checking temporary Dolt server: %w", err)
+		}
+		if !running {
+			return nil
+		}
+		if pid != incarnation.PID {
+			return fmt.Errorf("temporary Dolt server changed from PID %d to PID %d", incarnation.PID, pid)
+		}
+		if incarnation.ProcessStartToken != "" && getProcessStartToken(pid) != incarnation.ProcessStartToken {
+			return fmt.Errorf("temporary Dolt server PID %d was reused", pid)
+		}
+		return stopLocked(townRoot)
+	})
 }
 
 // WithStoppedDoltForDatabaseMove excludes start/stop races and prevents a live
@@ -3411,73 +3459,78 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 		}
 	}
 
-	// Resolve the orphaned-server case before taking the ownership lock. Stop
-	// takes the lifecycle lock first, matching cleanup's lifecycle -> ownership
-	// order and avoiding a lock inversion.
-	running, runningPID, runningErr := IsRunning(townRoot)
-	if runningErr != nil {
-		return false, false, fmt.Errorf("checking Dolt server before rig initialization: %w", runningErr)
-	}
-	if running {
-		if _, err := os.Stat(config.DataDir); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Warning: Dolt server (PID %d) is running but data directory %s does not exist — stopping orphaned server\n", runningPID, config.DataDir)
-			if stopErr := Stop(townRoot); stopErr != nil {
-				return false, false, fmt.Errorf("stopping orphaned Dolt server: %w", stopErr)
+	err = withDoltLifecycle(townRoot, func() error {
+		running, runningPID, runningErr := IsRunning(townRoot)
+		if runningErr != nil {
+			return fmt.Errorf("checking Dolt server before rig initialization: %w", runningErr)
+		}
+		if running {
+			if _, statErr := os.Stat(config.DataDir); os.IsNotExist(statErr) {
+				fmt.Fprintf(os.Stderr, "Warning: Dolt server (PID %d) is running but data directory %s does not exist — stopping orphaned server\n", runningPID, config.DataDir)
+				if stopErr := stopLocked(townRoot); stopErr != nil {
+					return fmt.Errorf("stopping orphaned Dolt server: %w", stopErr)
+				}
+				running = false
 			}
 		}
-	}
+		serverWasRunning = running
 
-	err = WithDatabaseOwnershipTransaction(townRoot, func() error {
-		rigDir := filepath.Join(config.DataDir, rigName)
-		running, _, err = IsRunning(townRoot)
-		if err != nil {
-			return fmt.Errorf("checking Dolt server: %w", err)
-		}
-		if _, statErr := os.Stat(filepath.Join(rigDir, ".dolt")); statErr == nil {
-			created = false
-		} else if !os.IsNotExist(statErr) {
-			return fmt.Errorf("checking existing rig database: %w", statErr)
-		} else {
-			created = true
-			if running {
-				if err := serverExecSQL(townRoot, fmt.Sprintf("CREATE DATABASE `%s`", rigName)); err != nil {
-					return fmt.Errorf("creating database on running server: %w", err)
-				}
-				if err := waitForCatalog(townRoot, rigName); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: catalog visibility wait timed out (will retry on use): %v\n", err)
-				}
+		if err := WithDatabaseOwnershipTransaction(townRoot, func() error {
+			rigDir := filepath.Join(config.DataDir, rigName)
+			if _, statErr := os.Stat(filepath.Join(rigDir, ".dolt")); statErr == nil {
+				created = false
+			} else if !os.IsNotExist(statErr) {
+				return fmt.Errorf("checking existing rig database: %w", statErr)
 			} else {
-				if err := os.MkdirAll(rigDir, 0o755); err != nil {
-					return fmt.Errorf("creating rig directory: %w", err)
+				created = true
+				if serverWasRunning {
+					if err := serverExecSQL(townRoot, fmt.Sprintf("CREATE DATABASE `%s`", rigName)); err != nil {
+						return fmt.Errorf("creating database on running server: %w", err)
+					}
+					if err := waitForCatalog(townRoot, rigName); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: catalog visibility wait timed out (will retry on use): %v\n", err)
+					}
+				} else {
+					if err := os.MkdirAll(rigDir, 0o755); err != nil {
+						return fmt.Errorf("creating rig directory: %w", err)
+					}
+					cmd := exec.Command("dolt", "init")
+					cmd.Dir = rigDir
+					setProcessGroup(cmd)
+					output, err := cmd.CombinedOutput()
+					if err != nil {
+						return fmt.Errorf("initializing Dolt database: %w\n%s", err, output)
+					}
 				}
-				cmd := exec.Command("dolt", "init")
-				cmd.Dir = rigDir
-				setProcessGroup(cmd)
-				output, err := cmd.CombinedOutput()
-				if err != nil {
-					return fmt.Errorf("initializing Dolt database: %w\n%s", err, output)
-				}
+				InvalidateDBCache()
 			}
-			InvalidateDBCache()
-		}
 
-		beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
-		if err != nil {
-			return fmt.Errorf("resolving beads directory: %w", err)
+			beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
+			if err != nil {
+				return fmt.Errorf("resolving beads directory: %w", err)
+			}
+			if err := ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName); err != nil {
+				return fmt.Errorf("publishing database ownership: %w", err)
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
-		if err := ensureMetadataForBeadsDirLocked(townRoot, beadsDir, rigName); err != nil {
-			return fmt.Errorf("publishing database ownership: %w", err)
+		if serverWasRunning {
+			return EnsureRigIssuePrefix(townRoot, rigName, true)
 		}
 		return nil
 	})
 	if err != nil {
-		return running, created, err
+		return serverWasRunning, created, err
 	}
-	if err := EnsureRigIssuePrefix(townRoot, rigName, running); err != nil {
-		return running, created, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
+	if !serverWasRunning {
+		if err := EnsureRigIssuePrefix(townRoot, rigName, false); err != nil {
+			return serverWasRunning, created, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
+		}
 	}
 
-	return running, created, nil
+	return serverWasRunning, created, nil
 }
 
 // EnsureRigIssuePrefix initializes the beads schema for a rig database and
@@ -3513,11 +3566,12 @@ func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
 	defer cancel()
 
 	if !serverMode {
-		if err := Start(townRoot); err != nil {
+		var started doltServerIncarnation
+		if err := start(townRoot, func(incarnation doltServerIncarnation) { started = incarnation }); err != nil {
 			return fmt.Errorf("starting temporary Dolt server: %w", err)
 		}
 		defer func() {
-			if err := Stop(townRoot); err != nil {
+			if err := stopDoltIncarnation(townRoot, started); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: could not stop temporary Dolt server after issue_prefix seed: %v\n", err)
 			}
 		}()

@@ -914,8 +914,8 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 		fmt.Fprintf(os.Stderr, "  Warning: Could not create plugin directories: %v\n", err)
 	}
 
-	// Register in town config
-	m.config.Rigs[opts.Name] = config.RigEntry{
+	// Register in town config.
+	entry := config.RigEntry{
 		GitURL:      opts.GitURL,
 		PushURL:     opts.PushURL,
 		UpstreamURL: opts.UpstreamURL,
@@ -925,6 +925,7 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 			Prefix: opts.BeadsPrefix,
 		},
 	}
+	m.config.Rigs[opts.Name] = entry
 
 	// Post-init identity verification (gas-tc4): verify metadata.json points
 	// to the correct database. This catches identity mismatches caused by bd init
@@ -942,14 +943,20 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	// Without this, a failure after AddRig returns (but before the caller saves) would
 	// leave a directory that is not registered in rigs.json.
 	rigsPath := filepath.Join(m.townRoot, "mayor", "rigs.json")
-	if err := config.SaveRigsConfig(rigsPath, m.config); err != nil {
+	var savedConfig *config.RigsConfig
+	if err := config.UpdateRigsConfig(rigsPath, func(current *config.RigsConfig) error {
+		current.Rigs[opts.Name] = entry
+		savedConfig = current
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("registering rig in rigs.json: %w", err)
 	}
+	m.config = savedConfig
 
 	success = true
 	// Best-effort cleanup: once the add succeeds, the stamp is no longer needed.
 	_ = clearAddOwnershipStamp(rigPath)
-	return m.loadRig(opts.Name, m.config.Rigs[opts.Name])
+	return m.loadRig(opts.Name, entry)
 }
 
 // addOwnershipStampFile marks which AddRig invocation currently owns the path.

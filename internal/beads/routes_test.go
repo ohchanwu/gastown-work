@@ -1,8 +1,10 @@
 package beads
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +38,61 @@ func TestWriteRoutesWaitsForDatabaseOwnership(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("WriteRoutes after ownership release: %v", err)
+	}
+}
+
+func TestAppendRouteToDirSerializesReadModifyWrite(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := WriteRoutes(beadsDir, []Route{{Prefix: "hq-", Path: "."}}); err != nil {
+		t.Fatal(err)
+	}
+	ownershipLock := flock.New(filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "ownership.lock"))
+	if err := ownershipLock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 2)
+	go func() { done <- AppendRouteToDir(beadsDir, Route{Prefix: "aa-", Path: "a"}) }()
+	go func() { done <- AppendRouteToDir(beadsDir, Route{Prefix: "bb-", Path: "b"}) }()
+	waitForBlockedRouteWriters(t, 2)
+	if err := ownershipLock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	routes, err := LoadRoutes(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := make(map[string]bool, len(routes))
+	for _, route := range routes {
+		found[route.Prefix] = true
+	}
+	if !found["aa-"] || !found["bb-"] {
+		t.Fatalf("concurrent ownership update was lost: routes=%v", routes)
+	}
+}
+
+func waitForBlockedRouteWriters(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var stacks bytes.Buffer
+		if err := pprof.Lookup("goroutine").WriteTo(&stacks, 2); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(stacks.String(), "AppendRouteToDir") >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("route writers did not both reach the ownership fence")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

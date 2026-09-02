@@ -1071,8 +1071,11 @@ func runRigRemove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("removing rig: %w", err)
 	}
 
-	// Save updated config
-	if err := config.SaveRigsConfig(rigsPath, rigsConfig); err != nil {
+	// Delete only this rig from the latest registry snapshot.
+	if err := config.UpdateRigsConfig(rigsPath, func(current *config.RigsConfig) error {
+		delete(current.Rigs, name)
+		return nil
+	}); err != nil {
 		return fmt.Errorf("saving rigs config: %w", err)
 	}
 
@@ -1168,8 +1171,14 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("adopting rig: %w", err)
 	}
 
-	// Save updated config
-	if err := config.SaveRigsConfig(rigsPath, rigsConfig); err != nil {
+	entry, ok := rigsConfig.Rigs[name]
+	if !ok {
+		return fmt.Errorf("adopted rig %q missing from registry update", name)
+	}
+	if err := config.UpdateRigsConfig(rigsPath, func(current *config.RigsConfig) error {
+		current.Rigs[name] = entry
+		return nil
+	}); err != nil {
 		return fmt.Errorf("saving rigs config: %w", err)
 	}
 

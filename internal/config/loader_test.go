@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,67 @@ func TestSaveRigsConfigWaitsForDatabaseOwnership(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("SaveRigsConfig after ownership release: %v", err)
+	}
+}
+
+func TestUpdateRigsConfigSerializesReadModifyWrite(t *testing.T) {
+	townRoot := t.TempDir()
+	path := filepath.Join(townRoot, "mayor", "rigs.json")
+	if err := SaveRigsConfig(path, &RigsConfig{Version: CurrentRigsVersion, Rigs: map[string]RigEntry{}}); err != nil {
+		t.Fatal(err)
+	}
+	ownershipLock := flock.New(filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "ownership.lock"))
+	if err := ownershipLock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 2)
+	for _, name := range []string{"alpha", "bravo"} {
+		name := name
+		go func() {
+			done <- UpdateRigsConfig(path, func(current *RigsConfig) error {
+				current.Rigs[name] = RigEntry{LocalRepo: name}
+				return nil
+			})
+		}()
+	}
+	waitForBlockedRigsWriters(t, 2)
+	if err := ownershipLock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := LoadRigsConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Rigs["alpha"]; !ok {
+		t.Fatalf("alpha update was lost: rigs=%v", got.Rigs)
+	}
+	if _, ok := got.Rigs["bravo"]; !ok {
+		t.Fatalf("bravo update was lost: rigs=%v", got.Rigs)
+	}
+}
+
+func waitForBlockedRigsWriters(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var stacks bytes.Buffer
+		if err := pprof.Lookup("goroutine").WriteTo(&stacks, 2); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(stacks.String(), "UpdateRigsConfig") >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("rig writers did not both reach the ownership fence")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

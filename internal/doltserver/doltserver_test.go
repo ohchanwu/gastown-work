@@ -4496,6 +4496,34 @@ func TestInitRigWaitsForDatabaseOwnershipTransaction(t *testing.T) {
 	}
 }
 
+func TestInitRigFailsClosedWhileDoltLifecycleLockHeld(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte("#!/bin/sh\nmkdir -p .dolt\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	lockPath := doltLifecycleLockPath(townRoot)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lifecycleLock := flock.New(lockPath)
+	if err := lifecycleLock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lifecycleLock.Unlock() })
+
+	_, _, err := InitRig(townRoot, "newrig")
+	if err == nil || !strings.Contains(err.Error(), "start") {
+		t.Fatalf("InitRig() error = %v, want lifecycle-lock refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(RigDatabaseDir(townRoot, "newrig"), ".dolt")); !os.IsNotExist(err) {
+		t.Fatalf("InitRig() mutated database while lifecycle lock held: %v", err)
+	}
+}
+
 func holdDatabaseOwnership(t *testing.T, townRoot string) func() {
 	t.Helper()
 	acquired := make(chan struct{})

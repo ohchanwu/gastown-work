@@ -121,9 +121,33 @@ func LoadRigsConfig(path string) (*RigsConfig, error) {
 // rename is atomic on POSIX, so concurrent readers never observe a zero-byte
 // or partially-written rigs.json.
 func SaveRigsConfig(path string, config *RigsConfig) error {
-	operation := func() error {
-		return saveRigsConfig(path, config)
+	return withRigsConfigOwnership(path, func() error { return saveRigsConfig(path, config) })
+}
+
+// UpdateRigsConfig applies a read-modify-write transaction without allowing a
+// concurrent publisher to overwrite a newer registry snapshot.
+func UpdateRigsConfig(path string, update func(*RigsConfig) error) error {
+	if update == nil {
+		return fmt.Errorf("rigs config update is required")
 	}
+	return withRigsConfigOwnership(path, func() error {
+		current, err := LoadRigsConfig(path)
+		if errors.Is(err, ErrNotFound) {
+			current = &RigsConfig{Version: CurrentRigsVersion, Rigs: make(map[string]RigEntry)}
+		} else if err != nil {
+			return err
+		}
+		if current.Rigs == nil {
+			current.Rigs = make(map[string]RigEntry)
+		}
+		if err := update(current); err != nil {
+			return err
+		}
+		return saveRigsConfig(path, current)
+	})
+}
+
+func withRigsConfigOwnership(path string, operation func() error) error {
 	cleanPath := filepath.Clean(path)
 	if filepath.Base(cleanPath) != "rigs.json" || filepath.Base(filepath.Dir(cleanPath)) != "mayor" {
 		return operation()
