@@ -6013,7 +6013,7 @@ func removeDatabaseLocked(townRoot, dbName string, force bool, creationToken str
 		if receipt.Force && !force {
 			return fmt.Errorf("database %q has a pending forced cleanup — rerun with --force", dbName)
 		}
-		if creationToken != "" && receipt.CreationToken != creationToken {
+		if receipt.CreationToken != creationToken {
 			return fmt.Errorf("database %q no longer matches owning creation token", dbName)
 		}
 		running, _, runningErr := IsRunning(townRoot)

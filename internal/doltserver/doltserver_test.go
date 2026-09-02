@@ -5761,6 +5761,24 @@ func TestRemoveDatabaseIfCreationTokenPreservesWrongGeneration(t *testing.T) {
 	}
 }
 
+func TestRemoveDatabaseCannotResumeCreationOwnedCleanupWithoutToken(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	receipt := databaseCleanupReceipt{
+		Version: databaseCleanupReceiptVersion, Database: "testdb_remove", Force: true,
+		Phase: databaseCleanupPrepared, Incarnation: "dolt-root:0123456789abcdefghijklmnopqrstuv/manifest-sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+		CreationToken: "owned-generation",
+	}
+	if err := writeDatabaseCleanupReceipt(databaseCleanupReceiptPath(townRoot, "testdb_remove"), receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveDatabase(townRoot, "testdb_remove", true); err == nil || !strings.Contains(err.Error(), "creation token") {
+		t.Fatalf("generic cleanup resumed creation-owned receipt: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("generic cleanup mutated creation-owned database: %v", err)
+	}
+}
+
 func TestReleaseDatabaseCreationTokenIsGenerationBoundAndIdempotent(t *testing.T) {
 	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
 	token := "release-generation"
