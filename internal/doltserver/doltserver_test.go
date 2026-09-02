@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1831,6 +1832,351 @@ func TestMigrateRigFromBeadsFailsClosedWhileLifecycleLockHeld(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(sourcePath, ".dolt")); err != nil {
 		t.Fatalf("source mutated while lifecycle lock was held: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsResumesPreparedReceiptAfterRename(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "resume-rename"
+	sourcePath := filepath.Join(townRoot, rigName, ".beads", "dolt", "beads_resume")
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		Phase:        databaseMigrationPrepared,
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
+		t.Fatalf("resume migration: %v", err)
+	}
+	if _, err := os.Stat(databaseMigrationReceiptPath(townRoot, rigName)); !os.IsNotExist(err) {
+		t.Fatalf("migration receipt remains after resume: %v", err)
+	}
+	metadata, err := readExistingDoltDatabase(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"))
+	if err != nil || metadata != rigName {
+		t.Fatalf("published database = %q, err = %v", metadata, err)
+	}
+}
+
+func TestMigrateRigFromBeadsResumesStagedCopy(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "resume-copy"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	stagePath := filepath.Join(targetPath, databaseMigrationStageName)
+	setupDoltDB(t, targetPath, databaseMigrationStageName)
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    stagePath,
+		SourceDigest: digest,
+		Phase:        databaseMigrationStaged,
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
+		t.Fatalf("resume staged migration: %v", err)
+	}
+	if _, err := os.Stat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("source remains after verified copy: %v", err)
+	}
+	if got, err := databaseMigrationTreeDigest(targetPath); err != nil || got != digest {
+		t.Fatalf("target digest = %q, err = %v; want %q", got, err, digest)
+	}
+}
+
+func TestMigrateRigFromBeadsCrossFilesystemStagesBeforePromotion(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "cross-device"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousRename := databaseMigrationRename
+	databaseMigrationRename = func(_, _ string) error { return syscall.EXDEV }
+	t.Cleanup(func() { databaseMigrationRename = previousRename })
+
+	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
+		t.Fatalf("cross-filesystem migration: %v", err)
+	}
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	if got, err := databaseMigrationTreeDigest(targetPath); err != nil || got != digest {
+		t.Fatalf("target digest = %q, err = %v; want %q", got, err, digest)
+	}
+	if _, err := os.Stat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("verified source remains after migration: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsReplacesReceiptOwnedPartialCopy(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "resume-partial"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	stagePath := filepath.Join(targetPath, databaseMigrationStageName)
+	if err := os.MkdirAll(stagePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stagePath, "partial"), []byte("incomplete"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    stagePath,
+		SourceDigest: digest,
+		Phase:        databaseMigrationPrepared,
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
+		t.Fatalf("resume partial migration: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(targetPath, "partial")); !os.IsNotExist(err) {
+		t.Fatalf("partial copy survived recovery: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsRestartsPartialStagePromotion(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "resume-promotion"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	if err := os.WriteFile(filepath.Join(sourcePath, "root.txt"), []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	targetPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	stagePath := setupDoltDB(t, targetPath, databaseMigrationStageName)
+	if err := os.WriteFile(filepath.Join(stagePath, "root.txt"), []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(stagePath, "root.txt"), filepath.Join(targetPath, "root.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := databaseMigrationReceiptPath(townRoot, rigName)
+	if err := writeDatabaseMigrationReceipt(receiptPath, databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    stagePath,
+		SourceDigest: digest,
+		Phase:        databaseMigrationStaged,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
+		t.Fatalf("resume partial promotion: %v", err)
+	}
+	if got, err := databaseMigrationTreeDigest(targetPath); err != nil || got != digest {
+		t.Fatalf("target digest = %q, err = %v; want %q", got, err, digest)
+	}
+}
+
+func TestMigrateRigFromBeadsFinishesClaimedSourceCleanup(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "resume-cleanup"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	cleanupPath := sourcePath + ".migration-cleanup"
+	if err := os.MkdirAll(cleanupPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cleanupPath, "partial"), []byte("leftover"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	if err := os.MkdirAll(filepath.Join(townRoot, rigName, "mayor", "rig", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDatabaseMigrationReceipt(databaseMigrationReceiptPath(townRoot, rigName), databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  cleanupPath,
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		Phase:        databaseMigrationTargetReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateRigFromBeads(townRoot, rigName, sourcePath); err != nil {
+		t.Fatalf("resume source cleanup: %v", err)
+	}
+	if _, err := os.Stat(cleanupPath); !os.IsNotExist(err) {
+		t.Fatalf("claimed source remains after resume: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsRejectsReservedStageEntry(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "reserved-stage"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	if err := os.MkdirAll(filepath.Join(sourcePath, databaseMigrationStageName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if err == nil || !strings.Contains(err.Error(), "reserved migration stage") {
+		t.Fatalf("MigrateRigFromBeads() error = %v, want reserved-stage refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(sourcePath, ".dolt")); err != nil {
+		t.Fatalf("source mutated after reserved-stage refusal: %v", err)
+	}
+}
+
+func TestMigrateRigFromBeadsKeepsSourceWhenTargetDigestDiffers(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "digest-mismatch"
+	sourcePath := setupDoltDB(t, filepath.Join(townRoot, "legacy"), rigName)
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	if err := os.WriteFile(filepath.Join(targetPath, ".dolt", "noms", "manifest"), []byte("different"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := databaseMigrationTreeDigest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := databaseMigrationReceiptPath(townRoot, rigName)
+	if err := writeDatabaseMigrationReceipt(receiptPath, databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		Phase:        databaseMigrationTargetReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = MigrateRigFromBeads(townRoot, rigName, sourcePath)
+	if err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("MigrateRigFromBeads() error = %v, want digest mismatch", err)
+	}
+	if _, err := os.Stat(filepath.Join(sourcePath, ".dolt")); err != nil {
+		t.Fatalf("source was removed despite target mismatch: %v", err)
+	}
+	if _, err := os.Stat(receiptPath); err != nil {
+		t.Fatalf("receipt was removed despite target mismatch: %v", err)
+	}
+}
+
+func TestPendingMigrationReceiptIsDiscoverableAndProtectsTarget(t *testing.T) {
+	townRoot := t.TempDir()
+	rigName := "pending-rig"
+	sourcePath := filepath.Join(townRoot, "legacy", rigName)
+	targetPath := setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), rigName)
+	digest, err := databaseMigrationTreeDigest(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := databaseMigrationReceiptPath(townRoot, rigName)
+	if err := writeDatabaseMigrationReceipt(receiptPath, databaseMigrationReceipt{
+		Version:      databaseMigrationReceiptVersion,
+		RigName:      rigName,
+		SourcePath:   sourcePath,
+		CleanupPath:  sourcePath + ".migration-cleanup",
+		TargetPath:   targetPath,
+		StagePath:    filepath.Join(targetPath, databaseMigrationStageName),
+		SourceDigest: digest,
+		Phase:        databaseMigrationPrepared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("receipt mode = %v, want 0600", info.Mode().Perm())
+	}
+
+	migrations, err := FindMigratableDatabasesChecked(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) != 1 || migrations[0].RigName != rigName || migrations[0].SourcePath != sourcePath {
+		t.Fatalf("pending migrations = %+v", migrations)
+	}
+	referenced, err := collectReferencedDatabases(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !referenced[canonicalDatabaseName(rigName)] {
+		t.Fatalf("pending migration target %q is not protected", rigName)
+	}
+
+	if err := os.WriteFile(receiptPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collectReferencedDatabases(townRoot); err == nil {
+		t.Fatal("malformed pending migration receipt did not fail cleanup closed")
 	}
 }
 

@@ -1557,7 +1557,10 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Find databases to migrate
-	migrations := doltserver.FindMigratableDatabases(townRoot)
+	migrations, err := doltserver.FindMigratableDatabasesChecked(townRoot)
+	if err != nil {
+		return fmt.Errorf("finding databases to migrate: %w", err)
+	}
 	if len(migrations) == 0 {
 		fmt.Println("No databases found to migrate.")
 		return nil

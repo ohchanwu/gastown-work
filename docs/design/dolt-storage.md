@@ -48,6 +48,13 @@ transaction, stop a running server for the move, and restore it afterward.
 This lock order prevents cleanup, registry publication, and server startup from
 observing contradictory ownership or a partially moved database.
 
+Legacy database migrations persist a private receipt before moving data. A
+same-filesystem rename is verified against the recorded source digest; an
+`EXDEV` move copies into a non-loadable stage below the target and promotes
+`.dolt` last. Retries reconcile the receipt phase with source, stage, target,
+and metadata state. Cleanup treats valid pending receipts as ownership and
+fails closed on malformed receipts.
+
 ## Environment Variables
 
 gt and bd use separate env vars for Dolt connection. gt automatically
