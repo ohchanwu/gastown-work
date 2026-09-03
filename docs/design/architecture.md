@@ -489,11 +489,13 @@ truthful about custody.
 
 Global convoy checking and stranded detection use bounded worker pools, a
 per-run tracked-issue cache, deterministic output, and a 30-second command
-deadline. Shared snapshots batch issue and relationship lookup; cross-rig sling
-context scans deduplicate resolved databases and run with a fixed concurrency
-cap while preserving deterministic result order. Lookup uncertainty is isolated
-per convoy and fails closed: a convoy can close only after every tracked issue
-was checked and found complete.
+deadline. Shared snapshots batch issue and relationship lookup. Cross-rig sling
+context scans retain each resolved canonical database path through later
+operations, deduplicate those paths, and use a fixed concurrency cap. A fatal
+scan cancels sibling subprocess groups and waits for their cleanup before the
+original error returns; successful results retain deterministic target order.
+Lookup uncertainty is isolated per convoy and fails closed: a convoy can close
+only after every tracked issue was checked and found complete.
 Reconciliation remains dry-run-first and never treats age alone as proof of
 completion. Reaper anomaly occurrences are durably linked and deduplicated,
 while convoy issue types and `gt:convoy` tracking records remain protected from
