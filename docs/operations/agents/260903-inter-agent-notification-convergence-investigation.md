@@ -1,6 +1,6 @@
 # Inter-Agent Notification Convergence Phase 0 Investigation
 
-Status: In progress
+Status: Phase 0 complete; awaiting independent AUTO GATE
 
 Governing specification:
 `docs/superpowers/specs/260902-inter-agent-notification-convergence-and-alert-deduplication-repair-spec.md`
@@ -555,15 +555,152 @@ command results are retained in the ignored local Phase 0 archive.
 
 ## Redundancy risk classification
 
-Investigation pending.
+### Required defense in depth
+
+- Durable Beads state plus an ephemeral wake are distinct layers. Removing
+  either would recreate autonomous stalls or erase audit history.
+- Direct idle tmux delivery plus queued poller fallback protects distinct
+  receipt, busy-session, and unavailable-session failures.
+- `mail check` and the nudge poller are independent consumers. The hook exposes
+  durable unread mail at a real prompt boundary; the poller wakes an otherwise
+  idle agent that would never reach another boundary.
+- Typed-versus-submitted receipt validation, delivery leases, Nack retry,
+  stale-claim recovery, and generation custody each protect a demonstrated
+  loss or wrong-recipient race.
+- Candidate-alias fan-out for an absent ambiguous session protects routing
+  uncertainty. It must converge by durable source, not be reduced to an
+  arbitrary single alias.
+- Reaper fingerprint, family transition, occurrence, and send-once state are
+  required. They already implement the desired recurrence model.
+
+### Temporary compatibility
+
+- Existing queue JSON without a durable source key must remain readable and
+  wake-eligible. Suppressing an unidentifiable legacy record would risk loss.
+- Existing mail without notification-source or review-lineage metadata must
+  keep its current read, delivery, and thread behavior. No heuristic backfill
+  is safe.
+- Standalone manual nudges without a durable source remain intentionally
+  ephemeral. They are not automatically deduplicated.
+- Manual escalations without a fingerprint retain current create-new behavior.
+  The repair targets recurring machine producers that can supply a real key.
+
+### Accidental duplication
+
+- Router reminders for every non-reply message duplicate informational mail
+  and can enqueue more than one reminder for one unchanged thread.
+- Repeated automated `gt escalate` calls without `--fingerprint` create a new
+  incident, durable mail, wake, and reminder for each sample even when only a
+  latency value or diagnostics path changed.
+- A protocol that sends durable mail and then an unrelated manual nudge creates
+  two wake identities which cannot converge after source completion.
+- Best-effort ordinary queue removal leaves claimed records and hides removal
+  errors. The later claim can display an already terminal source.
+- Generic Witness verdict mail preserves history but lacks a durable lineage
+  key, so every superseded exact can remain independently wake-eligible.
+
+The executable receipt, queue, hook, and Reaper tests prove that eliminating
+these duplicate *wake identities* does not require eliminating their distinct
+delivery transports or durable records.
+
+### Unknown and therefore preserved
+
+- Witness's process-local message-ID deduplicator may still prevent a separate
+  within-session handler replay. It is not a substitute for durable lineage and
+  remains unchanged until a dedicated handler test proves otherwise.
+- Queued records without a source key, unsupported runtime-specific fallbacks,
+  and legacy messages without explicit protocol metadata remain eligible.
+- An active `.claimed` file remains owned by its consumer lease. External
+  thread cleanup must not delete it; the owner must self-heal after a durable
+  eligibility check.
+- UI notification value for ACP users is not removed. Only the false claim that
+  a UI update proves agent prompt acceptance is rejected.
 
 ## Minimal recommended change set
 
-Investigation pending.
+The smallest safe design keeps every current transport and introduces one
+source-eligibility boundary immediately after a consumer claims a queued wake
+and before it injects a prompt.
+
+1. Add optional `SourceID` and `SourceKind` fields to `nudge.QueuedNudge`.
+   Router-generated mail, escalation, and reminder wakes use one generated
+   source ID that is also stored as a validated `wake-source:<id>` label on the
+   durable message. Legacy or manual records leave the fields empty.
+2. Add a mail-package eligibility query which uses the source ID, thread, typed
+   labels, delivery/read/work state, and replies. A lookup failure returns
+   `unknown`, which retains and Nacks the claim; only positive terminal or
+   superseded proof may suppress it.
+3. Add an exact claim terminalization operation. A consumer holding the
+   delivery lease may remove its own claim after positive durable proof without
+   fabricating a submission receipt. `RemoveKindByThread` continues to ignore
+   claims so another process cannot steal active custody.
+4. Call the same eligibility query from the poller, idle watcher,
+   prompt-boundary queue injector, and ACP Propeller. Report ordinary queue
+   removal failures as partial convergence; the later claim then self-heals.
+5. Make ACP `notify` distinguish UI-only observation from accepted prompt
+   injection. A busy normal wake remains queued; only a successful
+   `InjectPrompt` can produce the local ACP submission receipt.
+6. Reuse `TypeTask` as the existing explicit response-required marker. Enqueue
+   at most one reminder per source and thread. Informational notifications do
+   not create reminders; exact reply or mail-work completion clears them.
+7. Keep generic manual escalation behavior, but require stable explicit
+   fingerprints in recurring Deacon, dog, and cross-rig producers. Reuse the
+   existing escalation lookup and Reaper material-transition model.
+8. Add minimal typed Witness review labels for lineage, generation, exact SHA,
+   and verdict. A verdict must be an exact reply to its request. Only the
+   highest unambiguous generation in one lineage is binding; conflicting
+   metadata fails open and reports the ambiguity. Historical verdicts remain
+   durable and queryable.
+9. Restore the process-global prefix registry in the nudge CLI test so the
+   unchanged focused suite becomes order-independent.
+
+The generic source key and eligibility query are the shared convergence point.
+Reminder, Witness, and escalation code supply typed identity; transport code
+does not interpret subjects or bodies.
+
+### Rejected alternatives
+
+- **Subject or body matching:** text is neither stable identity nor lifecycle
+  authority and would suppress unrelated work with similar wording.
+- **A global time-window deduplicator:** it can drop a real material transition
+  and loses state across restart.
+- **Caller-by-caller stale-wake filters:** sibling producers and the next retry
+  path would remain broken.
+- **Broad queue cleanup:** it violates source and thread custody and risks
+  deleting unrelated work.
+- **Removing mail-check, poller, alias fan-out, or direct delivery:** each is a
+  separately tested liveness defense.
+- **Treating ACP UI output as acceptance:** it repeats the current silent-loss
+  bug.
+- **A new daemon, database table, or transport:** existing Beads labels,
+  optional queue JSON, thread queries, receipts, and escalation fingerprints
+  can express every invariant except explicit review lineage; typed labels are
+  sufficient for that gap.
 
 ## Compatibility and rollback
 
-Investigation pending.
+This is a source-only, backward-compatible format extension with no database
+schema migration:
+
+- Go JSON readers ignore the new optional queue fields; new readers treat their
+  absence as `unknown` and preserve delivery.
+- Older binaries ignore the new Beads labels. New binaries do not infer typed
+  identity for older messages.
+- Unknown source kinds and malformed or conflicting review lineage fail open:
+  preserve the wake, return a diagnostic, and do not mark it accepted.
+- Existing standalone nudges and manual unfingerprinted escalations retain
+  their current semantics.
+- Exact terminal claim removal requires a held lease plus a source-ID match;
+  it cannot delete an unrelated record.
+- No existing mail, verdict, escalation, receipt, or queue record is rewritten
+  or migrated during installation.
+
+Rollback is a source revert plus restoration of the prior installed binary.
+Durable messages, verdicts, escalation history, and existing queue records stay
+intact. The prior binary ignores the optional queue fields and added labels. A
+rollback fixture must create mixed old/new queue records, restore the prior
+binary, and prove both remain readable and actionable. No live cleanup or data
+migration is part of rollback.
 
 ## Unproven assumptions
 
@@ -585,7 +722,117 @@ Investigation pending.
 
 ## Evidence-backed implementation-plan revision
 
-Investigation pending.
+The post-gate implementation plan should replace its placeholder source phases
+with the following exact dependency order. Every task begins RED, makes the
+smallest GREEN change, runs normal and race tests, checks listener/queue
+residue, and commits locally without pushing.
+
+### Source Task A — repair the baseline harness
+
+- **Files/functions:** `internal/cmd/nudge_test.go`,
+  `TestNudgeValidModesAccepted`, `setupNudgeTestRegistry`.
+- **RED:** run the minimized two-test shuffle reproduction from this report.
+- **GREEN:** save and restore `session.DefaultRegistry` around the nudge test;
+  do not change production registry initialization.
+- **Verify:** the minimized command, the full focused cmd regex normally and
+  under race, and no new Dolt listener.
+- **Commit:** `test: isolate nudge prefix registry`.
+
+### Source Task B — bind queued wakes to durable source eligibility
+
+- **Files/functions:** `internal/nudge/queue.go`, queue tests;
+  `internal/mail/types.go`, `router.go`, `delivery.go`, and tests;
+  `internal/cmd/nudge.go`, `nudge_poller.go`, `mail_check.go`, and tests;
+  `internal/acp/propulsion.go` and tests.
+- **Interface:** optional queue source ID/kind, durable `wake-source` label,
+  tri-state eligibility (`eligible`, `terminal`, `unknown`), and exact
+  owner-held claim terminalization.
+- **RED:** add
+  `TestQueuedWakeTerminalSourceIsNotInjected`,
+  `TestQueuedWakeEligibilityFailureRemainsRetryable`,
+  `TestClaimedWakeSelfHealsAfterThreadRemovalRace`, and
+  `TestMailCheckReportsPartialQueueConvergence`.
+- **GREEN:** stamp router wakes, query Beads before injection, retain on unknown,
+  and terminalize only the exact owned claim on positive proof.
+- **Verify:** focused mail/nudge/delivery/cmd/ACP normal and race suites; mixed
+  legacy/new queue records; exact unrelated-source preservation.
+- **Residue:** fixture queues empty only for terminal sources; no listener or
+  live-state delta.
+- **Commit:** `fix: converge queued wakes with durable sources`.
+
+### Source Task C — preserve busy ACP wake liveness
+
+- **Files/functions:** `internal/acp/propulsion.go`, `notify`,
+  `deliverNudges`, and `propulsion_test.go`.
+- **RED:** `TestPropellerBusyNormalNudgeRemainsQueued` must show that the current
+  UI-only path deletes the claim.
+- **GREEN:** return explicit prompt-acceptance state; Nack a busy normal claim
+  until a safe boundary; keep urgent behavior and UI notification intact.
+- **Verify:** ACP normal/race package plus idle, busy, absent, lease-contention,
+  and failed-injector cases.
+- **Residue:** private queue and proxy streams closed; no live ACP target.
+- **Commit:** `fix: retain busy ACP notifications until acceptance`.
+
+### Source Task D — make reply reminders explicit and exact
+
+- **Files/functions:** `internal/mail/router.go`,
+  `enqueueReplyReminder`, `ClearReplyReminders`, mail-work completion, and
+  router/work-store tests.
+- **RED:** add tests proving informational mail creates zero reminders, twenty
+  retries of one task create one reminder, terminal action clears it, and
+  unrelated thread/kind records survive.
+- **GREEN:** treat only `TypeTask` as response-required, enqueue uniquely by
+  source and thread, and reuse exact clearing plus Task B eligibility.
+- **Verify:** mail/nudge/cmd normal and race suites and the reminder lifecycle
+  fixture.
+- **Residue:** one due reminder before action, zero after action, unrelated
+  record unchanged.
+- **Commit:** `fix: bound reply reminders to actionable mail`.
+
+### Source Task E — converge recurring automated escalations
+
+- **Files/functions:** `internal/cmd/escalate_impl.go`, `dog.go`,
+  `capacity_dispatch.go`, escalation tests, and recurring Deacon/dog formula
+  call sites under `internal/formula/formulas/`.
+- **RED:** add one fixture with twenty identical observations, one severity or
+  scope transition, closure, and recurrence. Assert one initial wake, one
+  transition wake, and one recurrence wake.
+- **GREEN:** keep `runEscalate` fingerprint convergence; make each recurring
+  machine producer supply a stable family-and-scope key. Sampling time,
+  measurement, and diagnostics path stay outside the key.
+- **Verify:** escalation/Reaper/formula/cmd normal and race tests plus embedded
+  formula validation.
+- **Residue:** one open fixture incident and no duplicate mail; fixture removed.
+- **Commit:** `fix: fingerprint recurring agent escalations`.
+
+### Source Task F — model Witness binding verdict lineage
+
+- **Files/functions:** `internal/mail/types.go`, label validation and parsing in
+  `router.go` and `types.go`, `internal/cmd/mail_send.go`, Witness review
+  protocol handlers/templates, and focused tests.
+- **Interface:** validated review lineage, positive generation, exact 40-hex
+  SHA, verdict enum, and exact `ReplyTo` request binding. No text heuristics.
+- **RED:** add a rapid five-generation lineage fixture with five durable
+  verdicts and only generation five wake-eligible; add malformed, conflicting,
+  and out-of-order cases that fail open.
+- **GREEN:** persist typed labels, inherit them only through an exact reply, and
+  let Task B's eligibility query select the highest unambiguous generation.
+- **Verify:** mail/Witness/cmd normal and race suites and the five-SHA fixture.
+- **Residue:** five queryable verdicts, one eligible wake, no live mail changes.
+- **Commit:** `fix: converge Witness verdict wake lineage`.
+
+### Integration and installed acceptance
+
+- Update `docs/architecture.md`, the maintained mail protocol, formula embeds,
+  and the town-level mirrored specification only after behavior is green.
+- Run format, vet, build, focused normal/race, full suite, Gitleaks, mixed-version
+  rollback, and listener/queue residue checks.
+- Obtain an independent exact-SHA source verdict, install only the approved
+  binary into a disposable fixture, and exercise every transport/session row,
+  twenty identical incidents, one material transition, five-SHA lineage,
+  reminder lifecycle, and queue-removal self-heal.
+- Restore the prior installed artifact after the disposable gate. Never mutate
+  live Mayor, Witness, Deacon, dog, polecat, mail, escalation, or queue state.
 
 ## Reproduction commands
 
