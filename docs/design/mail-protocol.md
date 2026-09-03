@@ -399,14 +399,19 @@ message?" If yes -> mail. If no -> nudge.
 
 ### Role-Specific Guidance
 
-| Role | Mail Budget | When to Mail | When to Nudge |
-|------|-------------|-------------|---------------|
-| **Polecat** | 0-1 per session | HELP/ESCALATE only (gt escalate preferred) | Everything else |
-| **Witness** | Protocol msgs only | MERGE_READY, RECOVERED_BEAD, RECOVERY_NEEDED, escalations to Mayor | Polecat health checks, status pings, nudge-and-observe |
-| **Refinery** | Protocol msgs only | MERGED, MERGE_FAILED, REWORK_REQUEST | Status updates to Witness |
-| **Deacon** | Escalations only | Escalations to Mayor, HANDOFF to self | TIMER callbacks, HEALTH_CHECK, lifecycle pokes |
-| **Dogs** | Zero | Never (results go to event beads or logs) | Report completion to Deacon via nudge |
-| **Mayor** | Strategic only | Cross-rig coordination, HANDOFF to self | Instructions to Deacon/Witness |
+- **Polecat:** Budget 0-1 mails per session. Mail only HELP or ESCALATE
+  (`gt escalate` preferred); nudge everything else.
+- **Witness:** Mail only protocol messages such as MERGE_READY, RECOVERED_BEAD,
+  RECOVERY_NEEDED, and Mayor escalations. Nudge health checks, status requests,
+  and nudge-and-observe work.
+- **Refinery:** Mail MERGED, MERGE_FAILED, and REWORK_REQUEST. Nudge routine
+  Witness status updates.
+- **Deacon:** Mail escalations to Mayor and exceptional self-handoffs. Nudge
+  TIMER callbacks, HEALTH_CHECK, and lifecycle pokes.
+- **Dogs:** Send no routine mail. Record results in event beads or logs and
+  nudge completion to Deacon.
+- **Mayor:** Reserve mail for strategic cross-rig coordination and exceptional
+  self-handoffs. Nudge routine instructions to Deacon or Witness.
 
 ### Why This Matters (The Commit Graph)
 
@@ -432,6 +437,65 @@ the next session discovers state from beads, not from mail.
 **Health check responses via mail** -- When Deacon sends a health check nudge, do
 NOT respond with mail. The Deacon tracks health via session status, not mail
 responses.
+
+## Durable Wake Convergence
+
+Mail storage and runtime wake delivery are separate operations. Every
+router-produced wake is bound to the durable message by a validated
+`wake-source:<id>` label plus the same source ID, `mail` source kind, and thread
+ID in the queued nudge. `gt mail send --json` exposes the exact stored message
+and wake-source IDs; a protocol fallback uses `gt nudge --source-mail` so it
+shares that identity instead of creating independent authority.
+
+Consumers claim one queued wake, then re-read its source before injection.
+Closed, replied-to, read, acknowledged, or superseded sources terminalize only
+that exact claim. Missing, malformed, contradictory, or unreadable source state
+is NACKed and remains retryable. Source-free legacy and standalone nudges remain
+eligible for compatibility. Queue uniqueness is exact by recipient, kind,
+thread, and source.
+
+For ACP agents, rendering a notification in the UI is not acceptance. A busy
+agent leaves the claim retryable for the next safe prompt boundary; only a
+matching runtime receipt acknowledges and removes it.
+
+## Response-Required Mail
+
+Only `msg-type:task` mail produces a reply reminder. Repeated and concurrent
+enqueue attempts converge on one reminder for the same thread and source.
+Reply, acknowledgement, close, completion, or supersession clears that exact
+reminder without touching unrelated queued work.
+
+## Recurring Escalations
+
+Machine-produced recurring incidents supply a stable fingerprint and explicit
+scope. The canonical open escalation stores a material-state hash of severity
+and normalized scope, a positive material generation, and the recipients still
+pending durable delivery. The initial create or a compare-and-set transition
+persists the generation and recipient set before any mail attempt.
+
+Each generation and recipient maps to a deterministic message ID. Retries after
+a crash or concurrent observation therefore reuse the existing durable record,
+then clear that recipient only after persistence succeeds. Identical samples
+update observation evidence without a new wake. Severity or scope transitions
+create one new generation and wake; recurrence after close creates a new
+incident.
+
+## Typed Exact-SHA Review Lineage
+
+Formal review requests and verdicts are permanent mail with four typed labels:
+
+- `review-lineage:<stable-id>`
+- `review-generation:<positive-integer>`
+- `review-exact:<lowercase-40-hex-sha>`
+- `review-verdict:approved|changes-required` on verdict replies only
+
+A request is a non-reply task. A verdict must be a reply to that exact stored
+request and inherits lineage, generation, and SHA only through `--reply-to`.
+Subject and body text never grant authority. Generations may use different mail
+threads; lineage lookup retains every request and verdict while only the newest
+unambiguous verdict is wake-eligible. An older verdict becomes terminal as soon
+as a newer request exists. Duplicate, malformed, mismatched, out-of-order, or
+changed-between-read authority fails open and remains retryable.
 
 ## Implementation
 

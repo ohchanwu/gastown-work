@@ -285,6 +285,20 @@ for submission instead of inferring behavior from a session name. In
 particular, text left in an interactive prompt composer is not a successful
 Codex submission without the matching runtime receipt.
 
+Queued mail wakes carry the durable message's validated source ID, source kind,
+and thread ID. Every consumer checks that source after acquiring its queue claim
+and before prompt injection. Positive terminal proof discards only the exact
+claim; unknown state is NACKed for retry. This same boundary suppresses
+superseded typed Witness verdicts without deleting their audit records.
+
+Reply reminders are derived only from task mail and are unique by kind, thread,
+and source. Recurring automated escalations converge through a stable
+fingerprint, normalized material state, compare-and-set generation, and a
+persisted pending-recipient set; deterministic per-recipient message identity
+makes crash recovery idempotent. Formal review authority is encoded in
+permanent lineage, generation, exact-SHA, verdict, and ReplyTo labels rather than
+subject or body text.
+
 ### Actionable mail as secondary work
 
 A newly sent permanent direct or queue message with `msg-type:task` is one

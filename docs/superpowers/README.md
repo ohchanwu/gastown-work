@@ -1,6 +1,8 @@
 # Agentic implementation knowledge
 
-Active work: none.
+Active work:
+
+- [Inter-agent notification convergence and alert deduplication repair](specs/260902-inter-agent-notification-convergence-and-alert-deduplication-repair-spec.md)
 
 Completed work:
 
