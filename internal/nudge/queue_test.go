@@ -104,6 +104,50 @@ func TestEnqueueUniqueBySourceConcurrent(t *testing.T) {
 	}
 }
 
+func TestEnqueueUniqueBySourceUpgradesExpiringMatch(t *testing.T) {
+	const sessionID = "gt-test-durable-source"
+	for _, claimed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "queued", true: "claimed"}[claimed], func(t *testing.T) {
+			townRoot := t.TempDir()
+			expiring := QueuedNudge{
+				DeliveryID: "ndg-expiring", Sender: "mayor", Message: "read the mail",
+				Priority: PriorityNormal, Kind: "mail", ThreadID: "thread-actionable",
+				SourceID: "msg-0123456789abcdef", SourceKind: SourceKindMail,
+			}
+			if err := Enqueue(townRoot, sessionID, expiring); err != nil {
+				t.Fatal(err)
+			}
+			var claim *ClaimedNudge
+			if claimed {
+				var err error
+				claim, err = ClaimDue(townRoot, sessionID)
+				if err != nil || claim == nil {
+					t.Fatalf("ClaimDue = %#v, %v", claim, err)
+				}
+			}
+
+			durable := expiring
+			durable.DurableUntilAck = true
+			added, err := EnqueueUniqueBySource(townRoot, sessionID, durable)
+			if err != nil || added {
+				t.Fatalf("EnqueueUniqueBySource = %t, %v; want upgraded existing record", added, err)
+			}
+			if claim != nil {
+				if err := claim.Nack("retry", time.Now()); err != nil {
+					t.Fatalf("Nack upgraded claim: %v", err)
+				}
+			}
+			queued, err := ListQueued(townRoot, sessionID)
+			if err != nil || len(queued) != 1 {
+				t.Fatalf("ListQueued = %#v, %v", queued, err)
+			}
+			if !queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero() {
+				t.Fatalf("matching record remained expiring: %#v", queued[0])
+			}
+		})
+	}
+}
+
 func TestQueuedNudgeSourceJSONCompatibility(t *testing.T) {
 	var legacy QueuedNudge
 	if err := json.Unmarshal([]byte(`{"sender":"mayor","message":"legacy","priority":"normal"}`), &legacy); err != nil {

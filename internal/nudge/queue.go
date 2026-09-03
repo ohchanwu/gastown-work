@@ -96,6 +96,21 @@ type ClaimedNudge struct {
 	claimPath string
 }
 
+func lockQueueDir(dir string) (func(), error) {
+	lockDir := filepath.Join(filepath.Dir(dir), ".locks")
+	if err := os.MkdirAll(lockDir, 0700); err != nil {
+		return nil, fmt.Errorf("creating nudge queue lock dir: %w", err)
+	}
+	if err := os.Chmod(lockDir, 0700); err != nil {
+		return nil, fmt.Errorf("securing nudge queue lock dir: %w", err)
+	}
+	queueLock := flock.New(filepath.Join(lockDir, filepath.Base(dir)+".lock"))
+	if err := queueLock.Lock(); err != nil {
+		return nil, fmt.Errorf("locking nudge queue: %w", err)
+	}
+	return func() { _ = queueLock.Unlock() }, nil
+}
+
 // AckSubmitted removes a claim only when the receipt matches its owner and was
 // produced after the claim baseline.
 func (c *ClaimedNudge) AckSubmitted(receipt SubmissionReceipt) error {
@@ -111,11 +126,33 @@ func (c *ClaimedNudge) AckSubmitted(receipt SubmissionReceipt) error {
 	if !receipt.SubmittedAt.After(c.Nudge.ClaimedAt) {
 		return fmt.Errorf("submission receipt is not newer than claim")
 	}
+	unlock, err := lockQueueDir(filepath.Dir(c.claimPath))
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return os.Remove(c.claimPath)
 }
 
 // Nack records a sanitized failure and returns the delivery to its FIFO slot.
 func (c *ClaimedNudge) Nack(errorCode string, nextAttempt time.Time) error {
+	unlock, err := lockQueueDir(filepath.Dir(c.claimPath))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	data, err := readQueueRecord(c.claimPath)
+	if err != nil {
+		return errors.New("reading claimed nudge before retry failed")
+	}
+	var stored QueuedNudge
+	if err := json.Unmarshal(data, &stored); err != nil || stored.DeliveryID != c.Nudge.DeliveryID {
+		return errors.New("claimed nudge changed before retry")
+	}
+	if stored.DurableUntilAck {
+		c.Nudge.DurableUntilAck = true
+		c.Nudge.ExpiresAt = time.Time{}
+	}
 	c.Nudge.ClaimedAt = time.Time{}
 	c.Nudge.NextAttempt = nextAttempt
 	c.Nudge.LastErrorCode = sanitizeErrorCode(errorCode)
@@ -129,6 +166,11 @@ func (c *ClaimedNudge) Nack(errorCode string, nextAttempt time.Time) error {
 // thread cleanup deliberately ignores claims so a concurrent owner cannot be
 // raced into data loss.
 func (c *ClaimedNudge) DiscardTerminal() error {
+	unlock, err := lockQueueDir(filepath.Dir(c.claimPath))
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return os.Remove(c.claimPath)
 }
 
@@ -297,18 +339,26 @@ func EnqueueUniqueBySource(townRoot, session string, n QueuedNudge) (bool, error
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return false, fmt.Errorf("creating nudge queue dir: %w", err)
 	}
-	queueLock := flock.New(filepath.Join(dir, ".enqueue.lock"))
-	if err := queueLock.Lock(); err != nil {
-		return false, fmt.Errorf("locking nudge queue: %w", err)
-	}
-	defer func() { _ = queueLock.Unlock() }()
-
-	queued, err := ListQueued(townRoot, session)
+	unlock, err := lockQueueDir(dir)
 	if err != nil {
 		return false, err
 	}
-	for _, existing := range queued {
+	defer unlock()
+
+	records, err := listQueuedRecords(dir)
+	if err != nil {
+		return false, err
+	}
+	for _, record := range records {
+		existing := record.nudge
 		if existing.Kind == n.Kind && existing.ThreadID == n.ThreadID && existing.SourceID == n.SourceID {
+			if n.DurableUntilAck && (!existing.DurableUntilAck || !existing.ExpiresAt.IsZero()) {
+				existing.DurableUntilAck = true
+				existing.ExpiresAt = time.Time{}
+				if err := writeQueueRecord(record.path, existing); err != nil {
+					return false, fmt.Errorf("upgrading matching nudge durability: %w", err)
+				}
+			}
 			return false, nil
 		}
 	}
@@ -345,7 +395,7 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 func ClaimDue(townRoot, session string) (*ClaimedNudge, error) {
 	dir := queueDir(townRoot, session)
 
-	entries, err := os.ReadDir(dir)
+	_, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -354,6 +404,15 @@ func ClaimDue(townRoot, session string) (*ClaimedNudge, error) {
 	}
 	if err := os.Chmod(dir, 0700); err != nil {
 		return nil, fmt.Errorf("securing nudge queue: %w", err)
+	}
+	unlock, err := lockQueueDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("reading nudge queue: %w", err)
 	}
 
 	// Requeue orphaned .claimed files from crashed drainers.
@@ -544,9 +603,12 @@ func HasQueuedOrClaimed(townRoot, session string) (bool, error) {
 	return false, nil
 }
 
-// ListQueued returns a read-only snapshot of queued and in-flight deliveries.
-func ListQueued(townRoot, session string) ([]QueuedNudge, error) {
-	dir := queueDir(townRoot, session)
+type queuedRecord struct {
+	path  string
+	nudge QueuedNudge
+}
+
+func listQueuedRecords(dir string) ([]queuedRecord, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -556,12 +618,13 @@ func ListQueued(townRoot, session string) ([]QueuedNudge, error) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
-	queued := make([]QueuedNudge, 0, len(entries))
+	records := make([]queuedRecord, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".json") && !strings.Contains(entry.Name(), ".json.claimed.")) {
 			continue
 		}
-		data, err := readQueueRecord(filepath.Join(dir, entry.Name()))
+		path := filepath.Join(dir, entry.Name())
+		data, err := readQueueRecord(path)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -572,7 +635,20 @@ func ListQueued(townRoot, session string) ([]QueuedNudge, error) {
 		if err := json.Unmarshal(data, &n); err != nil {
 			return nil, errors.New("malformed nudge queue record preserved")
 		}
-		queued = append(queued, n)
+		records = append(records, queuedRecord{path: path, nudge: n})
+	}
+	return records, nil
+}
+
+// ListQueued returns a read-only snapshot of queued and in-flight deliveries.
+func ListQueued(townRoot, session string) ([]QueuedNudge, error) {
+	records, err := listQueuedRecords(queueDir(townRoot, session))
+	if err != nil {
+		return nil, err
+	}
+	queued := make([]QueuedNudge, 0, len(records))
+	for _, record := range records {
+		queued = append(queued, record.nudge)
 	}
 	return queued, nil
 }
