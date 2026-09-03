@@ -1,6 +1,8 @@
 package mail
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -367,6 +369,197 @@ func TestQueuedWakeActiveSourceAndReadReminderStayEligible(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReviewVerdictLineageOnlyNewestGenerationIsWakeEligible(t *testing.T) {
+	lineage := reviewVerdictLineageFixture()
+	for generation := 1; generation <= 5; generation++ {
+		source := lineage[generation*2-1]
+		got, err := classifyReviewVerdictWake(source, lineage)
+		want := WakeTerminal
+		if generation == 5 {
+			want = WakeEligible
+		}
+		if err != nil || got != want {
+			t.Fatalf("generation %d eligibility = %q, %v; want %q", generation, got, err, want)
+		}
+	}
+}
+
+func TestCheckWakeEligibilitySuppressesSupersededReviewVerdict(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+	const (
+		lineage  = "notification-convergence"
+		sourceID = "msg-0123456789abcdef"
+	)
+	all := reviewVerdictLineageFixture()[:4]
+	all[1].WakeSourceID = sourceID
+	all[1].Labels = buildMessageLabels(all[1], true)
+	for _, message := range all {
+		if len(message.Labels) == 0 {
+			message.Labels = buildMessageLabels(message, true)
+		}
+	}
+	toBeads := func(messages []*Message) []BeadsMessage {
+		result := make([]BeadsMessage, 0, len(messages))
+		for _, message := range messages {
+			result = append(result, BeadsMessage{
+				ID: message.ID, Title: message.Subject, Assignee: message.To, Priority: 2,
+				Status: "open", CreatedAt: time.Now(), Labels: message.Labels,
+			})
+		}
+		return result
+	}
+	sourceJSON, err := json.Marshal(toBeads(all[:2]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineageJSON, err := json.Marshal(toBeads(all))
+	if err != nil {
+		t.Fatal(err)
+	}
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"dolt_database":"maildb"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fixtureDir := t.TempDir()
+	sourcePath := filepath.Join(fixtureDir, "source.json")
+	lineagePath := filepath.Join(fixtureDir, "lineage.json")
+	if err := os.WriteFile(sourcePath, sourceJSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lineagePath, lineageJSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "review-lineage:` + lineage + `" ]; then
+    cat "$REVIEW_LINEAGE_JSON"
+    exit 0
+  fi
+done
+cat "$REVIEW_SOURCE_JSON"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("REVIEW_SOURCE_JSON", sourcePath)
+	t.Setenv("REVIEW_LINEAGE_JSON", lineagePath)
+
+	got, err := CheckWakeEligibility(townRoot, nudge.QueuedNudge{
+		Kind: "mail", ThreadID: all[1].ThreadID, SourceID: sourceID, SourceKind: nudge.SourceKindMail,
+	})
+	if err != nil || got != WakeTerminal {
+		t.Fatalf("CheckWakeEligibility = %q, %v; want superseded verdict terminal", got, err)
+	}
+}
+
+func TestReviewVerdictLineageAmbiguityFailsOpen(t *testing.T) {
+	base := reviewVerdictLineageFixture()
+	cases := map[string]func([]*Message) []*Message{
+		"conflicting verdict": func(messages []*Message) []*Message {
+			duplicate := *messages[len(messages)-1]
+			duplicate.ID = "hq-verdict-conflict"
+			duplicate.Review = cloneReviewMetadata(duplicate.Review)
+			duplicate.Review.Verdict = ReviewChangesRequired
+			return append(messages, &duplicate)
+		},
+		"out of order generation": func(messages []*Message) []*Message {
+			messages[3].Review.Generation++
+			return messages
+		},
+		"non reply verdict": func(messages []*Message) []*Message {
+			messages[len(messages)-1].Type = TypeNotification
+			return messages
+		},
+		"wrong SHA": func(messages []*Message) []*Message {
+			messages[len(messages)-1].Review.ExactSHA = "fedcba9876543210fedcba9876543210fedcba98"
+			return messages
+		},
+		"malformed generation": func(messages []*Message) []*Message {
+			messages[len(messages)-1].Review.Generation = 0
+			return messages
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			messages := cloneReviewLineage(base)
+			messages = mutate(messages)
+			got, err := classifyReviewVerdictWake(messages[len(messages)-1], messages)
+			if err == nil || got != WakeUnknown {
+				t.Fatalf("classifyReviewVerdictWake = %q, %v; want unknown error", got, err)
+			}
+		})
+	}
+}
+
+func TestNewerPendingReviewRequestSupersedesOlderVerdict(t *testing.T) {
+	messages := reviewVerdictLineageFixture()[:4]
+	source := messages[1]
+	messages = messages[:3]
+	got, err := classifyReviewVerdictWake(source, messages)
+	if err != nil || got != WakeTerminal {
+		t.Fatalf("classifyReviewVerdictWake = %q, %v; want older verdict terminal", got, err)
+	}
+}
+
+func TestReviewVerdictSourceMustMatchLineageRecord(t *testing.T) {
+	messages := reviewVerdictLineageFixture()
+	source := *messages[len(messages)-1]
+	source.Review = cloneReviewMetadata(source.Review)
+	source.Review.Generation--
+	got, err := classifyReviewVerdictWake(&source, messages)
+	if err == nil || got != WakeUnknown {
+		t.Fatalf("classifyReviewVerdictWake = %q, %v; want changed source unknown", got, err)
+	}
+}
+
+func reviewVerdictLineageFixture() []*Message {
+	const lineage = "notification-convergence"
+	messages := make([]*Message, 0, 10)
+	for generation := 1; generation <= 5; generation++ {
+		exactSHA := fmt.Sprintf("%040x", generation)
+		request := &Message{
+			ID: fmt.Sprintf("hq-request-%d", generation), From: "mayor/", To: "gastown/witness",
+			Subject: "review request", Type: TypeTask, ThreadID: fmt.Sprintf("thread-review-%d", generation),
+			Review: &ReviewMetadata{Lineage: lineage, Generation: generation, ExactSHA: exactSHA},
+		}
+		verdict := &Message{
+			ID: fmt.Sprintf("hq-verdict-%d", generation), From: "gastown/witness", To: "mayor/",
+			Subject: "review verdict", Type: TypeReply, ThreadID: request.ThreadID, ReplyTo: request.ID,
+			Review: &ReviewMetadata{
+				Lineage: lineage, Generation: generation, ExactSHA: exactSHA, Verdict: ReviewApproved,
+			},
+		}
+		messages = append(messages, request, verdict)
+	}
+	return messages
+}
+
+func cloneReviewLineage(messages []*Message) []*Message {
+	cloned := make([]*Message, len(messages))
+	for i, message := range messages {
+		copy := *message
+		copy.Review = cloneReviewMetadata(message.Review)
+		cloned[i] = &copy
+	}
+	return cloned
+}
+
+func cloneReviewMetadata(review *ReviewMetadata) *ReviewMetadata {
+	if review == nil {
+		return nil
+	}
+	copy := *review
+	return &copy
 }
 
 func TestQueuedWakeEligibilityFailureRemainsRetryable(t *testing.T) {

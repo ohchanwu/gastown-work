@@ -149,6 +149,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		msg.SuppressNotify = true
 	}
 
+	var replyTarget *mail.Message
 	// Handle reply-to: auto-set type to reply and look up thread
 	if mailReplyTo != "" {
 		msg.ReplyTo = mailReplyTo
@@ -162,15 +163,25 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		router := mail.NewRouter(workDir)
 		mailbox, err := router.GetMailbox(from)
 		if err != nil {
+			if mailReviewVerdict != "" {
+				return fmt.Errorf("opening mailbox for exact review reply: %w", err)
+			}
 			style.PrintWarning("could not open mailbox for thread lookup: %v", err)
 		} else {
 			original, err := mailbox.Get(mailReplyTo)
 			if err != nil {
+				if mailReviewVerdict != "" {
+					return fmt.Errorf("finding exact review request %s: %w", mailReplyTo, err)
+				}
 				style.PrintWarning("could not find original message %s for threading (new thread will be created)", mailReplyTo)
 			} else {
 				msg.ThreadID = original.ThreadID
+				replyTarget = original
 			}
 		}
+	}
+	if err := bindReviewMetadata(msg, replyTarget, mailReviewLineage, mailReviewGeneration, mailReviewExact, mailReviewVerdict); err != nil {
+		return err
 	}
 
 	// Generate thread ID for new threads
@@ -266,6 +277,57 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  CC: %s\n", strings.Join(msg.CC, ", "))
 	}
 	return writeMailSendResult(cmd, mailSendJSON, to, mailSubject, receipts, sendErrs, msg.Type)
+}
+
+func bindReviewMetadata(message, replyTarget *mail.Message, lineage string, generation int, exactSHA, verdict string) error {
+	if lineage == "" && generation == 0 && exactSHA == "" && verdict == "" {
+		return nil
+	}
+	if verdict == "" {
+		message.Review = &mail.ReviewMetadata{
+			Lineage: lineage, Generation: generation, ExactSHA: exactSHA,
+		}
+		if err := message.Validate(); err != nil {
+			return fmt.Errorf("invalid review request: %w", err)
+		}
+		return nil
+	}
+
+	var typedVerdict mail.ReviewVerdict
+	switch verdict {
+	case string(mail.ReviewApproved):
+		typedVerdict = mail.ReviewApproved
+	case string(mail.ReviewChangesRequired):
+		typedVerdict = mail.ReviewChangesRequired
+	default:
+		return fmt.Errorf("invalid review verdict %q", verdict)
+	}
+	if replyTarget == nil || message.ReplyTo == "" || replyTarget.ID != message.ReplyTo {
+		return fmt.Errorf("review verdict requires its exact reply target")
+	}
+	if err := replyTarget.ValidateStored(); err != nil {
+		return fmt.Errorf("invalid exact review request: %w", err)
+	}
+	if replyTarget.Review == nil || replyTarget.Review.Verdict != "" {
+		return fmt.Errorf("review verdict must reply to a typed review request")
+	}
+	request := replyTarget.Review
+	if lineage != "" && lineage != request.Lineage {
+		return fmt.Errorf("review verdict lineage %q does not match request %q", lineage, request.Lineage)
+	}
+	if generation != 0 && generation != request.Generation {
+		return fmt.Errorf("review verdict generation %d does not match request %d", generation, request.Generation)
+	}
+	if exactSHA != "" && exactSHA != request.ExactSHA {
+		return fmt.Errorf("review verdict exact SHA %q does not match request %q", exactSHA, request.ExactSHA)
+	}
+	bound := *request
+	bound.Verdict = typedVerdict
+	message.Review = &bound
+	if err := message.Validate(); err != nil {
+		return fmt.Errorf("invalid review verdict: %w", err)
+	}
+	return nil
 }
 
 func waitForMailNotifications(router *mail.Router) {

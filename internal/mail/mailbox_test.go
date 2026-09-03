@@ -636,6 +636,52 @@ func newBeadsThreadTestMailboxOutput(t *testing.T, stdout string) (*Mailbox, str
 	return NewMailboxWithBeadsDir("gastown/Toast", workDir, beadsDir), logPath
 }
 
+func TestMailboxListByReviewLineagePreservesFiveGenerations(t *testing.T) {
+	const lineage = "notification-convergence"
+	messages := make([]BeadsMessage, 0, 10)
+	for generation := 1; generation <= 5; generation++ {
+		threadID := fmt.Sprintf("thread-review-%d", generation)
+		requestID := fmt.Sprintf("hq-request-%d", generation)
+		exactSHA := fmt.Sprintf("%040x", generation)
+		common := []string{
+			"gt:message", "from:mayor/", "thread:" + threadID,
+			ReviewLineageLabelPrefix + lineage,
+			ReviewGenerationLabelPrefix + fmt.Sprint(generation),
+			ReviewExactSHALabelPrefix + exactSHA,
+		}
+		messages = append(messages,
+			BeadsMessage{
+				ID: requestID, Title: "review request", Assignee: "gastown/witness", Status: "open",
+				CreatedAt: time.Unix(int64(generation*2), 0),
+				Labels:    append(append([]string(nil), common...), "msg-type:task"),
+			},
+			BeadsMessage{
+				ID: fmt.Sprintf("hq-verdict-%d", generation), Title: "review verdict", Assignee: "mayor/", Status: "open",
+				CreatedAt: time.Unix(int64(generation*2+1), 0),
+				Labels: append(append([]string(nil), common...),
+					"msg-type:reply", "reply-to:"+requestID, ReviewVerdictLabelPrefix+string(ReviewApproved)),
+			},
+		)
+	}
+	mailbox, logPath := newBeadsThreadTestMailbox(t, messages)
+	got, err := mailbox.ListByReviewLineage(lineage)
+	if err != nil {
+		t.Fatalf("ListByReviewLineage: %v", err)
+	}
+	verdicts := 0
+	for _, message := range got {
+		if message.Review != nil && message.Review.Verdict != "" {
+			verdicts++
+		}
+	}
+	if len(got) != 10 || verdicts != 5 {
+		t.Fatalf("lineage records = %d with %d verdicts, want 10 with 5", len(got), verdicts)
+	}
+	if log := readStubLog(t, logPath); !strings.Contains(log, "[--label][review-lineage:"+lineage+"]") {
+		t.Fatalf("lineage query omitted typed label: %s", log)
+	}
+}
+
 func TestMailboxLegacyEmptyInbox(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := NewMailbox(tmpDir)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -346,6 +347,16 @@ func buildMessageLabels(msg *Message, includeDelivery bool) []string {
 	}
 	if msg.ReplyTo != "" {
 		labels = append(labels, "reply-to:"+msg.ReplyTo)
+	}
+	if msg.Review != nil {
+		labels = append(labels,
+			ReviewLineageLabelPrefix+msg.Review.Lineage,
+			ReviewGenerationLabelPrefix+strconv.Itoa(msg.Review.Generation),
+			ReviewExactSHALabelPrefix+msg.Review.ExactSHA,
+		)
+		if msg.Review.Verdict != "" {
+			labels = append(labels, ReviewVerdictLabelPrefix+string(msg.Review.Verdict))
+		}
 	}
 	for _, cc := range msg.CC {
 		ccIdentity := AddressToIdentity(cc)

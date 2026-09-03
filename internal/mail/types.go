@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -46,6 +47,28 @@ const (
 	// TypeReply is a response to another message.
 	TypeReply MessageType = "reply"
 )
+
+// ReviewVerdict is the binding outcome of one exact-SHA review generation.
+type ReviewVerdict string
+
+const (
+	ReviewApproved        ReviewVerdict = "approved"
+	ReviewChangesRequired ReviewVerdict = "changes-required"
+
+	ReviewLineageLabelPrefix    = "review-lineage:"
+	ReviewGenerationLabelPrefix = "review-generation:"
+	ReviewExactSHALabelPrefix   = "review-exact:"
+	ReviewVerdictLabelPrefix    = "review-verdict:"
+)
+
+// ReviewMetadata gives review requests and verdict replies durable authority
+// that does not depend on subject or body text.
+type ReviewMetadata struct {
+	Lineage    string        `json:"lineage"`
+	Generation int           `json:"generation"`
+	ExactSHA   string        `json:"exact_sha"`
+	Verdict    ReviewVerdict `json:"verdict,omitempty"`
+}
 
 // Delivery specifies how a message is delivered to the recipient.
 type Delivery string
@@ -112,6 +135,9 @@ type Message struct {
 	// ReplyTo is the ID of the message this is replying to.
 	ReplyTo string `json:"reply_to,omitempty"`
 
+	// Review identifies one exact-SHA review request or its binding verdict.
+	Review *ReviewMetadata `json:"review,omitempty"`
+
 	// Pinned marks the message as pinned (won't be auto-archived).
 	Pinned bool `json:"pinned,omitempty"`
 
@@ -158,6 +184,10 @@ type Message struct {
 	// mailWork is set by Router.Send only for a newly enrolled task. Keeping it
 	// internal prevents callers from bypassing routing and persistence checks.
 	mailWork bool
+
+	// reviewParseErr retains malformed stored label state so validation fails
+	// open instead of silently accepting the last duplicate label.
+	reviewParseErr error
 }
 
 type StoredDelivery struct {
@@ -268,6 +298,12 @@ func (m *Message) Validate() error {
 	}
 	if m.WakeSourceID != "" && !validWakeSourceID(m.WakeSourceID) {
 		return fmt.Errorf("message has invalid wake source ID %q", m.WakeSourceID)
+	}
+	if m.reviewParseErr != nil {
+		return fmt.Errorf("message has invalid review metadata: %w", m.reviewParseErr)
+	}
+	if err := validateReviewMetadata(m); err != nil {
+		return err
 	}
 
 	// Routing: exactly one of To, Queue, or Channel
@@ -383,6 +419,8 @@ type BeadsMessage struct {
 	deliveryState   string
 	deliveryAckedBy string
 	deliveryAckedAt *time.Time
+	review          *ReviewMetadata
+	reviewParseErr  error
 }
 
 // ParseLabels extracts metadata from the labels array.
@@ -400,6 +438,8 @@ func (bm *BeadsMessage) ParseLabels() {
 	bm.deliveryState = ""
 	bm.deliveryAckedBy = ""
 	bm.deliveryAckedAt = nil
+	bm.review = nil
+	bm.reviewParseErr = nil
 
 	for _, label := range bm.Labels {
 		if strings.HasPrefix(label, "from:") {
@@ -427,6 +467,7 @@ func (bm *BeadsMessage) ParseLabels() {
 	}
 
 	bm.deliveryState, bm.deliveryAckedBy, bm.deliveryAckedAt = ParseDeliveryLabels(bm.Labels)
+	bm.review, bm.reviewParseErr = parseReviewMetadataLabels(bm.Labels)
 }
 
 // GetCC returns the parsed CC recipients.
@@ -495,6 +536,7 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		ThreadID:        bm.threadID,
 		WakeSourceID:    wakeSourceIDOrEmpty(bm.Labels),
 		ReplyTo:         bm.replyTo,
+		Review:          bm.review,
 		Wisp:            bm.Wisp,
 		CC:              ccAddrs,
 		Queue:           bm.queue,
@@ -504,7 +546,105 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		DeliveryState:   bm.deliveryState,
 		DeliveryAckedBy: bm.deliveryAckedBy,
 		DeliveryAckedAt: bm.deliveryAckedAt,
+		reviewParseErr:  bm.reviewParseErr,
 	}
+}
+
+func validateReviewMetadata(message *Message) error {
+	if message.Review == nil {
+		return nil
+	}
+	review := message.Review
+	if message.Wisp {
+		return fmt.Errorf("typed review mail must be permanent")
+	}
+	if !validReviewLineage(review.Lineage) {
+		return fmt.Errorf("message has invalid review lineage %q", review.Lineage)
+	}
+	if review.Generation <= 0 {
+		return fmt.Errorf("message has invalid review generation %d", review.Generation)
+	}
+	if !validReviewExactSHA(review.ExactSHA) {
+		return fmt.Errorf("message has invalid review exact SHA %q", review.ExactSHA)
+	}
+	switch review.Verdict {
+	case "":
+		if message.Type != TypeTask || message.ReplyTo != "" {
+			return fmt.Errorf("review request must be a non-reply task")
+		}
+	case ReviewApproved, ReviewChangesRequired:
+		if message.Type != TypeReply || message.ReplyTo == "" {
+			return fmt.Errorf("review verdict must be an exact reply")
+		}
+	default:
+		return fmt.Errorf("message has invalid review verdict %q", review.Verdict)
+	}
+	return nil
+}
+
+func validReviewLineage(lineage string) bool {
+	if len(lineage) == 0 || len(lineage) > 64 {
+		return false
+	}
+	for i, r := range lineage {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || (i > 0 && (r == '-' || r == '_' || r == '.')) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validReviewExactSHA(exactSHA string) bool {
+	if len(exactSHA) != 40 || strings.ToLower(exactSHA) != exactSHA {
+		return false
+	}
+	_, err := hex.DecodeString(exactSHA)
+	return err == nil
+}
+
+func parseReviewMetadataLabels(labels []string) (*ReviewMetadata, error) {
+	review := &ReviewMetadata{}
+	seen := make(map[string]bool, 4)
+	found := false
+	for _, label := range labels {
+		var key, value string
+		switch {
+		case strings.HasPrefix(label, ReviewLineageLabelPrefix):
+			key, value = "lineage", strings.TrimPrefix(label, ReviewLineageLabelPrefix)
+		case strings.HasPrefix(label, ReviewGenerationLabelPrefix):
+			key, value = "generation", strings.TrimPrefix(label, ReviewGenerationLabelPrefix)
+		case strings.HasPrefix(label, ReviewExactSHALabelPrefix):
+			key, value = "exact", strings.TrimPrefix(label, ReviewExactSHALabelPrefix)
+		case strings.HasPrefix(label, ReviewVerdictLabelPrefix):
+			key, value = "verdict", strings.TrimPrefix(label, ReviewVerdictLabelPrefix)
+		default:
+			continue
+		}
+		found = true
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate review %s label", key)
+		}
+		seen[key] = true
+		switch key {
+		case "lineage":
+			review.Lineage = value
+		case "generation":
+			generation, err := strconv.Atoi(value)
+			if err != nil || strconv.Itoa(generation) != value {
+				return nil, fmt.Errorf("invalid review generation %q", value)
+			}
+			review.Generation = generation
+		case "exact":
+			review.ExactSHA = value
+		case "verdict":
+			review.Verdict = ReviewVerdict(value)
+		}
+	}
+	if !found {
+		return nil, nil
+	}
+	return review, nil
 }
 
 // GetQueue returns the queue name for queue messages.

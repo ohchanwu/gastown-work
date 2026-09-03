@@ -79,7 +79,96 @@ func CheckWakeEligibility(townRoot string, queued nudge.QueuedNudge) (WakeEligib
 	if source == nil {
 		return WakeUnknown, fmt.Errorf("wake source %q not found", queued.SourceID)
 	}
+	if source.Review != nil && source.Review.Verdict != "" {
+		lineage, err := mailbox.ListByReviewLineage(source.Review.Lineage)
+		if err != nil {
+			return WakeUnknown, fmt.Errorf("reading review verdict lineage: %w", err)
+		}
+		eligibility, err := classifyReviewVerdictWake(source, lineage)
+		if err != nil || eligibility != WakeEligible {
+			return eligibility, err
+		}
+	}
 	return classifyWakeSource(queued, source, thread)
+}
+
+type reviewGeneration struct {
+	request *Message
+	verdict *Message
+}
+
+func classifyReviewVerdictWake(source *Message, messages []*Message) (WakeEligibility, error) {
+	if source == nil || source.Review == nil || source.Review.Verdict == "" {
+		return WakeUnknown, fmt.Errorf("wake source is not a typed review verdict")
+	}
+	lineage := source.Review.Lineage
+	generations := make(map[int]*reviewGeneration)
+	maxGeneration := 0
+	sourceMatches := 0
+	var sourceRecord *Message
+	for _, message := range messages {
+		if message == nil || message.Review == nil || message.Review.Lineage != lineage {
+			return WakeUnknown, fmt.Errorf("review lineage contains an untyped or mismatched message")
+		}
+		if err := message.Validate(); err != nil {
+			return WakeUnknown, fmt.Errorf("invalid review lineage message %q: %w", message.ID, err)
+		}
+		if message.ID == source.ID {
+			sourceMatches++
+			sourceRecord = message
+		}
+		generation := message.Review.Generation
+		entry := generations[generation]
+		if entry == nil {
+			entry = &reviewGeneration{}
+			generations[generation] = entry
+		}
+		if message.Review.Verdict == "" {
+			if entry.request != nil {
+				return WakeUnknown, fmt.Errorf("review generation %d has conflicting requests", generation)
+			}
+			entry.request = message
+		} else {
+			if entry.verdict != nil {
+				return WakeUnknown, fmt.Errorf("review generation %d has conflicting verdicts", generation)
+			}
+			entry.verdict = message
+		}
+		if generation > maxGeneration {
+			maxGeneration = generation
+		}
+	}
+	if sourceMatches != 1 {
+		return WakeUnknown, fmt.Errorf("review verdict source %q is not unique in its lineage", source.ID)
+	}
+	if sourceRecord.Type != source.Type || sourceRecord.ThreadID != source.ThreadID ||
+		sourceRecord.ReplyTo != source.ReplyTo || *sourceRecord.Review != *source.Review {
+		return WakeUnknown, fmt.Errorf("review verdict source changed while reading its lineage")
+	}
+	for generation, entry := range generations {
+		if entry.request == nil {
+			return WakeUnknown, fmt.Errorf("review lineage has incomplete or out-of-order generation %d", generation)
+		}
+		if entry.verdict == nil {
+			if generation != maxGeneration {
+				return WakeUnknown, fmt.Errorf("review lineage has incomplete or out-of-order generation %d", generation)
+			}
+			continue
+		}
+		if entry.verdict.ReplyTo != entry.request.ID {
+			return WakeUnknown, fmt.Errorf("review generation %d verdict does not reply to its exact request", generation)
+		}
+		if entry.verdict.Review.ExactSHA != entry.request.Review.ExactSHA {
+			return WakeUnknown, fmt.Errorf("review generation %d has conflicting exact SHAs", generation)
+		}
+	}
+	if source.Review.Generation != maxGeneration {
+		return WakeTerminal, nil
+	}
+	if generations[maxGeneration].verdict == nil || generations[maxGeneration].verdict.ID != source.ID {
+		return WakeUnknown, fmt.Errorf("newest review verdict source does not match lineage")
+	}
+	return WakeEligible, nil
 }
 
 func hasWakeSourceLabel(labels []string) bool {

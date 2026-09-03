@@ -1570,6 +1570,42 @@ func (m *Mailbox) ListByThread(threadID string) ([]*Message, error) {
 	return m.listByThreadBeads(threadID)
 }
 
+// ListByReviewLineage returns every durable request and verdict carrying one
+// typed review lineage, even when generations use different mail threads.
+func (m *Mailbox) ListByReviewLineage(lineage string) ([]*Message, error) {
+	if !validReviewLineage(lineage) {
+		return nil, fmt.Errorf("invalid review lineage %q", lineage)
+	}
+	if m.legacy {
+		return m.listByReviewLineageLegacy(lineage)
+	}
+	if m.store != nil {
+		return m.storeListByReviewLineage(lineage)
+	}
+	return m.listByReviewLineageBeads(lineage)
+}
+
+func (m *Mailbox) listByReviewLineageBeads(lineage string) ([]*Message, error) {
+	args := []string{
+		"list", "--include-infra", "--all",
+		"--label", "gt:message",
+		"--label", ReviewLineageLabelPrefix + lineage,
+		"--limit", "0", "--json",
+	}
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	stdout, err := runBdCommand(ctx, args, m.workDir, m.beadsDir, "BD_IDENTITY="+m.identity)
+	if err != nil {
+		return nil, err
+	}
+	messages, err := decodeReviewLineageList(stdout, lineage)
+	if err != nil {
+		return nil, fmt.Errorf("decode review lineage list: %w", err)
+	}
+	sortThreadMessages(messages)
+	return messages, nil
+}
+
 func (m *Mailbox) listByThreadBeads(threadID string) ([]*Message, error) {
 	args := []string{
 		"list", "--include-infra", "--all",
@@ -1621,6 +1657,39 @@ func decodeThreadList(stdout []byte, threadID string) ([]*Message, error) {
 		message := bm.ToMessage()
 		if err := validateThreadMessage(message, bm.Labels, threadID); err != nil {
 			return nil, fmt.Errorf("message %d: %w", i, err)
+		}
+		messages = append(messages, message)
+	}
+	return messages, nil
+}
+
+func decodeReviewLineageList(stdout []byte, lineage string) ([]*Message, error) {
+	data, err := threadListData(stdout)
+	if err != nil {
+		return nil, err
+	}
+	var records []json.RawMessage
+	if err := json.Unmarshal(data, &records); err != nil || records == nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("expected JSON array")
+	}
+	messages := make([]*Message, 0, len(records))
+	for i, record := range records {
+		if bytes.Equal(bytes.TrimSpace(record), []byte("null")) {
+			return nil, fmt.Errorf("message %d is null", i)
+		}
+		var bm BeadsMessage
+		if err := decodeThreadRecord(record, &bm); err != nil {
+			return nil, fmt.Errorf("message %d: %w", i, err)
+		}
+		message := bm.ToMessage()
+		if err := validateThreadMessage(message, bm.Labels, message.ThreadID); err != nil {
+			return nil, fmt.Errorf("message %d: %w", i, err)
+		}
+		if message.Review == nil || message.Review.Lineage != lineage {
+			return nil, fmt.Errorf("message %d has wrong or missing review lineage", i)
 		}
 		messages = append(messages, message)
 	}
@@ -1792,7 +1861,8 @@ func validateSingletonThreadLabels(labels []string) error {
 			continue
 		}
 		switch key {
-		case "from", "thread", "msg-type", "queue", "channel", "announce":
+		case "from", "thread", "reply-to", "msg-type", "queue", "channel", "announce",
+			"review-lineage", "review-generation", "review-exact", "review-verdict":
 			if seen[key] {
 				return fmt.Errorf("duplicate %s label", key)
 			}
@@ -1830,6 +1900,24 @@ func (m *Mailbox) listByThreadLegacy(threadID string) ([]*Message, error) {
 	})
 
 	return thread, nil
+}
+
+func (m *Mailbox) listByReviewLineageLegacy(lineage string) ([]*Message, error) {
+	messages, err := m.List()
+	if err != nil {
+		return nil, err
+	}
+	var result []*Message
+	for _, message := range messages {
+		if message.Review != nil && message.Review.Lineage == lineage {
+			if err := message.Validate(); err != nil {
+				return nil, err
+			}
+			result = append(result, message)
+		}
+	}
+	sortThreadMessages(result)
+	return result, nil
 }
 
 // isJSON returns true if the byte slice looks like JSON (starts with [ or {).

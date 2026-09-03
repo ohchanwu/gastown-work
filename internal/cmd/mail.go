@@ -6,37 +6,41 @@ import (
 
 // Mail command flags
 var (
-	mailSubject       string
-	mailBody          string
-	mailPriority      int
-	mailUrgent        bool
-	mailPinned        bool
-	mailWisp          bool
-	mailPermanent     bool
-	mailType          string
-	mailReplyTo       string
-	mailNotify        bool
-	mailNoNotify      bool   // Suppress auto-nudge notification to recipient
-	mailTo            string // --to flag (alternative to positional arg)
-	mailFrom          string // --from flag (override sender, for relay/bridge use)
-	mailSendSelf      bool
-	mailSendJSON      bool
-	mailCC            []string // CC recipients
-	mailInboxJSON     bool
-	mailReadJSON      bool
-	mailInboxUnread   bool
-	mailInboxAll      bool
-	mailInboxIdentity string
-	mailCheckInject   bool
-	mailCheckJSON     bool
-	mailCheckIdentity string
-	mailThreadJSON    bool
-	mailReplySubject  string
-	mailReplyMessage  string
-	mailReplyComplete bool
-	mailClaimID       string
-	mailBlockMessage  string
-	mailStdin         bool // Read message body from stdin
+	mailSubject          string
+	mailBody             string
+	mailPriority         int
+	mailUrgent           bool
+	mailPinned           bool
+	mailWisp             bool
+	mailPermanent        bool
+	mailType             string
+	mailReplyTo          string
+	mailReviewLineage    string
+	mailReviewGeneration int
+	mailReviewExact      string
+	mailReviewVerdict    string
+	mailNotify           bool
+	mailNoNotify         bool   // Suppress auto-nudge notification to recipient
+	mailTo               string // --to flag (alternative to positional arg)
+	mailFrom             string // --from flag (override sender, for relay/bridge use)
+	mailSendSelf         bool
+	mailSendJSON         bool
+	mailCC               []string // CC recipients
+	mailInboxJSON        bool
+	mailReadJSON         bool
+	mailInboxUnread      bool
+	mailInboxAll         bool
+	mailInboxIdentity    string
+	mailCheckInject      bool
+	mailCheckJSON        bool
+	mailCheckIdentity    string
+	mailThreadJSON       bool
+	mailReplySubject     string
+	mailReplyMessage     string
+	mailReplyComplete    bool
+	mailClaimID          string
+	mailBlockMessage     string
+	mailStdin            bool // Read message body from stdin
 
 	// Search flags
 	mailSearchFrom    string
@@ -104,7 +108,7 @@ var mailSendCmd = &cobra.Command{
 	Annotations: map[string]string{
 		BrokerSafeAnnotation:      "true",
 		brokerSafeArgsAnnotation:  brokerSafeArgsExactOne,
-		brokerSafeFlagsAnnotation: "subject,message,body,stdin,priority,urgent,type,reply-to,notify,no-notify,pinned,wisp,permanent,json",
+		brokerSafeFlagsAnnotation: "subject,message,body,stdin,priority,urgent,type,reply-to,review-lineage,review-generation,review-exact,review-verdict,notify,no-notify,pinned,wisp,permanent,json",
 	},
 	Short: "Send a message",
 	Long: `Send a message to an agent.
@@ -499,6 +503,10 @@ func init() {
 	mailSendCmd.Flags().BoolVar(&mailUrgent, "urgent", false, "Set priority=0 (urgent)")
 	mailSendCmd.Flags().StringVar(&mailType, "type", "notification", "Message type (task, scavenge, notification, reply)")
 	mailSendCmd.Flags().StringVar(&mailReplyTo, "reply-to", "", "Message ID this is replying to")
+	mailSendCmd.Flags().StringVar(&mailReviewLineage, "review-lineage", "", "Stable typed review lineage")
+	mailSendCmd.Flags().IntVar(&mailReviewGeneration, "review-generation", 0, "Positive typed review generation")
+	mailSendCmd.Flags().StringVar(&mailReviewExact, "review-exact", "", "Exact 40-hex commit SHA under review")
+	mailSendCmd.Flags().StringVar(&mailReviewVerdict, "review-verdict", "", "Binding verdict: approved or changes-required")
 	mailSendCmd.Flags().BoolVarP(&mailNotify, "notify", "n", false, "Bump priority to high (notification is automatic; use --no-notify to suppress)")
 	mailSendCmd.Flags().BoolVar(&mailNoNotify, "no-notify", false, "Suppress auto-nudge notification to recipient")
 	mailSendCmd.MarkFlagsMutuallyExclusive("notify", "no-notify")

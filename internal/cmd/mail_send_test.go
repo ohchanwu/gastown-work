@@ -156,3 +156,36 @@ func TestPickReplyTo(t *testing.T) {
 		}
 	})
 }
+
+func TestBindReviewMetadataInheritsOnlyFromExactRequest(t *testing.T) {
+	const exactSHA = "0123456789abcdef0123456789abcdef01234567"
+	request := &mail.Message{
+		ID: "hq-review-request", From: "mayor/", To: "gastown/witness", Subject: "review",
+		Type: mail.TypeTask,
+		Review: &mail.ReviewMetadata{
+			Lineage: "notification-convergence", Generation: 5, ExactSHA: exactSHA,
+		},
+	}
+	reply := &mail.Message{
+		ID: "msg-review-reply", From: "gastown/witness", To: "mayor/", Subject: "verdict",
+		Type: mail.TypeReply, ReplyTo: request.ID,
+	}
+	if err := bindReviewMetadata(reply, request, "", 0, "", "approved"); err != nil {
+		t.Fatalf("bindReviewMetadata: %v", err)
+	}
+	if reply.Review == nil || reply.Review.Lineage != request.Review.Lineage ||
+		reply.Review.Generation != 5 || reply.Review.ExactSHA != exactSHA ||
+		reply.Review.Verdict != mail.ReviewApproved {
+		t.Fatalf("bound review = %#v", reply.Review)
+	}
+
+	wrongSHA := *reply
+	wrongSHA.Review = nil
+	if err := bindReviewMetadata(&wrongSHA, request, "", 0,
+		"fedcba9876543210fedcba9876543210fedcba98", "approved"); err == nil {
+		t.Fatal("bindReviewMetadata accepted a verdict SHA that disagrees with its exact request")
+	}
+	if err := bindReviewMetadata(&wrongSHA, nil, "", 0, "", "approved"); err == nil {
+		t.Fatal("bindReviewMetadata accepted a verdict without its exact reply target")
+	}
+}

@@ -227,6 +227,31 @@ Every mail = a Dolt commit in the permanent history. Nudges = zero storage cost.
 
 Process mail in your inbox-check mol step.
 
+### Exact-SHA review protocol
+
+Formal review authority is typed; subjects and body text are descriptive only.
+The requester starts each generation with one stable lineage, a positive
+generation, and the full lowercase 40-hex commit SHA:
+
+```bash
+{{ cmd }} mail send {{ .RigName }}/witness --type task --permanent \
+  --review-lineage <stable-lineage> --review-generation <N> \
+  --review-exact <40-hex-sha> -s "REVIEW exact <short-sha>" -m "<scope>"
+```
+
+After reviewing that exact request, send one binding verdict as its exact
+reply. The reply inherits lineage, generation, and SHA from the stored request:
+
+```bash
+{{ cmd }} mail send <requester> --permanent --reply-to <request-message-id> \
+  --review-verdict approved -s "APPROVED: exact <short-sha>" -m "<evidence>"
+# Or: --review-verdict changes-required
+```
+
+Do not issue a second verdict for the same generation. If exact custody is
+missing, contradictory, or canceled, preserve evidence and fail open without a
+typed verdict.
+
 ---
 
 ## 🔄 Context Management

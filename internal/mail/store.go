@@ -129,6 +129,35 @@ func (m *Mailbox) storeListByThread(threadID string) ([]*Message, error) {
 	return messages, nil
 }
 
+func (m *Mailbox) storeListByReviewLineage(lineage string) ([]*Message, error) {
+	ctx, cancel := mailStoreCtx()
+	defer cancel()
+
+	sdkIssues, err := m.store.SearchIssues(ctx, "", beadsdk.IssueFilter{
+		Labels: []string{"gt:message", ReviewLineageLabelPrefix + lineage},
+		Limit:  0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store list review lineage: %w", err)
+	}
+	messages := make([]*Message, 0, len(sdkIssues))
+	for i, issue := range sdkIssues {
+		message := sdkIssueToMessage(issue)
+		if message == nil {
+			return nil, fmt.Errorf("store review lineage message %d is null", i)
+		}
+		if err := validateThreadMessage(message, issue.Labels, message.ThreadID); err != nil {
+			return nil, fmt.Errorf("store review lineage message %d: %w", i, err)
+		}
+		if message.Review == nil || message.Review.Lineage != lineage {
+			return nil, fmt.Errorf("store review lineage message %d has wrong or missing lineage", i)
+		}
+		messages = append(messages, message)
+	}
+	sortThreadMessages(messages)
+	return messages, nil
+}
+
 // storeGetFromDir retrieves a message using the in-process store.
 func (m *Mailbox) storeGetFromDir(id string) (*Message, error) {
 	ctx, cancel := mailStoreCtx()

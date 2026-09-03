@@ -66,6 +66,27 @@ func TestRenderRole_Mayor(t *testing.T) {
 	}
 }
 
+func TestRenderRoleWitnessIncludesTypedReviewVerdictProtocol(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := tmpl.RenderRole("witness", RoleData{
+		Role: "witness", RigName: "gastown", TownRoot: "/test/town", TownName: "town",
+		WorkDir: "/test/town/gastown/witness", DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"--review-lineage", "--review-generation", "--review-exact", "--review-verdict", "--reply-to",
+	} {
+		if !strings.Contains(output, required) {
+			t.Fatalf("rendered Witness instructions omit %q", required)
+		}
+	}
+}
+
 func TestRenderRole_Polecat(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {

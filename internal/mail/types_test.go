@@ -997,3 +997,85 @@ func TestActionableWorkReadStateComesOnlyFromReadLabel(t *testing.T) {
 		t.Fatal("blocked work ignored its read label")
 	}
 }
+
+func TestReviewMetadataLabelsRoundTrip(t *testing.T) {
+	const exactSHA = "0123456789abcdef0123456789abcdef01234567"
+	request := &Message{
+		ID:       "msg-review-request",
+		From:     "mayor/",
+		To:       "gastown/witness",
+		Subject:  "review exact SHA",
+		Type:     TypeTask,
+		ThreadID: "thread-review-1",
+		Review: &ReviewMetadata{
+			Lineage:    "notification-convergence",
+			Generation: 5,
+			ExactSHA:   exactSHA,
+		},
+	}
+	labels := buildMessageLabels(request, false)
+	stored := (&BeadsMessage{
+		ID: "hq-request", Title: request.Subject, Assignee: request.To, Status: "open",
+		Labels: labels,
+	}).ToMessage()
+	if err := validateThreadMessage(stored, labels, request.ThreadID); err != nil {
+		t.Fatalf("typed review request did not round-trip: %v", err)
+	}
+	if stored.Review == nil || stored.Review.Lineage != request.Review.Lineage ||
+		stored.Review.Generation != request.Review.Generation || stored.Review.ExactSHA != exactSHA ||
+		stored.Review.Verdict != "" {
+		t.Fatalf("stored review metadata = %#v, want %#v", stored.Review, request.Review)
+	}
+}
+
+func TestReviewMetadataValidationRejectsMalformedOrAmbiguousLabels(t *testing.T) {
+	const exactSHA = "0123456789abcdef0123456789abcdef01234567"
+	base := []string{
+		"gt:message", "from:mayor/", "msg-type:task", "thread:thread-review",
+		ReviewLineageLabelPrefix + "notification-convergence",
+		ReviewGenerationLabelPrefix + "1",
+		ReviewExactSHALabelPrefix + exactSHA,
+	}
+	cases := map[string][]string{
+		"duplicate lineage":       append(append([]string(nil), base...), ReviewLineageLabelPrefix+"other"),
+		"zero generation":         replaceLabel(base, ReviewGenerationLabelPrefix, ReviewGenerationLabelPrefix+"0"),
+		"noncanonical generation": replaceLabel(base, ReviewGenerationLabelPrefix, ReviewGenerationLabelPrefix+"01"),
+		"short SHA":               replaceLabel(base, ReviewExactSHALabelPrefix, ReviewExactSHALabelPrefix+"deadbeef"),
+		"unknown verdict":         append(append([]string(nil), base...), ReviewVerdictLabelPrefix+"maybe"),
+	}
+	for name, labels := range cases {
+		t.Run(name, func(t *testing.T) {
+			stored := (&BeadsMessage{
+				ID: "hq-review", Title: "review", Assignee: "gastown/witness", Status: "open", Labels: labels,
+			}).ToMessage()
+			if err := stored.ValidateStored(); err == nil {
+				t.Fatalf("ValidateStored accepted labels %q", labels)
+			}
+		})
+	}
+}
+
+func TestReviewMetadataMustBePermanent(t *testing.T) {
+	message := &Message{
+		ID: "msg-review", From: "mayor/", To: "gastown/witness", Subject: "review",
+		Type: TypeTask, Wisp: true,
+		Review: &ReviewMetadata{
+			Lineage: "notification-convergence", Generation: 1,
+			ExactSHA: "0123456789abcdef0123456789abcdef01234567",
+		},
+	}
+	if err := message.Validate(); err == nil {
+		t.Fatal("Validate accepted squashable typed review mail")
+	}
+}
+
+func replaceLabel(labels []string, prefix, replacement string) []string {
+	result := append([]string(nil), labels...)
+	for i, label := range result {
+		if len(label) >= len(prefix) && label[:len(prefix)] == prefix {
+			result[i] = replacement
+			break
+		}
+	}
+	return result
+}
