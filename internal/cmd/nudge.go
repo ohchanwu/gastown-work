@@ -118,8 +118,9 @@ const (
 type nudgeDeliveryResult string
 
 const (
-	nudgeDeliveryQueued    nudgeDeliveryResult = "queued"
-	nudgeDeliverySubmitted nudgeDeliveryResult = "submitted"
+	nudgeDeliveryQueued     nudgeDeliveryResult = "queued"
+	nudgeDeliverySubmitted  nudgeDeliveryResult = "submitted"
+	nudgeDeliverySuppressed nudgeDeliveryResult = "suppressed"
 )
 
 func submissionReceiptMatches(receipt tmux.SubmissionReceipt, sessionName, deliveryID string, baseline time.Time) bool {
@@ -142,6 +143,40 @@ func fallbackUrgentDelivery(townRoot, sessionName string, queued nudge.QueuedNud
 		return "", fmt.Errorf("urgent queue fallback failed: %v (original: %w)", err, deliveryErr)
 	}
 	return nudgeDeliveryQueued, nil
+}
+
+// deliverDirectNudge revalidates a durable source immediately before prompt
+// injection. Terminal sources are suppressed; unreadable sources stay queued
+// for retry instead of being delivered on stale information.
+func deliverDirectNudge(t *tmux.Tmux, townRoot, sessionName, message string, queued nudge.QueuedNudge, opts tmux.NudgeOpts) (tmux.SubmissionReceipt, nudgeDeliveryResult, error) {
+	eligibility, eligibilityErr := mail.CheckWakeEligibility(townRoot, queued)
+	switch eligibility {
+	case mail.WakeTerminal:
+		return tmux.SubmissionReceipt{}, nudgeDeliverySuppressed, nil
+	case mail.WakeUnknown:
+		queued.DurableUntilAck = true
+		if _, err := nudge.EnqueueUniqueBySource(townRoot, sessionName, queued); err != nil {
+			return tmux.SubmissionReceipt{}, "", errors.Join(eligibilityErr, fmt.Errorf("retaining source-bound nudge: %w", err))
+		}
+		fmt.Fprintf(os.Stderr, "nudge source eligibility unknown; queued durably for %s: %v\n", sessionName, eligibilityErr)
+		return tmux.SubmissionReceipt{}, nudgeDeliveryQueued, nil
+	}
+
+	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
+		entry := fmt.Sprintf("nudge:%s::%s\n", sessionName, message)
+		if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			_, _ = f.WriteString(entry)
+			_ = f.Close()
+		}
+		now := time.Now()
+		return tmux.SubmissionReceipt{
+			Session: sessionName, DeliveryID: opts.DeliveryID, Runtime: "test",
+			Typed: true, Submitted: true, TypedAt: now, SubmittedAt: now,
+		}, nudgeDeliverySubmitted, nil
+	}
+
+	receipt, err := t.NudgeSessionWithReceipt(sessionName, message, opts)
+	return receipt, "", err
 }
 
 func init() {
@@ -256,7 +291,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string, source nudg
 	// runs from delivering "test" messages to live agents (mayor reported
 	// recurring synthetic nudges traced to nudge_test.go invocations).
 	// Mirrors the pattern in sling_helpers.go's nudgeWitness/nudgeRefinery.
-	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
+	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" && source.ID == "" {
 		entry := fmt.Sprintf("nudge:%s:%s:%s\n", sessionName, sender, message)
 		if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 			_, _ = f.WriteString(entry)
@@ -307,11 +342,17 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string, source nudg
 				queued.DurableUntilAck = nudgePriorityFlag == nudge.PriorityUrgent
 				if qErr := nudge.Enqueue(townRoot, sessionName, queued); qErr != nil {
 					formatted := nudge.FormatForInjection([]nudge.QueuedNudge{queued})
-					deliveryID := nudge.NewDeliveryID()
+					queued.DeliveryID = nudge.NewDeliveryID()
 					baseline := time.Now()
-					receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: deliveryID})
-					if err == nil && submissionReceiptMatches(receipt, sessionName, deliveryID, baseline) {
+					receipt, result, err := deliverDirectNudge(t, townRoot, sessionName, formatted, queued, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: queued.DeliveryID})
+					if result != "" {
+						return result, err
+					}
+					if err == nil && submissionReceiptMatches(receipt, sessionName, queued.DeliveryID, baseline) {
 						return nudgeDeliverySubmitted, nil
+					}
+					if err == nil {
+						err = tmux.ErrSubmitNotVerified
 					}
 					return "", err
 				}
@@ -336,7 +377,10 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string, source nudg
 			queued.DeliveryID = nudge.NewDeliveryID()
 			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{queued})
 			baseline := time.Now()
-			receipt, deliverErr := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: queued.DeliveryID})
+			receipt, result, deliverErr := deliverDirectNudge(t, townRoot, sessionName, formatted, queued, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: queued.DeliveryID})
+			if result != "" {
+				return result, deliverErr
+			}
 			if deliverErr == nil && submissionReceiptMatches(receipt, sessionName, queued.DeliveryID, baseline) {
 				return nudgeDeliverySubmitted, nil
 			}
@@ -372,11 +416,17 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string, source nudg
 			// Still use FormatForInjection so the agent sees a consistent
 			// <system-reminder> format regardless of delivery path.
 			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{queued})
-			deliveryID := nudge.NewDeliveryID()
+			queued.DeliveryID = nudge.NewDeliveryID()
 			baseline := time.Now()
-			receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: deliveryID})
-			if err == nil && submissionReceiptMatches(receipt, sessionName, deliveryID, baseline) {
+			receipt, result, err := deliverDirectNudge(t, townRoot, sessionName, formatted, queued, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: queued.DeliveryID})
+			if result != "" {
+				return result, err
+			}
+			if err == nil && submissionReceiptMatches(receipt, sessionName, queued.DeliveryID, baseline) {
 				return nudgeDeliverySubmitted, nil
+			}
+			if err == nil {
+				err = tmux.ErrSubmitNotVerified
 			}
 			return "", err
 		}
@@ -402,12 +452,15 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string, source nudg
 		queued.DeliveryID = nudge.NewDeliveryID()
 		opts.DeliveryID = queued.DeliveryID
 		baseline := time.Now()
-		receipt, deliveryErr := t.NudgeSessionWithReceipt(sessionName, prefixedMessage, opts)
-		result, err := fallbackUrgentDelivery(townRoot, sessionName, queued, baseline, receipt, deliveryErr)
-		if result == nudgeDeliveryQueued {
+		receipt, result, deliveryErr := deliverDirectNudge(t, townRoot, sessionName, prefixedMessage, queued, opts)
+		if result != "" {
+			return result, deliveryErr
+		}
+		fallbackResult, err := fallbackUrgentDelivery(townRoot, sessionName, queued, baseline, receipt, deliveryErr)
+		if fallbackResult == nudgeDeliveryQueued {
 			fmt.Fprintf(os.Stderr, "urgent nudge submission unverified; queued durably for %s\n", sessionName)
 		}
-		return result, err
+		return fallbackResult, err
 	}
 }
 

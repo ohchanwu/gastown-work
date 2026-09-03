@@ -492,6 +492,83 @@ printf '%s\n' '[{"id":"hq-source","title":"source","assignee":"gastown/witness",
 	}
 }
 
+func TestSourceBoundDirectNudgeRevalidatesBeforeEveryInjection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+	const (
+		sourceID  = "msg-0123456789abcdef"
+		threadID  = "thread-direct-source"
+		sessionID = "gt-test-direct-source"
+	)
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "metadata.json"), []byte(`{"dolt_database":"maildb"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	terminalPath := filepath.Join(townRoot, "terminal")
+	failurePath := filepath.Join(townRoot, "failure")
+	binDir := t.TempDir()
+	stub := `#!/bin/sh
+if [ -f "$MOCK_WAKE_FAILURE" ]; then
+  printf '%s\n' 'injected source lookup failure' >&2
+  exit 1
+fi
+if [ -f "$MOCK_WAKE_TERMINAL" ]; then
+  printf '%s\n' '[{"id":"hq-source","title":"source","assignee":"gastown/witness","status":"open","created_at":"2026-09-04T00:00:00Z","labels":["gt:message","from:mayor/","msg-type:notification","thread:` + threadID + `","delivery:pending","wake-source:` + sourceID + `","read"]}]'
+  exit 0
+fi
+printf '%s\n' '[{"id":"hq-source","title":"source","assignee":"gastown/witness","status":"open","created_at":"2026-09-04T00:00:00Z","labels":["gt:message","from:mayor/","msg-type:notification","thread:` + threadID + `","delivery:pending","wake-source:` + sourceID + `"]}]'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(stub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOCK_WAKE_TERMINAL", terminalPath)
+	t.Setenv("MOCK_WAKE_FAILURE", failurePath)
+	logPath := filepath.Join(townRoot, "nudge.log")
+	t.Setenv("GT_TEST_NUDGE_LOG", logPath)
+
+	queued := newNudgeDeliveryRecord("mayor", "read the mail", nudge.PriorityNormal, nudgeSource{
+		ID: sourceID, Kind: nudge.SourceKindMail, ThreadID: threadID, QueueKind: "mail",
+	})
+	queued.DeliveryID = "ndg-direct-source"
+	opts := tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: queued.DeliveryID}
+	receipt, result, err := deliverDirectNudge(nil, townRoot, sessionID, "payload", queued, opts)
+	if err != nil || result != nudgeDeliverySubmitted || !receipt.Submitted {
+		t.Fatalf("eligible delivery = %#v, %q, %v", receipt, result, err)
+	}
+
+	if err := os.WriteFile(terminalPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	receipt, result, err = deliverDirectNudge(nil, townRoot, sessionID, "payload", queued, opts)
+	if err != nil || result != nudgeDeliverySuppressed || receipt.Submitted {
+		t.Fatalf("terminal delivery = %#v, %q, %v", receipt, result, err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), "nudge:"+sessionID+":"); got != 1 {
+		t.Fatalf("direct injection count = %d, want 1", got)
+	}
+
+	if err := os.WriteFile(failurePath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, result, err = deliverDirectNudge(nil, townRoot, sessionID, "payload", queued, opts)
+	if err != nil || result != nudgeDeliveryQueued {
+		t.Fatalf("unknown delivery = %q, %v; want retained queue", result, err)
+	}
+	pending, err := nudge.ListQueued(townRoot, sessionID)
+	if err != nil || len(pending) != 1 || !pending[0].DurableUntilAck {
+		t.Fatalf("retained queue = %#v, %v", pending, err)
+	}
+}
+
 func TestNudgeSourceMailDerivesEscalationQueueKind(t *testing.T) {
 	got, err := validateNudgeSourceMessage(&mail.Message{
 		To:           "mayor/",

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestFormatEscalationDescription(t *testing.T) {
@@ -428,6 +429,16 @@ func TestConvergeEscalationObservationSerializesOnePersistedOccurrence(t *testin
 		Recipients:  []string{"mayor/", "overseer"},
 	}
 
+	previousAcquire := acquireBeadLock
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	acquireBeadLock = func(path string) (func(), error) {
+		entered <- struct{}{}
+		<-release
+		return previousAcquire(path)
+	}
+	t.Cleanup(func() { acquireBeadLock = previousAcquire })
+
 	var wg sync.WaitGroup
 	results := make(chan *EscalationTransition, 2)
 	errs := make(chan error, 2)
@@ -443,6 +454,15 @@ func TestConvergeEscalationObservationSerializesOnePersistedOccurrence(t *testin
 			results <- transition
 		}()
 	}
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("concurrent observations did not both reach the serialization barrier")
+		}
+	}
+	close(release)
 	wg.Wait()
 	close(results)
 	close(errs)
@@ -484,6 +504,18 @@ func TestEscalationTransitionPersistenceFailuresRemainRetryable(t *testing.T) {
 		if got := ParseEscalationFields(readEscalationBDState(t, statePath).Description); got.MaterialGeneration != 1 {
 			t.Fatalf("failed update changed persisted generation to %d", got.MaterialGeneration)
 		}
+		t.Setenv("GT_ESCALATION_BD_FAIL", "")
+		transition, err := b.ConvergeEscalationObservation(EscalationObservation{
+			Title: "Dolt latency", Severity: "critical", Scope: "town",
+			ObservedAt: "2026-09-04T02:00:00Z", Fingerprint: fingerprint,
+			Recipients: []string{"mayor/"},
+		})
+		if err != nil || transition.Kind != EscalationTransitionChanged {
+			t.Fatalf("retry transition = %#v, %v", transition, err)
+		}
+		if got := ParseEscalationFields(readEscalationBDState(t, statePath).Description); got.MaterialGeneration != 2 {
+			t.Fatalf("successful retry persisted generation %d, want 2", got.MaterialGeneration)
+		}
 	})
 
 	t.Run("stale and failed recipient completion", func(t *testing.T) {
@@ -503,6 +535,14 @@ func TestEscalationTransitionPersistenceFailuresRemainRetryable(t *testing.T) {
 		got := ParseEscalationFields(readEscalationBDState(t, statePath).Description)
 		if !reflect.DeepEqual(got.PendingRecipients, []string{"mayor/", "overseer"}) {
 			t.Fatalf("failed completion changed pending recipients to %#v", got.PendingRecipients)
+		}
+		t.Setenv("GT_ESCALATION_BD_FAIL", "")
+		if err := b.CompleteEscalationRecipient("hq-escalation-test", fingerprint, 2, "mayor/"); err != nil {
+			t.Fatalf("retrying recipient completion: %v", err)
+		}
+		got = ParseEscalationFields(readEscalationBDState(t, statePath).Description)
+		if !reflect.DeepEqual(got.PendingRecipients, []string{"overseer"}) {
+			t.Fatalf("successful retry pending recipients = %#v", got.PendingRecipients)
 		}
 	})
 }
