@@ -3,11 +3,14 @@ package mail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/nudge"
 )
 
 const (
@@ -24,6 +27,133 @@ const (
 	DeliveryLabelAckedAtPrefix = "delivery-acked-at:"
 	WakeSourceLabelPrefix      = "wake-source:"
 )
+
+// WakeEligibility is the durable source verdict for one owned queue claim.
+type WakeEligibility string
+
+const (
+	WakeEligible WakeEligibility = "eligible"
+	WakeTerminal WakeEligibility = "terminal"
+	WakeUnknown  WakeEligibility = "unknown"
+)
+
+// CheckWakeEligibility resolves a source-bound wake against durable mail.
+// Source-free legacy and standalone nudges retain their existing delivery
+// behavior. Any incomplete or unreadable source state fails open to retry.
+func CheckWakeEligibility(townRoot string, queued nudge.QueuedNudge) (WakeEligibility, error) {
+	if queued.SourceID == "" && queued.SourceKind == "" {
+		return WakeEligible, nil
+	}
+	if queued.SourceID == "" || queued.SourceKind != nudge.SourceKindMail {
+		return WakeUnknown, fmt.Errorf("incomplete or unsupported wake source %q/%q", queued.SourceKind, queued.SourceID)
+	}
+	if !validWakeSourceID(queued.SourceID) || queued.ThreadID == "" || townRoot == "" {
+		return WakeUnknown, fmt.Errorf("invalid wake source metadata")
+	}
+
+	mailbox := NewMailboxWithBeadsDir("system", townRoot, filepath.Join(townRoot, ".beads"))
+	thread, err := mailbox.ListByThread(queued.ThreadID)
+	if err != nil {
+		return WakeUnknown, fmt.Errorf("reading wake source thread: %w", err)
+	}
+	var source *Message
+	for _, message := range thread {
+		if !hasWakeSourceLabel(message.Labels) {
+			continue
+		}
+		id, err := WakeSourceForMessage(message)
+		if err != nil {
+			return WakeUnknown, fmt.Errorf("reading wake source identity: %w", err)
+		}
+		if id != queued.SourceID {
+			continue
+		}
+		if source != nil {
+			return WakeUnknown, fmt.Errorf("wake source %q is not unique", queued.SourceID)
+		}
+		source = message
+	}
+	if source == nil {
+		return WakeUnknown, fmt.Errorf("wake source %q not found", queued.SourceID)
+	}
+	return classifyWakeSource(queued, source, thread)
+}
+
+func hasWakeSourceLabel(labels []string) bool {
+	for _, label := range labels {
+		if strings.HasPrefix(label, WakeSourceLabelPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyWakeSource(queued nudge.QueuedNudge, source *Message, thread []*Message) (WakeEligibility, error) {
+	if source == nil || source.ThreadID != queued.ThreadID || source.WakeSourceID != queued.SourceID {
+		return WakeUnknown, fmt.Errorf("wake source metadata does not match queue record")
+	}
+	switch source.DeliveryState {
+	case "", DeliveryStatePending, DeliveryStateAcked:
+	default:
+		return WakeUnknown, fmt.Errorf("unknown delivery state %q", source.DeliveryState)
+	}
+	switch queued.Kind {
+	case "mail":
+		if source.Type == TypeEscalation {
+			return WakeUnknown, fmt.Errorf("mail wake references escalation source")
+		}
+	case "escalation":
+		if source.Type != TypeEscalation {
+			return WakeUnknown, fmt.Errorf("escalation wake references %q source", source.Type)
+		}
+	case "reply-reminder":
+	default:
+		return WakeUnknown, fmt.Errorf("unknown source-bound wake kind %q", queued.Kind)
+	}
+
+	replied := false
+	for _, message := range thread {
+		if message == nil {
+			return WakeUnknown, fmt.Errorf("wake source thread contains nil message")
+		}
+		if message.ReplyTo != source.ID {
+			continue
+		}
+		if message.Type != TypeReply {
+			return WakeUnknown, fmt.Errorf("message %q has reply binding without reply type", message.ID)
+		}
+		replied = true
+	}
+	if source.Status == WorkStateClosed || replied {
+		return WakeTerminal, nil
+	}
+	if queued.Kind != "reply-reminder" && (source.Read || source.DeliveryState == DeliveryStateAcked) {
+		return WakeTerminal, nil
+	}
+	return WakeEligible, nil
+}
+
+// PrepareWakeClaim applies durable eligibility after a consumer owns the
+// claim and before any prompt injection. Unknown state remains retryable.
+func PrepareWakeClaim(townRoot string, claim *nudge.ClaimedNudge) (bool, error) {
+	if claim == nil {
+		return false, fmt.Errorf("wake claim is nil")
+	}
+	eligibility, err := CheckWakeEligibility(townRoot, claim.Nudge)
+	switch eligibility {
+	case WakeEligible:
+		return true, nil
+	case WakeTerminal:
+		if discardErr := claim.DiscardTerminal(); discardErr != nil {
+			nackErr := claim.Nack("terminal-discard-failed", nudge.NextRetry(claim.Nudge.Attempts))
+			return false, errors.Join(discardErr, nackErr)
+		}
+		return false, nil
+	default:
+		nackErr := claim.Nack("wake-source-unknown", nudge.NextRetry(claim.Nudge.Attempts))
+		return false, errors.Join(err, nackErr)
+	}
+}
 
 func validWakeSourceID(id string) bool {
 	if !strings.HasPrefix(id, "msg-") || len(id) <= len("msg-") || len(id) > len("msg-")+32 {

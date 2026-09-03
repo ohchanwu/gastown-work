@@ -449,6 +449,14 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) nudgeDeliveryRe
 			if err != nil || claim == nil {
 				return nudgeDeliveryQueued
 			}
+			deliver, eligibilityErr := mail.PrepareWakeClaim(townRoot, claim)
+			if !deliver {
+				releaseLease()
+				if eligibilityErr != nil {
+					fmt.Fprintf(os.Stderr, "idle-watcher: source eligibility for %s failed: %v\n", sessionName, eligibilityErr)
+				}
+				return nudgeDeliveryQueued
+			}
 			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge})
 			receipt, deliveryErr := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: claim.Nudge.DeliveryID})
 			nextAttempt := nudge.NextRetry(claim.Nudge.Attempts)

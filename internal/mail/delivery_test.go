@@ -4,9 +4,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/nudge"
 )
 
 func TestParseDeliveryLabels_CrashAndRetryStates(t *testing.T) {
@@ -184,6 +187,130 @@ func TestWakeSourceLabelsRequireValidIdentity(t *testing.T) {
 		if _, err := wakeSourceIDFromLabels(labels); err == nil {
 			t.Fatalf("wakeSourceIDFromLabels(%q) accepted invalid labels", labels)
 		}
+	}
+}
+
+func TestQueuedWakeTerminalSourceIsNotInjected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+	const (
+		threadID = "thread-terminal"
+		sourceID = "msg-0123456789abcdef"
+		session  = "gt-test-terminal-source"
+	)
+	sourceRecord := BeadsMessage{
+		ID:        "hq-source",
+		Title:     "source",
+		Assignee:  "gastown/Toast",
+		Status:    "open",
+		CreatedAt: time.Now(),
+		Labels: []string{
+			"gt:message", "thread:" + threadID, "from:mayor/", "read",
+			DeliveryLabelPending, WakeSourceLabelPrefix + sourceID,
+		},
+	}
+	mailbox, _ := newBeadsThreadTestMailbox(t, []BeadsMessage{sourceRecord})
+	queued := nudge.QueuedNudge{
+		Sender:     "mayor/",
+		Message:    "terminal wake",
+		Kind:       "mail",
+		ThreadID:   threadID,
+		SourceID:   sourceID,
+		SourceKind: nudge.SourceKindMail,
+	}
+	if err := nudge.Enqueue(mailbox.workDir, session, queued); err != nil {
+		t.Fatalf("Enqueue terminal wake: %v", err)
+	}
+	unrelated := queued
+	unrelated.Message = "unrelated wake"
+	unrelated.SourceID = "msg-fedcba9876543210"
+	if err := nudge.Enqueue(mailbox.workDir, session, unrelated); err != nil {
+		t.Fatalf("Enqueue unrelated wake: %v", err)
+	}
+	claim, err := nudge.ClaimDue(mailbox.workDir, session)
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimDue = %#v, %v", claim, err)
+	}
+
+	deliver, err := PrepareWakeClaim(mailbox.workDir, claim)
+	if err != nil || deliver {
+		t.Fatalf("PrepareWakeClaim = %t, %v; want terminal suppression", deliver, err)
+	}
+	remaining, err := nudge.ListQueued(mailbox.workDir, session)
+	if err != nil {
+		t.Fatalf("ListQueued: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].SourceID != unrelated.SourceID {
+		t.Fatalf("remaining queue = %#v, want only unrelated source", remaining)
+	}
+}
+
+func TestQueuedWakeActiveSourceAndReadReminderStayEligible(t *testing.T) {
+	const sourceID = "msg-0123456789abcdef"
+	source := &Message{
+		ID:            "hq-source",
+		ThreadID:      "thread-active",
+		WakeSourceID:  sourceID,
+		Type:          TypeNotification,
+		Status:        WorkStateOpen,
+		DeliveryState: DeliveryStatePending,
+	}
+	tests := []struct {
+		name string
+		kind string
+		read bool
+	}{
+		{name: "active mail", kind: "mail"},
+		{name: "read reminder awaiting reply", kind: "reply-reminder", read: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := *source
+			candidate.Read = tt.read
+			queued := nudge.QueuedNudge{
+				Kind:       tt.kind,
+				ThreadID:   candidate.ThreadID,
+				SourceID:   sourceID,
+				SourceKind: nudge.SourceKindMail,
+			}
+			got, err := classifyWakeSource(queued, &candidate, []*Message{&candidate})
+			if err != nil || got != WakeEligible {
+				t.Fatalf("classifyWakeSource = %q, %v; want %q", got, err, WakeEligible)
+			}
+		})
+	}
+}
+
+func TestQueuedWakeEligibilityFailureRemainsRetryable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+	mailbox, _ := newBeadsThreadTestMailbox(t, nil)
+	const session = "gt-test-source-unknown"
+	if err := nudge.Enqueue(mailbox.workDir, session, nudge.QueuedNudge{
+		Kind:       "mail",
+		ThreadID:   "thread-missing",
+		SourceID:   "msg-0123456789abcdef",
+		SourceKind: nudge.SourceKindMail,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claim, err := nudge.ClaimDue(mailbox.workDir, session)
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimDue = %#v, %v", claim, err)
+	}
+
+	deliver, err := PrepareWakeClaim(mailbox.workDir, claim)
+	if err == nil || deliver {
+		t.Fatalf("PrepareWakeClaim = %t, %v; want retryable failure", deliver, err)
+	}
+	queued, err := nudge.ListQueued(mailbox.workDir, session)
+	if err != nil {
+		t.Fatalf("ListQueued: %v", err)
+	}
+	if len(queued) != 1 || queued[0].Attempts != 1 || queued[0].LastErrorCode != "wake-source-unknown" {
+		t.Fatalf("retry queue = %#v, want one unknown-source retry", queued)
 	}
 }
 

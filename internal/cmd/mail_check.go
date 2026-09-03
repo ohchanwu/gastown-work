@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -61,6 +62,13 @@ func injectQueuedNudgeForMailCheck(ctx context.Context, workDir, sessionName str
 		return
 	}
 	if claim == nil {
+		return
+	}
+	deliver, eligibilityErr := mail.PrepareWakeClaim(workDir, claim)
+	if !deliver {
+		if eligibilityErr != nil {
+			fmt.Fprintf(errorOutput, "gt mail check: nudge source eligibility error: %v\n", eligibilityErr)
+		}
 		return
 	}
 	fmt.Fprint(output, nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge}))
@@ -162,8 +170,9 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 				fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
 			} else if sessionName != "" {
 				for _, msg := range messages {
-					_, _ = nudge.RemoveKindByThread(workDir, sessionName, "mail", msg.ThreadID)
-					_, _ = nudge.RemoveKindByThread(workDir, sessionName, "escalation", msg.ThreadID)
+					if cleanupErr := removeAcknowledgedWakeKinds(workDir, sessionName, msg.ThreadID); cleanupErr != nil {
+						fmt.Fprintf(os.Stderr, "gt mail check: partial queue convergence for %s: %v\n", msg.ThreadID, cleanupErr)
+					}
 				}
 			}
 		}
@@ -184,6 +193,16 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("No new mail")
 	return NewSilentExit(1)
+}
+
+func removeAcknowledgedWakeKinds(workDir, sessionName, threadID string) error {
+	var errs []error
+	for _, kind := range []string{"mail", "escalation"} {
+		if _, err := nudge.RemoveKindByThread(workDir, sessionName, kind, threadID); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s wake: %w", kind, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // formatInjectOutput builds the system-reminder text for inject mode.

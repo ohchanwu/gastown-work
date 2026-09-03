@@ -124,6 +124,13 @@ func (c *ClaimedNudge) Nack(errorCode string, nextAttempt time.Time) error {
 	return os.Rename(c.claimPath, c.queuePath)
 }
 
+// DiscardTerminal removes only the queue claim owned by this consumer. Broad
+// thread cleanup deliberately ignores claims so a concurrent owner cannot be
+// raced into data loss.
+func (c *ClaimedNudge) DiscardTerminal() error {
+	return os.Remove(c.claimPath)
+}
+
 // HasRecoverableState proves the delivery still exists either in its in-flight
 // claim or restored FIFO slot. Callers use this before releasing external
 // delivery custody after a filesystem error.

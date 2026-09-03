@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -168,6 +169,14 @@ func runNudgePollerLoopWithWait(
 			}
 			if claim == nil {
 				continue // someone else drained it
+			}
+			deliver, eligibilityErr := mail.PrepareWakeClaim(townRoot, claim)
+			if !deliver {
+				releaseLease()
+				if eligibilityErr != nil {
+					fmt.Fprintf(os.Stderr, "nudge-poller: source eligibility error for %s: %v\n", sessionName, eligibilityErr)
+				}
+				continue
 			}
 
 			func() {

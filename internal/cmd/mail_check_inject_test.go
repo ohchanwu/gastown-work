@@ -111,6 +111,23 @@ func TestInjectQueuedNudgePreservesDurableQueueWhileDeliveryLeaseContended(t *te
 	}
 }
 
+func TestMailCheckReportsPartialQueueConvergence(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-partial-convergence"
+	queueParent := filepath.Join(townRoot, ".runtime", "nudge_queue")
+	if err := os.MkdirAll(queueParent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(queueParent, session), []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := removeAcknowledgedWakeKinds(townRoot, session, "thread-partial")
+	if err == nil || !strings.Contains(err.Error(), "reading nudge queue") {
+		t.Fatalf("removeAcknowledgedWakeKinds error = %v, want queue read failure", err)
+	}
+}
+
 func TestFormatInjectOutput(t *testing.T) {
 	// Helper to build test messages with a given priority.
 	msg := func(id, from, subject string, priority mail.Priority) *mail.Message {

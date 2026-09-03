@@ -932,6 +932,31 @@ func TestRemoveKindByThread(t *testing.T) {
 	}
 }
 
+func TestClaimedWakeSelfHealsAfterThreadRemovalRace(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-claimed-thread-race"
+	if err := Enqueue(townRoot, session, QueuedNudge{
+		Kind:     "mail",
+		ThreadID: "thread-terminal",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claim, err := ClaimDue(townRoot, session)
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimDue = %#v, %v", claim, err)
+	}
+	if removed, err := RemoveKindByThread(townRoot, session, "mail", "thread-terminal"); err != nil || removed != 0 {
+		t.Fatalf("RemoveKindByThread = %d, %v; want claimed record untouched", removed, err)
+	}
+	if err := claim.DiscardTerminal(); err != nil {
+		t.Fatalf("DiscardTerminal: %v", err)
+	}
+	visible, err := HasQueuedOrClaimed(townRoot, session)
+	if err != nil || visible {
+		t.Fatalf("HasQueuedOrClaimed = %t, %v; want converged queue", visible, err)
+	}
+}
+
 // TestDeferredNudgeDeliveredAfterDelay uses a very short DeliverAfter to confirm
 // that the same nudge is skipped on first Drain and delivered on a second Drain
 // after the deadline elapses.

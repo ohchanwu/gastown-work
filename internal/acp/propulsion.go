@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -214,6 +215,13 @@ func (p *Propeller) deliverNudges() {
 		return
 	}
 	if claim == nil {
+		return
+	}
+	deliver, eligibilityErr := mail.PrepareWakeClaim(p.townRoot, claim)
+	if !deliver {
+		if eligibilityErr != nil {
+			debugLog(p.townRoot, "[Propeller] source eligibility error: %v", eligibilityErr)
+		}
 		return
 	}
 	nudges := []nudge.QueuedNudge{claim.Nudge}
