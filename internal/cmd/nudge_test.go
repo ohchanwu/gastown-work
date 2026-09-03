@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -427,10 +428,24 @@ func TestNudgeValidModesAccepted(t *testing.T) {
 }
 
 func TestNudgeSourceMailBindsAllDeliveryPaths(t *testing.T) {
-	source := nudgeSource{ID: "msg-0123456789abcdef", Kind: nudge.SourceKindMail}
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+	const (
+		sourceID = "msg-0123456789abcdef"
+		threadID = "thread-source-mail"
+	)
+	source := nudgeSource{
+		ID:        sourceID,
+		Kind:      nudge.SourceKindMail,
+		ThreadID:  threadID,
+		QueueKind: "mail",
+	}
 	validated, err := validateNudgeSourceMessage(&mail.Message{
 		To:           "gastown/witness",
 		WakeSourceID: source.ID,
+		ThreadID:     threadID,
+		Type:         mail.TypeNotification,
 	}, "gastown/polecats/witness")
 	if err != nil {
 		t.Fatalf("validateNudgeSourceMessage: %v", err)
@@ -438,13 +453,57 @@ func TestNudgeSourceMailBindsAllDeliveryPaths(t *testing.T) {
 	if validated != source {
 		t.Fatalf("validated source = %#v, want %#v", validated, source)
 	}
-	for _, mode := range []string{NudgeModeImmediate, NudgeModeQueue, NudgeModeWaitIdle, "acp", "urgent-fallback"} {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "metadata.json"), []byte(`{"dolt_database":"maildb"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	stub := `#!/bin/sh
+printf '%s\n' '[{"id":"hq-source","title":"source","assignee":"gastown/witness","status":"open","created_at":"2026-09-04T00:00:00Z","labels":["gt:message","from:mayor/","msg-type:notification","thread:` + threadID + `","delivery:pending","wake-source:` + sourceID + `"]}]'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(stub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, mode := range []string{NudgeModeQueue, NudgeModeWaitIdle, "acp", "urgent-fallback"} {
 		t.Run(mode, func(t *testing.T) {
 			got := newNudgeDeliveryRecord("mayor", "read the mail", nudge.PriorityUrgent, source)
-			if got.SourceID != source.ID || got.SourceKind != source.Kind {
-				t.Fatalf("source = %q/%q, want %q/%q", got.SourceKind, got.SourceID, source.Kind, source.ID)
+			if got.SourceID != source.ID || got.SourceKind != source.Kind ||
+				got.ThreadID != source.ThreadID || got.Kind != source.QueueKind {
+				t.Fatalf("source-bound record = %#v, want source %#v", got, source)
+			}
+			sessionName := "gt-test-source-" + strings.ReplaceAll(mode, "-", "_")
+			if err := nudge.Enqueue(townRoot, sessionName, got); err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			claim, err := nudge.ClaimDue(townRoot, sessionName)
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimDue = %#v, %v", claim, err)
+			}
+			deliver, err := mail.PrepareWakeClaim(townRoot, claim)
+			if err != nil || !deliver {
+				t.Fatalf("PrepareWakeClaim = %t, %v; want eligible", deliver, err)
 			}
 		})
+	}
+}
+
+func TestNudgeSourceMailDerivesEscalationQueueKind(t *testing.T) {
+	got, err := validateNudgeSourceMessage(&mail.Message{
+		To:           "mayor/",
+		WakeSourceID: "msg-fedcba9876543210",
+		ThreadID:     "hq-escalation",
+		Type:         mail.TypeEscalation,
+	}, "mayor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.QueueKind != "escalation" || got.ThreadID != "hq-escalation" {
+		t.Fatalf("escalation source = %#v", got)
 	}
 }
 

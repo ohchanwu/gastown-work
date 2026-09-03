@@ -48,8 +48,10 @@ var (
 )
 
 type nudgeSource struct {
-	ID   string
-	Kind string
+	ID        string
+	Kind      string
+	ThreadID  string
+	QueueKind string
 }
 
 func newNudgeDeliveryRecord(sender, message, priority string, source nudgeSource) nudge.QueuedNudge {
@@ -57,6 +59,8 @@ func newNudgeDeliveryRecord(sender, message, priority string, source nudgeSource
 		Sender:     sender,
 		Message:    message,
 		Priority:   priority,
+		Kind:       source.QueueKind,
+		ThreadID:   source.ThreadID,
 		SourceID:   source.ID,
 		SourceKind: source.Kind,
 	}
@@ -66,11 +70,23 @@ func validateNudgeSourceMessage(msg *mail.Message, target string) (nudgeSource, 
 	if msg == nil || mail.AddressToIdentity(msg.To) != mail.AddressToIdentity(target) {
 		return nudgeSource{}, fmt.Errorf("source mail recipient does not match nudge target %q", target)
 	}
+	if msg.ThreadID == "" {
+		return nudgeSource{}, fmt.Errorf("source mail has no thread ID")
+	}
 	sourceID, err := mail.WakeSourceForMessage(msg)
 	if err != nil {
 		return nudgeSource{}, err
 	}
-	return nudgeSource{ID: sourceID, Kind: nudge.SourceKindMail}, nil
+	queueKind := "mail"
+	if msg.Type == mail.TypeEscalation {
+		queueKind = "escalation"
+	}
+	return nudgeSource{
+		ID:        sourceID,
+		Kind:      nudge.SourceKindMail,
+		ThreadID:  msg.ThreadID,
+		QueueKind: queueKind,
+	}, nil
 }
 
 func resolveNudgeSourceMail(townRoot, target, messageID string) (nudgeSource, error) {

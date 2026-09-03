@@ -1,10 +1,15 @@
 package beads
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -407,6 +412,270 @@ func TestPrepareEscalationTransitionFieldsLifecycle(t *testing.T) {
 		roundTrip.Scope != observation.Scope || roundTrip.LastObservedAt != observation.ObservedAt {
 		t.Fatalf("transition round trip = %#v, want %#v", roundTrip, fields)
 	}
+}
+
+func TestConvergeEscalationObservationSerializesOnePersistedOccurrence(t *testing.T) {
+	b, statePath := newEscalationBDHarness(t)
+	observation := EscalationObservation{
+		Title:       "Dolt latency",
+		Severity:    "high",
+		Scope:       "town",
+		Reason:      "slow query",
+		Source:      "reaper",
+		EscalatedBy: "deacon/dogs/bravo",
+		ObservedAt:  "2026-09-04T01:00:00Z",
+		Fingerprint: "escalation-fp:abc123def456",
+		Recipients:  []string{"mayor/", "overseer"},
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan *EscalationTransition, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			transition, err := b.ConvergeEscalationObservation(observation)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- transition
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("ConvergeEscalationObservation: %v", err)
+	}
+
+	kinds := map[EscalationTransitionKind]int{}
+	for result := range results {
+		kinds[result.Kind]++
+	}
+	if kinds[EscalationTransitionCreated] != 1 || kinds[EscalationTransitionUnchanged] != 1 {
+		t.Fatalf("transition kinds = %#v", kinds)
+	}
+	issue := readEscalationBDState(t, statePath)
+	fields := ParseEscalationFields(issue.Description)
+	if fields.MaterialGeneration != 1 || !reflect.DeepEqual(fields.PendingRecipients, []string{"mayor/", "overseer"}) {
+		t.Fatalf("persisted fields = %#v", fields)
+	}
+}
+
+func TestEscalationTransitionPersistenceFailuresRemainRetryable(t *testing.T) {
+	const fingerprint = "escalation-fp:abc123def456"
+	t.Run("observation update", func(t *testing.T) {
+		b, statePath := newEscalationBDHarness(t)
+		seedEscalationBDState(t, statePath, &EscalationFields{
+			Severity: "high", Scope: "town", Fingerprint: fingerprint,
+			MaterialState: "severity=high|scope=town", MaterialGeneration: 1,
+		})
+		t.Setenv("GT_ESCALATION_BD_FAIL", "update")
+		_, err := b.ConvergeEscalationObservation(EscalationObservation{
+			Title: "Dolt latency", Severity: "critical", Scope: "town",
+			ObservedAt: "2026-09-04T02:00:00Z", Fingerprint: fingerprint,
+			Recipients: []string{"mayor/"},
+		})
+		if err == nil {
+			t.Fatal("ConvergeEscalationObservation accepted a failed persisted update")
+		}
+		if got := ParseEscalationFields(readEscalationBDState(t, statePath).Description); got.MaterialGeneration != 1 {
+			t.Fatalf("failed update changed persisted generation to %d", got.MaterialGeneration)
+		}
+	})
+
+	t.Run("stale and failed recipient completion", func(t *testing.T) {
+		b, statePath := newEscalationBDHarness(t)
+		seedEscalationBDState(t, statePath, &EscalationFields{
+			Severity: "high", Scope: "town", Fingerprint: fingerprint,
+			MaterialState: "severity=high|scope=town", MaterialGeneration: 2,
+			PendingRecipients: []string{"mayor/", "overseer"},
+		})
+		if err := b.CompleteEscalationRecipient("hq-escalation-test", fingerprint, 1, "mayor/"); !errors.Is(err, ErrAgentFieldsChanged) {
+			t.Fatalf("stale completion error = %v, want ErrAgentFieldsChanged", err)
+		}
+		t.Setenv("GT_ESCALATION_BD_FAIL", "update")
+		if err := b.CompleteEscalationRecipient("hq-escalation-test", fingerprint, 2, "mayor/"); err == nil {
+			t.Fatal("recipient completion accepted a failed persisted update")
+		}
+		got := ParseEscalationFields(readEscalationBDState(t, statePath).Description)
+		if !reflect.DeepEqual(got.PendingRecipients, []string{"mayor/", "overseer"}) {
+			t.Fatalf("failed completion changed pending recipients to %#v", got.PendingRecipients)
+		}
+	})
+}
+
+func TestEscalationBDHelperProcess(t *testing.T) {
+	statePath := os.Getenv("GT_ESCALATION_BD_STATE")
+	if statePath == "" {
+		return
+	}
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) > 0 {
+		args = args[1:]
+	}
+	command := ""
+	for _, arg := range args {
+		switch arg {
+		case "list", "create", "update", "show":
+			command = arg
+		}
+	}
+	if command == "" {
+		_, _ = os.Stdout.WriteString("--allow-stale\n")
+		os.Exit(0)
+	}
+
+	readState := func() *Issue {
+		data, err := os.ReadFile(statePath)
+		if err != nil {
+			return nil
+		}
+		var issue Issue
+		if json.Unmarshal(data, &issue) != nil {
+			return nil
+		}
+		return &issue
+	}
+	writeState := func(issue *Issue) {
+		data, _ := json.Marshal(issue)
+		tmp := statePath + ".tmp"
+		_ = os.WriteFile(tmp, data, 0600)
+		_ = os.Rename(tmp, statePath)
+	}
+	writeJSON := func(value any) {
+		_ = json.NewEncoder(os.Stdout).Encode(value)
+	}
+	flagValue := func(prefix string) string {
+		for _, arg := range args {
+			if strings.HasPrefix(arg, prefix) {
+				return strings.TrimPrefix(arg, prefix)
+			}
+		}
+		return ""
+	}
+
+	switch command {
+	case "list":
+		if issue := readState(); issue != nil {
+			writeJSON([]*Issue{issue})
+		} else {
+			writeJSON([]*Issue{})
+		}
+	case "create":
+		if readState() != nil {
+			_, _ = os.Stderr.WriteString("duplicate escalation\n")
+			os.Exit(1)
+		}
+		description, _ := io.ReadAll(os.Stdin)
+		issue := &Issue{
+			ID: "hq-escalation-test", Title: flagValue("--title="),
+			Description: string(description), Status: "open", Type: "task", Ephemeral: true,
+			Labels: []string{"gt:escalation"},
+		}
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "--labels=") {
+				issue.Labels = append(issue.Labels, strings.TrimPrefix(arg, "--labels="))
+			}
+		}
+		writeState(issue)
+		writeJSON(issue)
+	case "show":
+		issue := readState()
+		if issue == nil {
+			_, _ = os.Stderr.WriteString("not found\n")
+			os.Exit(1)
+		}
+		writeJSON([]*Issue{issue})
+	case "update":
+		if os.Getenv("GT_ESCALATION_BD_FAIL") == "update" {
+			_, _ = os.Stderr.WriteString("injected update failure\n")
+			os.Exit(1)
+		}
+		issue := readState()
+		if issue == nil {
+			os.Exit(1)
+		}
+		if title := flagValue("--title="); title != "" {
+			issue.Title = title
+		}
+		for _, arg := range args {
+			switch {
+			case arg == "--body-file=-":
+				description, _ := io.ReadAll(os.Stdin)
+				issue.Description = string(description)
+			case strings.HasPrefix(arg, "--add-label="):
+				issue.Labels = append(issue.Labels, strings.TrimPrefix(arg, "--add-label="))
+			case strings.HasPrefix(arg, "--remove-label="):
+				remove := strings.TrimPrefix(arg, "--remove-label=")
+				kept := issue.Labels[:0]
+				for _, label := range issue.Labels {
+					if label != remove {
+						kept = append(kept, label)
+					}
+				}
+				issue.Labels = kept
+			}
+		}
+		writeState(issue)
+		writeJSON(issue)
+	}
+	os.Exit(0)
+}
+
+func newEscalationBDHarness(t *testing.T) (*Beads, string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	stubPath := filepath.Join(dir, "bd")
+	stub := "#!/bin/sh\nexec \"" + os.Args[0] + "\" -test.run=TestEscalationBDHelperProcess -- \"$@\"\n"
+	if err := os.WriteFile(stubPath, []byte(stub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_ESCALATION_BD_STATE", statePath)
+	ResetBdAllowStaleCacheForTest()
+	b := New(t.TempDir())
+	b.noRoute = true
+	return b, statePath
+}
+
+func seedEscalationBDState(t *testing.T, statePath string, fields *EscalationFields) {
+	t.Helper()
+	issue := &Issue{
+		ID: "hq-escalation-test", Title: "Dolt latency",
+		Description: FormatEscalationDescription("Dolt latency", fields),
+		Status:      "open", Type: "task", Ephemeral: true,
+		Labels: []string{"gt:escalation", fields.Fingerprint, "severity:" + fields.Severity},
+	}
+	data, err := json.Marshal(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readEscalationBDState(t *testing.T, statePath string) *Issue {
+	t.Helper()
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var issue Issue
+	if err := json.Unmarshal(data, &issue); err != nil {
+		t.Fatal(err)
+	}
+	return &issue
 }
 
 func TestFilterEscalationRecordsSkipsMailMessages(t *testing.T) {
