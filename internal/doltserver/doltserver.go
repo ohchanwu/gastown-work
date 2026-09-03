@@ -2998,10 +2998,10 @@ func WithStoppedDoltForDatabaseMove(townRoot string, operation func() error) err
 			if state != nil && !state.StartedAt.IsZero() && time.Since(state.StartedAt) < minStableAge {
 				return fmt.Errorf("Dolt server is too new to stop safely for a database move")
 			}
-			wasRunning = true
 			if err := stopOwnedDoltServer(townRoot); err != nil {
 				return fmt.Errorf("stopping Dolt server for database move: %w", err)
 			}
+			wasRunning = true
 		}
 		return operation()
 	}()

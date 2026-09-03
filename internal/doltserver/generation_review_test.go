@@ -298,6 +298,10 @@ func TestWithStoppedDoltForDatabaseMoveStopFailurePreservesDatabase(t *testing.T
 	previousStop := stopOwnedDoltServer
 	stopOwnedDoltServer = func(string) error { return errors.New("injected stop failure") }
 	t.Cleanup(func() { stopOwnedDoltServer = previousStop })
+	initialRunning, initialPID, initialStatusErr := IsRunning(townRoot)
+	if initialStatusErr != nil || !initialRunning || initialPID <= 0 {
+		t.Fatalf("Dolt state before stop failure = running %v pid %d err %v", initialRunning, initialPID, initialStatusErr)
+	}
 	called := false
 	err = WithStoppedDoltForDatabaseMove(townRoot, func() error {
 		called = true
@@ -313,8 +317,8 @@ func TestWithStoppedDoltForDatabaseMoveStopFailurePreservesDatabase(t *testing.T
 		t.Fatal("database was removed after stop failure")
 	}
 	running, pid, statusErr := IsRunning(townRoot)
-	if statusErr != nil || !running || pid <= 0 {
-		t.Fatalf("Dolt state after stop failure = running %v pid %d err %v", running, pid, statusErr)
+	if statusErr != nil || !running || pid <= 0 || pid != initialPID {
+		t.Fatalf("Dolt state after stop failure = running %v pid %d initial %d err %v", running, pid, initialPID, statusErr)
 	}
 }
 
