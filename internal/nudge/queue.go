@@ -96,7 +96,12 @@ type ClaimedNudge struct {
 	claimPath string
 }
 
-func lockQueueDir(dir string) (func(), error) {
+var beforeQueueLock, afterQueueLock func(string)
+
+func lockQueueDir(dir, operation string) (func(), error) {
+	if beforeQueueLock != nil {
+		beforeQueueLock(operation)
+	}
 	lockDir := filepath.Join(filepath.Dir(dir), ".locks")
 	if err := os.MkdirAll(lockDir, 0700); err != nil {
 		return nil, fmt.Errorf("creating nudge queue lock dir: %w", err)
@@ -107,6 +112,9 @@ func lockQueueDir(dir string) (func(), error) {
 	queueLock := flock.New(filepath.Join(lockDir, filepath.Base(dir)+".lock"))
 	if err := queueLock.Lock(); err != nil {
 		return nil, fmt.Errorf("locking nudge queue: %w", err)
+	}
+	if afterQueueLock != nil {
+		afterQueueLock(operation)
 	}
 	return func() { _ = queueLock.Unlock() }, nil
 }
@@ -126,7 +134,7 @@ func (c *ClaimedNudge) AckSubmitted(receipt SubmissionReceipt) error {
 	if !receipt.SubmittedAt.After(c.Nudge.ClaimedAt) {
 		return fmt.Errorf("submission receipt is not newer than claim")
 	}
-	unlock, err := lockQueueDir(filepath.Dir(c.claimPath))
+	unlock, err := lockQueueDir(filepath.Dir(c.claimPath), "ack")
 	if err != nil {
 		return err
 	}
@@ -136,7 +144,7 @@ func (c *ClaimedNudge) AckSubmitted(receipt SubmissionReceipt) error {
 
 // Nack records a sanitized failure and returns the delivery to its FIFO slot.
 func (c *ClaimedNudge) Nack(errorCode string, nextAttempt time.Time) error {
-	unlock, err := lockQueueDir(filepath.Dir(c.claimPath))
+	unlock, err := lockQueueDir(filepath.Dir(c.claimPath), "nack")
 	if err != nil {
 		return err
 	}
@@ -171,7 +179,7 @@ func (c *ClaimedNudge) Nack(errorCode string, nextAttempt time.Time) error {
 // thread cleanup deliberately ignores claims so a concurrent owner cannot be
 // raced into data loss.
 func (c *ClaimedNudge) DiscardTerminal() error {
-	unlock, err := lockQueueDir(filepath.Dir(c.claimPath))
+	unlock, err := lockQueueDir(filepath.Dir(c.claimPath), "discard")
 	if err != nil {
 		return err
 	}
@@ -350,7 +358,7 @@ func EnqueueUniqueBySource(townRoot, session string, n QueuedNudge) (bool, error
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return false, fmt.Errorf("creating nudge queue dir: %w", err)
 	}
-	unlock, err := lockQueueDir(dir)
+	unlock, err := lockQueueDir(dir, "ensure")
 	if err != nil {
 		return false, err
 	}
@@ -416,7 +424,7 @@ func ClaimDue(townRoot, session string) (*ClaimedNudge, error) {
 	if err := os.Chmod(dir, 0700); err != nil {
 		return nil, fmt.Errorf("securing nudge queue: %w", err)
 	}
-	unlock, err := lockQueueDir(dir)
+	unlock, err := lockQueueDir(dir, "claim")
 	if err != nil {
 		return nil, err
 	}

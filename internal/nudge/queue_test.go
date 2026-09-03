@@ -220,76 +220,122 @@ func TestNackRejectsUnreadableOrChangedClaim(t *testing.T) {
 }
 
 func TestDurabilityPromotionSerializesWithClaimSettlement(t *testing.T) {
+	type operationResult struct {
+		operation string
+		err       error
+	}
+	waitOperation := func(t *testing.T, ch <-chan string, want string) {
+		t.Helper()
+		select {
+		case got := <-ch:
+			if got != want {
+				t.Fatalf("lock operation = %q, want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s lock boundary", want)
+		}
+	}
+	waitResult := func(t *testing.T, ch <-chan operationResult, want string) {
+		t.Helper()
+		select {
+		case result := <-ch:
+			if result.operation != want || result.err != nil {
+				t.Fatalf("%s result = %#v", want, result)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s result", want)
+		}
+	}
+
 	for _, operation := range []string{"ack", "nack", "discard"} {
-		t.Run(operation, func(t *testing.T) {
-			townRoot := t.TempDir()
-			const sessionID = "gt-test-settlement-race"
-			expiring := QueuedNudge{
-				DeliveryID: "ndg-settlement", Sender: "mayor", Message: "read the mail",
-				Priority: PriorityNormal, Kind: "mail", ThreadID: "thread-actionable",
-				SourceID: "msg-0123456789abcdef", SourceKind: SourceKindMail,
-			}
-			if err := Enqueue(townRoot, sessionID, expiring); err != nil {
-				t.Fatal(err)
-			}
-			claim, err := ClaimDue(townRoot, sessionID)
-			if err != nil || claim == nil {
-				t.Fatalf("ClaimDue = %#v, %v", claim, err)
-			}
-			unlock, err := lockQueueDir(queueDir(townRoot, sessionID))
-			if err != nil {
-				t.Fatal(err)
-			}
-			started := make(chan struct{}, 2)
-			results := make(chan error, 2)
-			durable := expiring
-			durable.DurableUntilAck = true
-			go func() {
-				started <- struct{}{}
-				_, ensureErr := EnqueueUniqueBySource(townRoot, sessionID, durable)
-				results <- ensureErr
-			}()
-			go func() {
-				started <- struct{}{}
-				var settleErr error
-				switch operation {
-				case "ack":
-					settleErr = claim.AckSubmitted(SubmissionReceipt{
-						Session: sessionID, DeliveryID: claim.Nudge.DeliveryID, Runtime: "test",
-						Submitted: true, SubmittedAt: claim.Nudge.ClaimedAt.Add(time.Second),
-					})
-				case "nack":
-					settleErr = claim.Nack("retry", time.Now())
-				case "discard":
-					settleErr = claim.DiscardTerminal()
+		for _, first := range []string{"ensure", operation} {
+			t.Run(operation+"/"+first+"-first", func(t *testing.T) {
+				townRoot := t.TempDir()
+				const sessionID = "gt-test-settlement-race"
+				expiring := QueuedNudge{
+					DeliveryID: "ndg-settlement", Sender: "mayor", Message: "read the mail",
+					Priority: PriorityNormal, Kind: "mail", ThreadID: "thread-actionable",
+					SourceID: "msg-0123456789abcdef", SourceKind: SourceKindMail,
 				}
-				results <- settleErr
-			}()
-			<-started
-			<-started
-			select {
-			case err := <-results:
-				unlock()
-				t.Fatalf("operation escaped the held queue lock: %v", err)
-			case <-time.After(50 * time.Millisecond):
-			}
-			unlock()
-			for range 2 {
-				if err := <-results; err != nil {
-					t.Fatalf("concurrent %s: %v", operation, err)
+				if err := Enqueue(townRoot, sessionID, expiring); err != nil {
+					t.Fatal(err)
 				}
-			}
-			queued, err := ListQueued(townRoot, sessionID)
-			if err != nil || len(queued) > 1 {
-				t.Fatalf("settled queue = %#v, %v", queued, err)
-			}
-			if operation == "nack" && (len(queued) != 1 || !queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero()) {
-				t.Fatalf("Nack race lost durable custody: %#v", queued)
-			}
-			if len(queued) == 1 && (!queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero()) {
-				t.Fatalf("settlement race retained an expiring record: %#v", queued)
-			}
-		})
+				claim, err := ClaimDue(townRoot, sessionID)
+				if err != nil || claim == nil {
+					t.Fatalf("ClaimDue = %#v, %v", claim, err)
+				}
+				before := make(chan string)
+				after := make(chan string)
+				releases := map[string]chan struct{}{
+					"ensure":  make(chan struct{}),
+					operation: make(chan struct{}),
+				}
+				previousBefore, previousAfter := beforeQueueLock, afterQueueLock
+				beforeQueueLock = func(current string) {
+					if current == "ensure" || current == operation {
+						before <- current
+					}
+				}
+				afterQueueLock = func(current string) {
+					if current == "ensure" || current == operation {
+						after <- current
+						<-releases[current]
+					}
+				}
+				defer func() {
+					beforeQueueLock, afterQueueLock = previousBefore, previousAfter
+				}()
+
+				results := make(chan operationResult, 2)
+				durable := expiring
+				durable.DurableUntilAck = true
+				run := func(current string) {
+					if current == "ensure" {
+						_, ensureErr := EnqueueUniqueBySource(townRoot, sessionID, durable)
+						results <- operationResult{operation: current, err: ensureErr}
+						return
+					}
+					var settleErr error
+					switch current {
+					case "ack":
+						settleErr = claim.AckSubmitted(SubmissionReceipt{
+							Session: sessionID, DeliveryID: claim.Nudge.DeliveryID, Runtime: "test",
+							Submitted: true, SubmittedAt: claim.Nudge.ClaimedAt.Add(time.Second),
+						})
+					case "nack":
+						settleErr = claim.Nack("retry", time.Now())
+					case "discard":
+						settleErr = claim.DiscardTerminal()
+					}
+					results <- operationResult{operation: current, err: settleErr}
+				}
+				second := operation
+				if first == operation {
+					second = "ensure"
+				}
+				go run(first)
+				waitOperation(t, before, first)
+				waitOperation(t, after, first)
+				go run(second)
+				waitOperation(t, before, second)
+				close(releases[first])
+				waitResult(t, results, first)
+				waitOperation(t, after, second)
+				close(releases[second])
+				waitResult(t, results, second)
+
+				queued, err := ListQueued(townRoot, sessionID)
+				if err != nil || len(queued) > 1 {
+					t.Fatalf("settled queue = %#v, %v", queued, err)
+				}
+				if operation == "nack" && (len(queued) != 1 || !queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero()) {
+					t.Fatalf("Nack race lost durable custody: %#v", queued)
+				}
+				if len(queued) == 1 && (!queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero()) {
+					t.Fatalf("settlement race retained an expiring record: %#v", queued)
+				}
+			})
+		}
 	}
 }
 
