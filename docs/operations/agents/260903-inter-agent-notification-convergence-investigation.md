@@ -672,8 +672,11 @@ and before it injects a prompt.
    not create reminders; exact reply or mail-work completion clears them.
 8. Keep generic manual escalation behavior, but separate the stable incident
    fingerprint from the material-state key for recurring Deacon, dog, and
-   cross-rig producers. Reuse one open canonical record, notify once for each
-   state transition, and create a new occurrence only after closure.
+   cross-rig producers. Creation and every material transition atomically store
+   the generation plus its normalized pending-recipient set. Every later
+   observation idempotently ensures deterministic per-generation mail before
+   clearing pending delivery. Reuse one open canonical record, notify once for
+   each state transition, and create a new occurrence only after closure.
 9. Add minimal typed Witness review labels for lineage, generation, exact SHA,
    and verdict. A verdict must be an exact reply to its request. Only the
    highest unambiguous generation in one lineage is binding; conflicting
@@ -719,8 +722,9 @@ schema migration:
 - Existing standalone nudges and manual unfingerprinted escalations retain
   their current semantics.
 - The new mail-send JSON result, source-bound nudge flag, escalation scope,
-  material-state key, and material generation are additive. Older senders omit
-  them; new readers fail open rather than infer them.
+  material-state key, material generation, and pending-recipient fields are
+  additive. Older senders omit them; new readers fail open rather than infer
+  them.
 - Exact terminal claim removal requires a held lease plus a source-ID match;
   it cannot delete an unrelated record.
 - No existing mail, verdict, escalation, receipt, or queue record is rewritten
@@ -844,23 +848,33 @@ residue, and commits locally without pushing.
   severity plus scope. Routing derived from severity is therefore part of
   material state without hashing volatile prose. A positive material generation
   increments only after a state-key change; transition mail is keyed by
-  escalation ID, generation, and recipient.
+  escalation ID, generation, and recipient. The same atomic create or state CAS
+  stores the normalized recipient set as pending for that generation.
 - **RED:** add one fixture with twenty identical observations, one severity
   transition, one affected-scope transition, closure, and recurrence. Add a
-  concurrent identical-transition case. Assert one canonical open bead, one
-  initial wake, exactly one wake per material transition, and one new
-  occurrence/wake after closure.
+  concurrent identical-transition case. Inject failures after the generation
+  CAS but before mail persistence, after mail persistence but before pending
+  completion, and during a concurrent retry in each window. Assert one
+  canonical open bead, one initial wake, exactly one wake per material
+  transition, and one new occurrence/wake after closure.
 - **GREEN:** on a matching open fingerprint, compare the stored material-state
   key. For an identical state, compare-and-update only the same bead's latest
-  observation fields and suppress mail/wake. For a changed state, atomically
-  update the same bead's severity, scope, title/reason/source, state key, and
-  incremented generation. Then ensure one same-thread transition mail/wake per
-  generation and recipient; a retry finds the durable transition mail instead
-  of creating another, and a CAS loser re-reads the winning generation. Exclude
-  closed occurrences from open matching so a later recurrence creates a new
-  bead. Multiple open matches or lookup/update failure return an error and send
-  nothing. Require recurring machine producers to supply the stable fingerprint
-  and explicit scope.
+  observation fields without creating a new generation. For a changed state,
+  atomically update the same bead's severity, scope, title/reason/source, state
+  key, and
+  incremented generation together with its pending recipients. Initial creation
+  stores generation one and its pending recipients before any mail attempt.
+  Fresh, changed, and identical observations all run the same ensure loop for
+  the current generation until every pending recipient has one durable message.
+  Derive a valid deterministic message ID from escalation ID, generation, and
+  normalized recipient; create-if-absent makes concurrent retries converge on
+  that exact record. Clear a recipient from pending only after the durable mail
+  exists. A crash after persistence therefore self-heals without another mail,
+  and Task B retains runtime wake delivery until acceptance. A CAS loser
+  re-reads and ensures the winning generation. Exclude closed occurrences from
+  open matching so a later recurrence creates a new bead. Multiple open matches
+  or lookup/update failure return an error and send nothing. Require recurring
+  machine producers to supply the stable fingerprint and explicit scope.
 - **Verify:** escalation/Reaper/formula/cmd normal and race tests plus embedded
   formula validation.
 - **Residue:** one open recurrence fixture incident and no duplicate or orphaned
