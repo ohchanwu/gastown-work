@@ -325,11 +325,12 @@ func TestDurabilityPromotionSerializesWithClaimSettlement(t *testing.T) {
 				waitResult(t, results, second)
 
 				queued, err := ListQueued(townRoot, sessionID)
-				if err != nil || len(queued) > 1 {
-					t.Fatalf("settled queue = %#v, %v", queued, err)
+				wantCount := 1
+				if operation != "nack" && first == "ensure" {
+					wantCount = 0
 				}
-				if operation == "nack" && (len(queued) != 1 || !queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero()) {
-					t.Fatalf("Nack race lost durable custody: %#v", queued)
+				if err != nil || len(queued) != wantCount {
+					t.Fatalf("settled queue = %#v, %v; want %d records", queued, err, wantCount)
 				}
 				if len(queued) == 1 && (!queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero()) {
 					t.Fatalf("settlement race retained an expiring record: %#v", queued)
