@@ -559,13 +559,36 @@ printf '%s\n' '[{"id":"hq-source","title":"source","assignee":"gastown/witness",
 	if err := os.WriteFile(failurePath, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, result, err = deliverDirectNudge(nil, townRoot, sessionID, "payload", queued, opts)
-	if err != nil || result != nudgeDeliveryQueued {
-		t.Fatalf("unknown delivery = %q, %v; want retained queue", result, err)
-	}
-	pending, err := nudge.ListQueued(townRoot, sessionID)
-	if err != nil || len(pending) != 1 || !pending[0].DurableUntilAck {
-		t.Fatalf("retained queue = %#v, %v", pending, err)
+	for _, claimed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "queued", true: "claimed"}[claimed], func(t *testing.T) {
+			unknownSession := sessionID + map[bool]string{false: "-queued", true: "-claimed"}[claimed]
+			existing := queued
+			existing.DeliveryID = "ndg-expiring-source"
+			if err := nudge.Enqueue(townRoot, unknownSession, existing); err != nil {
+				t.Fatal(err)
+			}
+			var claim *nudge.ClaimedNudge
+			if claimed {
+				var err error
+				claim, err = nudge.ClaimDue(townRoot, unknownSession)
+				if err != nil || claim == nil {
+					t.Fatalf("ClaimDue = %#v, %v", claim, err)
+				}
+			}
+			_, result, err := deliverDirectNudge(nil, townRoot, unknownSession, "payload", queued, opts)
+			if err != nil || result != nudgeDeliveryQueued {
+				t.Fatalf("unknown delivery = %q, %v; want retained queue", result, err)
+			}
+			if claim != nil {
+				if err := claim.Nack("retry", time.Now()); err != nil {
+					t.Fatalf("Nack retained source: %v", err)
+				}
+			}
+			pending, err := nudge.ListQueued(townRoot, unknownSession)
+			if err != nil || len(pending) != 1 || !pending[0].DurableUntilAck || !pending[0].ExpiresAt.IsZero() {
+				t.Fatalf("retained queue = %#v, %v", pending, err)
+			}
+		})
 	}
 }
 

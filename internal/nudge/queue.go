@@ -149,10 +149,15 @@ func (c *ClaimedNudge) Nack(errorCode string, nextAttempt time.Time) error {
 	if err := json.Unmarshal(data, &stored); err != nil || stored.DeliveryID != c.Nudge.DeliveryID {
 		return errors.New("claimed nudge changed before retry")
 	}
-	if stored.DurableUntilAck {
-		c.Nudge.DurableUntilAck = true
-		c.Nudge.ExpiresAt = time.Time{}
+	expected := stored
+	if stored.DurableUntilAck && !c.Nudge.DurableUntilAck && stored.ExpiresAt.IsZero() {
+		expected.DurableUntilAck = false
+		expected.ExpiresAt = c.Nudge.ExpiresAt
 	}
+	if !sameQueuedNudge(expected, c.Nudge) {
+		return errors.New("claimed nudge changed before retry")
+	}
+	c.Nudge = stored
 	c.Nudge.ClaimedAt = time.Time{}
 	c.Nudge.NextAttempt = nextAttempt
 	c.Nudge.LastErrorCode = sanitizeErrorCode(errorCode)
@@ -216,6 +221,12 @@ func sanitizeErrorCode(value string) string {
 		return "unknown"
 	}
 	return result
+}
+
+func sameQueuedNudge(left, right QueuedNudge) bool {
+	leftJSON, _ := json.Marshal(left)
+	rightJSON, _ := json.Marshal(right)
+	return string(leftJSON) == string(rightJSON)
 }
 
 // queueDir returns the nudge queue directory for a given session.

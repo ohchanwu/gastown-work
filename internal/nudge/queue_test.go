@@ -148,6 +148,151 @@ func TestEnqueueUniqueBySourceUpgradesExpiringMatch(t *testing.T) {
 	}
 }
 
+func TestNackRejectsUnreadableOrChangedClaim(t *testing.T) {
+	newClaim := func(t *testing.T, durable bool) *ClaimedNudge {
+		t.Helper()
+		townRoot := t.TempDir()
+		queued := QueuedNudge{
+			DeliveryID: "ndg-claim-state", Sender: "mayor", Message: "read the mail",
+			Priority: PriorityNormal, Kind: "mail", ThreadID: "thread-actionable",
+			SourceID: "msg-0123456789abcdef", SourceKind: SourceKindMail,
+			DurableUntilAck: durable,
+		}
+		if err := Enqueue(townRoot, "gt-test-claim-state", queued); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := ClaimDue(townRoot, "gt-test-claim-state")
+		if err != nil || claim == nil {
+			t.Fatalf("ClaimDue = %#v, %v", claim, err)
+		}
+		return claim
+	}
+
+	t.Run("unreadable", func(t *testing.T) {
+		claim := newClaim(t, false)
+		previousRead := readQueueRecord
+		readQueueRecord = func(path string) ([]byte, error) {
+			if path == claim.claimPath {
+				return nil, os.ErrPermission
+			}
+			return previousRead(path)
+		}
+		defer func() { readQueueRecord = previousRead }()
+		if err := claim.Nack("retry", time.Now()); err == nil {
+			t.Fatal("Nack accepted an unreadable claim")
+		}
+		if _, err := os.Stat(claim.claimPath); err != nil {
+			t.Fatalf("unreadable claim was not preserved: %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name    string
+		durable bool
+		mutate  func(*QueuedNudge)
+	}{
+		{name: "source changed", mutate: func(n *QueuedNudge) { n.SourceID = "msg-fedcba9876543210" }},
+		{name: "durability cleared", durable: true, mutate: func(n *QueuedNudge) {
+			n.DurableUntilAck = false
+			n.ExpiresAt = time.Now().Add(DefaultNormalTTL)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claim := newClaim(t, test.durable)
+			changed := claim.Nudge
+			test.mutate(&changed)
+			if err := writeQueueRecord(claim.claimPath, changed); err != nil {
+				t.Fatal(err)
+			}
+			if err := claim.Nack("retry", time.Now()); err == nil {
+				t.Fatal("Nack accepted a changed claim with the same delivery ID")
+			}
+			data, err := os.ReadFile(claim.claimPath)
+			if err != nil {
+				t.Fatalf("changed claim was not preserved: %v", err)
+			}
+			var stored QueuedNudge
+			if err := json.Unmarshal(data, &stored); err != nil || stored.SourceID != changed.SourceID || stored.DurableUntilAck != changed.DurableUntilAck {
+				t.Fatalf("changed claim was overwritten: %#v, %v", stored, err)
+			}
+		})
+	}
+}
+
+func TestDurabilityPromotionSerializesWithClaimSettlement(t *testing.T) {
+	for _, operation := range []string{"ack", "nack", "discard"} {
+		t.Run(operation, func(t *testing.T) {
+			townRoot := t.TempDir()
+			const sessionID = "gt-test-settlement-race"
+			expiring := QueuedNudge{
+				DeliveryID: "ndg-settlement", Sender: "mayor", Message: "read the mail",
+				Priority: PriorityNormal, Kind: "mail", ThreadID: "thread-actionable",
+				SourceID: "msg-0123456789abcdef", SourceKind: SourceKindMail,
+			}
+			if err := Enqueue(townRoot, sessionID, expiring); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := ClaimDue(townRoot, sessionID)
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimDue = %#v, %v", claim, err)
+			}
+			unlock, err := lockQueueDir(queueDir(townRoot, sessionID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := make(chan struct{}, 2)
+			results := make(chan error, 2)
+			durable := expiring
+			durable.DurableUntilAck = true
+			go func() {
+				started <- struct{}{}
+				_, ensureErr := EnqueueUniqueBySource(townRoot, sessionID, durable)
+				results <- ensureErr
+			}()
+			go func() {
+				started <- struct{}{}
+				var settleErr error
+				switch operation {
+				case "ack":
+					settleErr = claim.AckSubmitted(SubmissionReceipt{
+						Session: sessionID, DeliveryID: claim.Nudge.DeliveryID, Runtime: "test",
+						Submitted: true, SubmittedAt: claim.Nudge.ClaimedAt.Add(time.Second),
+					})
+				case "nack":
+					settleErr = claim.Nack("retry", time.Now())
+				case "discard":
+					settleErr = claim.DiscardTerminal()
+				}
+				results <- settleErr
+			}()
+			<-started
+			<-started
+			select {
+			case err := <-results:
+				unlock()
+				t.Fatalf("operation escaped the held queue lock: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			unlock()
+			for range 2 {
+				if err := <-results; err != nil {
+					t.Fatalf("concurrent %s: %v", operation, err)
+				}
+			}
+			queued, err := ListQueued(townRoot, sessionID)
+			if err != nil || len(queued) > 1 {
+				t.Fatalf("settled queue = %#v, %v", queued, err)
+			}
+			if operation == "nack" && (len(queued) != 1 || !queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero()) {
+				t.Fatalf("Nack race lost durable custody: %#v", queued)
+			}
+			if len(queued) == 1 && (!queued[0].DurableUntilAck || !queued[0].ExpiresAt.IsZero()) {
+				t.Fatalf("settlement race retained an expiring record: %#v", queued)
+			}
+		})
+	}
+}
+
 func TestQueuedNudgeSourceJSONCompatibility(t *testing.T) {
 	var legacy QueuedNudge
 	if err := json.Unmarshal([]byte(`{"sender":"mayor","message":"legacy","priority":"normal"}`), &legacy); err != nil {
