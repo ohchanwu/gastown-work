@@ -68,6 +68,13 @@ root hashes alone are never sufficient to start a new destructive cleanup; an
 older cleanup receipt may be upgraded only after its target has already been
 atomically claimed or removed.
 
+Destructive database cleanup is offline-only. While the Dolt server is running,
+cleanup may inventory targets with `--dry-run`, but removal fails before writing
+a receipt or issuing SQL. Once the server is stopped, cleanup records the exact
+incarnation, atomically renames that directory into its private claim path,
+revalidates ownership, and deletes only the claimed directory. This avoids the
+unrecoverable race between a live identity check and unconditional `DROP DATABASE`.
+
 ## Environment Variables
 
 gt and bd use separate env vars for Dolt connection. gt automatically

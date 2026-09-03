@@ -1360,6 +1360,15 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
+	if !doltCleanupDry {
+		running, _, err := doltserver.IsRunning(townRoot)
+		if err != nil {
+			return fmt.Errorf("checking Dolt server before cleanup: %w", err)
+		}
+		if running {
+			return fmt.Errorf("destructive database cleanup requires a stopped Dolt server; run 'gt dolt stop', retry 'gt dolt cleanup', then run 'gt dolt start'")
+		}
+	}
 	pending, err := doltserver.PendingDatabaseCleanupNames(townRoot)
 	if err != nil {
 		return fmt.Errorf("finding pending database cleanups: %w", err)
@@ -1422,69 +1431,17 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// BALK: If there are too many orphans, SQL-based cleanup will take hours
-	// because each DROP DATABASE is a separate query against an overloaded server.
-	// Force the user to stop the server and clean the filesystem directly.
-	// (Clown Show #18: 245 orphans at 27s latency = ~2 hour cleanup)
-	const maxSQLCleanup = 50
-	if len(orphans) > maxSQLCleanup {
-		fmt.Printf("\n%s Too many orphans (%d) for SQL-based cleanup (max %d).\n",
-			style.Bold.Render("!"), len(orphans), maxSQLCleanup)
-		fmt.Printf("  The server is likely overloaded. SQL cleanup would take hours.\n\n")
-		fmt.Printf("  Instead, stop the server and clean the filesystem:\n\n")
-		fmt.Printf("    gt dolt stop\n")
-		fmt.Printf("    cd %s/.dolt-data && rm -rf testdb_* beads_t* beads_pt* beads_vr* doctest_* doctortest_*\n", townRoot)
-		fmt.Printf("    gt dolt start\n\n")
-		fmt.Printf("  This is safe — orphan databases have no production data.\n")
-		return fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans))
-	}
-
 	fmt.Println()
 	removed := 0
 	var cleanupErr error
 	for _, o := range orphans {
-		serverWasRunning, _, _ := doltserver.IsRunning(townRoot)
 		if err := doltserver.RemoveDatabase(townRoot, o.Name, doltCleanupForce); err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("removing database %s: %w", o.Name, err))
-			// If DROP caused read-only, stop immediately and recover (gt-r1cyd)
-			if doltserver.IsReadOnlyError(err.Error()) {
-				fmt.Printf("  %s DROP put server into read-only mode — attempting recovery...\n", style.Bold.Render("!"))
-				if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr != nil {
-					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("recovering read-only server: %w", recoverErr))
-					fmt.Printf("  %s Recovery failed: %v\n", style.Bold.Render("✗"), recoverErr)
-					fmt.Printf("  Run: gt dolt stop && gt dolt start\n")
-				} else {
-					fmt.Printf("  %s Server recovered from read-only state\n", style.Bold.Render("✓"))
-				}
-				break
-			}
 			fmt.Printf("  %s Failed to remove %s: %v\n", style.Bold.Render("✗"), o.Name, err)
 			continue
 		}
 		fmt.Printf("  %s Removed %s\n", style.Bold.Render("✓"), o.Name)
 		removed++
-
-		if !serverWasRunning {
-			continue
-		}
-
-		// Health check after each DROP to catch read-only early (gt-r1cyd)
-		readOnly, probeErr := doltserver.CheckReadOnly(townRoot)
-		if probeErr != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("verifying server writability after removing %s: %w", o.Name, probeErr))
-			fmt.Printf("  %s Could not verify server writability after DROP: %v\n", style.Bold.Render("✗"), probeErr)
-			break
-		}
-		if readOnly {
-			fmt.Printf("  %s Server went read-only after DROP — attempting recovery...\n", style.Bold.Render("!"))
-			if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr != nil {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("recovering read-only server: %w", recoverErr))
-				fmt.Printf("  %s Recovery failed: %v\n", style.Bold.Render("✗"), recoverErr)
-				fmt.Printf("  Run: gt dolt stop && gt dolt start\n")
-				break
-			}
-			fmt.Printf("  %s Server recovered — continuing cleanup\n", style.Bold.Render("✓"))
-		}
 	}
 
 	marker := "✓"

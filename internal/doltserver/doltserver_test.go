@@ -5468,119 +5468,7 @@ func TestCheckReadOnlyReturnsListDatabasesError(t *testing.T) {
 	}
 }
 
-func TestRemoveDatabasePreservesDirectoryOnDropFailure(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
-case "$*" in
-  *"DROP DATABASE"*) printf 'transport failure\n' >&2; exit 1 ;;
-esac
-exit 0
-`)
-
-	err := RemoveDatabase(townRoot, "testdb_remove", true)
-	if err == nil || !strings.Contains(err.Error(), "dropping database") {
-		t.Fatalf("RemoveDatabase() error = %v, want DROP failure", err)
-	}
-	if _, statErr := os.Stat(dbPath); statErr != nil {
-		t.Fatalf("database directory was not preserved: %v", statErr)
-	}
-}
-
-func TestRemoveDatabasePreservesDirectoryWhenUserTableProbeFails(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
-case "$*" in
-  *"SHOW TABLES"*) printf 'inspection unavailable\n' >&2; exit 1 ;;
-  *"DROP DATABASE"*|*"DELETE FROM dolt_branch_control"*) exit 0 ;;
-esac
-exit 0
-`)
-
-	err := RemoveDatabase(townRoot, "testdb_remove", false)
-	if err == nil || !strings.Contains(err.Error(), "inspecting user tables") {
-		t.Fatalf("RemoveDatabase() error = %v, want table-inspection failure", err)
-	}
-	if _, statErr := os.Stat(dbPath); statErr != nil {
-		t.Fatalf("database directory was not preserved: %v", statErr)
-	}
-}
-
-func TestRemoveDatabaseDropFailureDoesNotDeleteBranchControl(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "branch-delete-ran")
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, fmt.Sprintf(`
-case "$*" in
-  *"DROP DATABASE"*) printf 'transport failure\n' >&2; exit 1 ;;
-  *"DELETE FROM dolt_branch_control"*) printf ran > %q; exit 0 ;;
-esac
-exit 0
-`, marker))
-
-	err := RemoveDatabase(townRoot, "testdb_remove", true)
-	if err == nil || !strings.Contains(err.Error(), "dropping database") {
-		t.Fatalf("RemoveDatabase() error = %v, want DROP failure", err)
-	}
-	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
-		t.Fatalf("branch-control deletion ran before failed DROP: %v", statErr)
-	}
-	if _, statErr := os.Stat(dbPath); statErr != nil {
-		t.Fatalf("database directory was not preserved: %v", statErr)
-	}
-}
-
-func TestRemoveDatabasePreservesDirectoryOnBranchControlFailure(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
-case "$*" in
-  *"DROP DATABASE"*) exit 0 ;;
-  *"DELETE FROM dolt_branch_control"*) printf 'permission denied\n' >&2; exit 1 ;;
-esac
-exit 0
-`)
-
-	err := RemoveDatabase(townRoot, "testdb_remove", true)
-	if err == nil || !strings.Contains(err.Error(), "branch-control") {
-		t.Fatalf("RemoveDatabase() error = %v, want branch-control failure", err)
-	}
-	if _, statErr := os.Stat(dbPath); statErr != nil {
-		t.Fatalf("database directory was not preserved: %v", statErr)
-	}
-}
-
-func TestRemoveDatabaseSelectsSurvivingDatabaseForBranchControlCleanup(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
-case "$*" in
-  *"USE "*"control_db"*"DELETE FROM dolt_branch_control"*) exit 0 ;;
-  *"DELETE FROM dolt_branch_control"*) printf 'no database selected\n' >&2; exit 1 ;;
-  *"DROP DATABASE"*) exit 0 ;;
-esac
-exit 0
-`)
-
-	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
-		t.Fatalf("RemoveDatabase() error = %v, want target-selected branch cleanup", err)
-	}
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("database directory still exists: %v", err)
-	}
-}
-
-func TestRemoveDatabaseUsesLiveCatalogForBranchControlCleanup(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
-case "$*" in
-  *"USE "*"control_db"*"DELETE FROM dolt_branch_control"*) exit 0 ;;
-  *"DELETE FROM dolt_branch_control"*) printf 'selected database is not live\n' >&2; exit 1 ;;
-  *"DROP DATABASE"*) exit 0 ;;
-esac
-exit 0
-`)
-	setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), "a_disk_only")
-
-	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
-		t.Fatalf("RemoveDatabase() error = %v, want live-catalog control database", err)
-	}
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("database directory still exists: %v", err)
-	}
-}
-
-func TestRemoveDatabaseUsesLiveCatalogAgainstIsolatedServer(t *testing.T) {
+func TestRemoveDatabaseRefusesRunningIsolatedServer(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test manages a POSIX Dolt process")
 	}
@@ -5668,18 +5556,18 @@ func TestRemoveDatabaseUsesLiveCatalogAgainstIsolatedServer(t *testing.T) {
 	if err := os.Rename(staged, filepath.Join(dataDir, "a_disk_only")); err != nil {
 		t.Fatal(err)
 	}
-	if err := RemoveDatabase(townRoot, "a_disk_only", false); err == nil || !strings.Contains(err.Error(), "not loaded") {
-		t.Fatalf("RemoveDatabase() unloaded non-force error = %v, want fail-closed refusal", err)
+	if err := RemoveDatabase(townRoot, "a_disk_only", false); err == nil || !strings.Contains(err.Error(), "stopped Dolt server") {
+		t.Fatalf("RemoveDatabase() unloaded non-force error = %v, want offline-only refusal", err)
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "a_disk_only", ".dolt")); err != nil {
 		t.Fatalf("non-force cleanup mutated filesystem-only database: %v", err)
 	}
 
-	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
-		t.Fatalf("RemoveDatabase() against isolated server: %v", err)
+	if err := RemoveDatabase(townRoot, "testdb_remove", true); err == nil || !strings.Contains(err.Error(), "stopped Dolt server") {
+		t.Fatalf("RemoveDatabase() loaded target error = %v, want offline-only refusal", err)
 	}
-	if _, err := os.Stat(filepath.Join(dataDir, "testdb_remove")); !os.IsNotExist(err) {
-		t.Fatalf("target directory still exists: %v", err)
+	if _, err := os.Stat(filepath.Join(dataDir, "testdb_remove", ".dolt")); err != nil {
+		t.Fatalf("loaded target was mutated: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "a_disk_only", ".dolt")); err != nil {
 		t.Fatalf("filesystem-only database was mutated: %v", err)
@@ -5691,65 +5579,21 @@ func TestRemoveDatabaseUsesLiveCatalogAgainstIsolatedServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slicesContain(live, "testdb_remove") || slicesContain(live, "a_disk_only") || !slicesContain(live, "beads_global") {
-		t.Fatalf("live databases = %v, want only protected control database", live)
-	}
-}
-
-func TestRemoveDatabaseResumesAfterPostDropBranchControlFailure(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "branch-delete-attempted")
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
-case "$*" in
-  *"DROP DATABASE"*) mv "$REMOVE_DB_PATH" "$REMOVE_DB_PATH.dropped"; exit 0 ;;
-  *"DELETE FROM dolt_branch_control"*)
-    if [ ! -f "$BRANCH_MARKER" ]; then
-      : > "$BRANCH_MARKER"
-	  printf '{"rows":[{"Database":"control_db"}]}\n' > "$GT_TEST_SHOW_DATABASES_FILE"
-      printf 'temporary branch-control failure\n' >&2
-      exit 1
-    fi
-    exit 0 ;;
-esac
-exit 0
-`)
-	t.Setenv("BRANCH_MARKER", marker)
-	t.Setenv("REMOVE_DB_PATH", dbPath)
-	catalogFile := filepath.Join(t.TempDir(), "show-databases.json")
-	if err := os.WriteFile(catalogFile, []byte("{\"rows\":[{\"Database\":\"testdb_remove\"},{\"Database\":\"control_db\"}]}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GT_TEST_SHOW_DATABASES_FILE", catalogFile)
-	receiptPath := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "testdb_remove.json")
-
-	err := RemoveDatabase(townRoot, "testdb_remove", true)
-	if err == nil || !strings.Contains(err.Error(), "branch-control") {
-		t.Fatalf("first RemoveDatabase() error = %v, want branch-control failure", err)
-	}
-	if _, err := os.Stat(receiptPath); err != nil {
-		t.Fatalf("durable cleanup receipt missing after committed DROP: %v", err)
-	}
-	info, err := os.Stat(receiptPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("cleanup receipt mode = %v, want 0600", info.Mode().Perm())
-	}
-
-	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
-		t.Fatalf("resumed RemoveDatabase() error = %v", err)
-	}
-	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
-		t.Fatalf("cleanup receipt still exists after successful resume: %v", err)
+	if !slicesContain(live, "testdb_remove") || slicesContain(live, "a_disk_only") || !slicesContain(live, "beads_global") {
+		t.Fatalf("live databases = %v, want loaded target and protected control database", live)
 	}
 }
 
 func TestRemoveDatabaseResumesPreparedClaim(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	receiptPath := databaseCleanupReceiptPath(townRoot, "testdb_remove")
+	incarnation, err := databaseCleanupIncarnation(townRoot, "testdb_remove", dbPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	receipt := databaseCleanupReceipt{
 		Version: databaseCleanupReceiptVersion, Database: "testdb_remove", Force: true,
-		Phase: databaseCleanupPrepared, Incarnation: "dolt-root:0123456789abcdefghijklmnopqrstuv/manifest-sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+		Phase: databaseCleanupPrepared, Incarnation: incarnation,
 	}
 	if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
 		t.Fatal(err)
@@ -5771,36 +5615,8 @@ func TestRemoveDatabaseResumesPreparedClaim(t *testing.T) {
 	}
 }
 
-func TestRemoveDatabasePreservesPreparedClaimWithoutControlDatabase(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
-	receiptPath := databaseCleanupReceiptPath(townRoot, "testdb_remove")
-	receipt := databaseCleanupReceipt{
-		Version: databaseCleanupReceiptVersion, Database: "testdb_remove", Force: true,
-		Phase: databaseCleanupPrepared, Incarnation: "dolt-root:0123456789abcdefghijklmnopqrstuv/manifest-sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-	}
-	if err := writeDatabaseCleanupReceipt(receiptPath, receipt); err != nil {
-		t.Fatal(err)
-	}
-	claimedPath, err := claimDatabaseCleanupDirectory(townRoot, "testdb_remove", dbPath, receipt.Incarnation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GT_TEST_SHOW_DATABASES_JSON", `{"rows":[]}`)
-
-	err = RemoveDatabase(townRoot, "testdb_remove", true)
-	if err == nil || !strings.Contains(err.Error(), "no surviving live database") {
-		t.Fatalf("RemoveDatabase() error = %v, want missing control database", err)
-	}
-	if _, err := os.Stat(receiptPath); err != nil {
-		t.Fatalf("prepared receipt was cleared after directory claim: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(claimedPath, ".dolt")); err != nil {
-		t.Fatalf("claimed database was lost: %v", err)
-	}
-}
-
 func TestEnsureDatabaseCleanupTargetValidatesExistingClaim(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	want := "dolt-root:0123456789abcdefghijklmnopqrstuv/manifest-sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 	claimedPath, err := claimDatabaseCleanupDirectory(townRoot, "testdb_remove", dbPath, want)
 	if err != nil {
@@ -5817,7 +5633,7 @@ func TestEnsureDatabaseCleanupTargetValidatesExistingClaim(t *testing.T) {
 }
 
 func TestRemoveDatabaseQuarantinesReferencedPendingReceipt(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	receiptPath := databaseCleanupReceiptPath(townRoot, "testdb_remove")
 	receipt := databaseCleanupReceipt{
 		Version: databaseCleanupReceiptVersion, Database: "testdb_remove", Force: true,
@@ -5850,7 +5666,7 @@ func TestRemoveDatabaseQuarantinesReferencedPendingReceipt(t *testing.T) {
 }
 
 func TestRemoveDatabaseIfCreationTokenRemovesReferencedIncompleteRig(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	token := "add-generation"
 	if err := os.WriteFile(filepath.Join(dbPath, databaseCreationOwnerFile), []byte(token+"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -5871,7 +5687,7 @@ func TestRemoveDatabaseIfCreationTokenRemovesReferencedIncompleteRig(t *testing.
 }
 
 func TestRemoveDatabaseIfRootIncarnationPreservesUnprovenLegacyRig(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -5888,7 +5704,7 @@ func TestRemoveDatabaseIfRootIncarnationPreservesUnprovenLegacyRig(t *testing.T)
 }
 
 func TestRemoveDatabaseIfRootIncarnationPreservesReplacement(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", "dolt-root:replacement", true); !errors.Is(err, ErrLegacyDatabaseIdentityUnproven) {
 		t.Fatalf("replacement root error = %v", err)
 	}
@@ -5898,7 +5714,7 @@ func TestRemoveDatabaseIfRootIncarnationPreservesReplacement(t *testing.T) {
 }
 
 func TestRemoveDatabaseIfRootIncarnationUpgradesClaimedVersionThreeReceipt(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	t.Setenv("GT_DOLT_PORT", "1")
 	incarnation, err := databaseCleanupIncarnation(townRoot, "testdb_remove", dbPath, false)
 	if err != nil {
@@ -5931,12 +5747,14 @@ func TestRemoveDatabaseIfRootIncarnationUpgradesClaimedVersionThreeReceipt(t *te
 	}
 }
 
-func TestRemoveDatabaseIfRootIncarnationRejectsLiveVersionFourLegacyReceipt(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
-	incarnation, err := databaseCleanupIncarnation(townRoot, "testdb_remove", dbPath, true)
+func TestRemoveDatabaseIfRootIncarnationRejectsUnclaimedVersionFourLegacyReceipt(t *testing.T) {
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
+	manifest, err := os.ReadFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	state := sha256.Sum256(manifest)
+	incarnation := fmt.Sprintf("dolt-root:0123456789abcdefghijklmnopqrstuv/manifest-sha256:%x", state[:])
 	root := databaseCleanupRootIdentity(incarnation)
 	receipt := databaseCleanupReceipt{
 		Version: databaseCleanupReceiptVersion, Database: "testdb_remove", Force: true,
@@ -5946,15 +5764,15 @@ func TestRemoveDatabaseIfRootIncarnationRejectsLiveVersionFourLegacyReceipt(t *t
 		t.Fatal(err)
 	}
 	if err := RemoveDatabaseIfRootIncarnation(townRoot, "testdb_remove", root, true); !errors.Is(err, ErrLegacyDatabaseIdentityUnproven) {
-		t.Fatalf("live legacy receipt error = %v, want unproven identity", err)
+		t.Fatalf("unclaimed legacy receipt error = %v, want unproven identity", err)
 	}
 	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
-		t.Fatalf("live legacy database was mutated: %v", err)
+		t.Fatalf("unclaimed legacy database was mutated: %v", err)
 	}
 }
 
 func TestMigrateLegacyDatabaseCreationReleasePreservesReplacement(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	err := MigrateLegacyDatabaseCreationRelease(townRoot, "testdb_remove", "owner-token", "dolt-root:replacement")
 	if err == nil || !strings.Contains(err.Error(), "legacy root identity") {
 		t.Fatalf("replacement root error = %v", err)
@@ -5968,7 +5786,7 @@ func TestMigrateLegacyDatabaseCreationReleasePreservesReplacement(t *testing.T) 
 }
 
 func TestMigrateLegacyDatabaseCreationReleaseResumesAfterGenerationInstall(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	token := "legacy-release-retry"
 	incarnation, err := databaseCreationIncarnation(townRoot, "testdb_remove", dbPath)
 	if err != nil {
@@ -5987,7 +5805,7 @@ func TestMigrateLegacyDatabaseCreationReleaseResumesAfterGenerationInstall(t *te
 }
 
 func TestVerifyLegacyDatabaseRootAcceptsExactManifestFallback(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	manifest, err := os.ReadFile(filepath.Join(dbPath, ".dolt", "noms", "manifest"))
 	if err != nil {
 		t.Fatal(err)
@@ -6000,7 +5818,7 @@ func TestVerifyLegacyDatabaseRootAcceptsExactManifestFallback(t *testing.T) {
 }
 
 func TestDatabaseCreationTokenReleasedMigratesVersionOneReceipt(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	token := "version-one-release"
 	incarnation, err := databaseCreationIncarnation(townRoot, "testdb_remove", dbPath)
 	if err != nil {
@@ -6039,7 +5857,7 @@ func TestDatabaseCreationTokenReleasedMigratesVersionOneReceipt(t *testing.T) {
 }
 
 func TestDatabaseCreationTokenReleasedRejectsVersionTwoWithoutPrivateAnchor(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	token := "version-two-release"
 	receiptPath := databaseCreationReleaseReceiptPath(townRoot, "testdb_remove", token)
 	if err := ensurePrivateDatabaseCleanupDirectory(filepath.Dir(receiptPath)); err != nil {
@@ -6241,7 +6059,7 @@ func TestRemoveDatabasePreservesPendingCreationIntent(t *testing.T) {
 }
 
 func TestRemoveDatabaseIfCreationTokenPreservesWrongGeneration(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	if err := os.WriteFile(filepath.Join(dbPath, databaseCreationOwnerFile), []byte("current-generation\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -6254,7 +6072,7 @@ func TestRemoveDatabaseIfCreationTokenPreservesWrongGeneration(t *testing.T) {
 }
 
 func TestRemoveDatabaseIfCreationTokenRejectsReplayedGenerationFile(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	token := "replayed-file-generation"
 	generation := databaseGenerationID(token)
 	if err := installDatabaseGeneration(townRoot, "testdb_remove", dbPath, generation); err != nil {
@@ -6279,7 +6097,7 @@ func TestRemoveDatabaseIfCreationTokenRejectsReplayedGenerationFile(t *testing.T
 }
 
 func TestRemoveDatabaseCannotResumeCreationOwnedCleanupWithoutToken(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	receipt := databaseCleanupReceipt{
 		Version: databaseCleanupReceiptVersion, Database: "testdb_remove", Force: true,
 		Phase: databaseCleanupPrepared, Incarnation: "dolt-root:0123456789abcdefghijklmnopqrstuv/manifest-sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
@@ -6297,7 +6115,7 @@ func TestRemoveDatabaseCannotResumeCreationOwnedCleanupWithoutToken(t *testing.T
 }
 
 func TestReleaseDatabaseCreationTokenIsGenerationBoundAndIdempotent(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	token := "release-generation"
 	generation := databaseGenerationID(token)
 	marker := filepath.Join(dbPath, databaseCreationOwnerFile)
@@ -6334,7 +6152,7 @@ func TestReleaseDatabaseCreationTokenIsGenerationBoundAndIdempotent(t *testing.T
 }
 
 func TestRemoveDatabaseQuarantinesIncarnationMismatch(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
+	townRoot, dbPath := setupRemoveDatabaseOfflineTest(t)
 	receiptPath := databaseCleanupReceiptPath(townRoot, "testdb_remove")
 	receipt := databaseCleanupReceipt{
 		Version: databaseCleanupReceiptVersion, Database: "testdb_remove", Force: true,
@@ -6427,42 +6245,6 @@ func TestRemoveDatabaseOfflineRestoresClaimAfterOwnershipRace(t *testing.T) {
 	claimedPath := databaseCleanupClaimPath(townRoot, "testdb_remove", incarnation)
 	if _, err := os.Stat(claimedPath); !os.IsNotExist(err) {
 		t.Fatalf("claimed path still exists after restore: %v", err)
-	}
-}
-
-func TestRemoveDatabaseRunningRestoresClaimAfterOwnershipRace(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, "exit 0\n")
-	t.Setenv("GT_TEST_SHOW_DATABASES_JSON", `{"rows":[{"Database":"testdb_remove"},{"Database":"control_db"}]}`)
-	claimDir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup", "claimed")
-	oldSync := databaseCleanupDirSync
-	injected := false
-	databaseCleanupDirSync = func(f *os.File) error {
-		if f.Name() == claimDir && !injected {
-			injected = true
-			if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
-				return err
-			}
-			if err := os.WriteFile(filepath.Join(townRoot, ".beads", "metadata.json"), []byte("{\"dolt_database\":\"testdb_remove\"}\n"), 0o600); err != nil {
-				return err
-			}
-		}
-		return f.Sync()
-	}
-	t.Cleanup(func() { databaseCleanupDirSync = oldSync })
-
-	err := RemoveDatabase(townRoot, "testdb_remove", true)
-	if err == nil || !strings.Contains(err.Error(), "referenced") {
-		t.Fatalf("RemoveDatabase() error = %v, want ownership race", err)
-	}
-	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
-		t.Fatalf("database was not restored after running ownership race: %v", err)
-	}
-	claimed, err := filepath.Glob(filepath.Join(claimDir, "testdb_remove-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(claimed) != 0 {
-		t.Fatalf("claimed database remained stranded: %v", claimed)
 	}
 }
 
@@ -6841,24 +6623,7 @@ func TestWriteDatabaseCleanupReceiptReportsDirectorySyncError(t *testing.T) {
 	}
 }
 
-func TestRemoveDatabaseAllowsAlreadyAbsentCatalogEntry(t *testing.T) {
-	townRoot, dbPath := setupRemoveDatabaseSQLTest(t, `
-case "$*" in
-  *"DROP DATABASE"*) printf "Unknown database 'testdb_remove'\n" >&2; exit 1 ;;
-  *"DELETE FROM dolt_branch_control"*) exit 0 ;;
-esac
-exit 0
-`)
-
-	if err := RemoveDatabase(townRoot, "testdb_remove", true); err != nil {
-		t.Fatalf("RemoveDatabase() error = %v, want already-absent catalog entry tolerated", err)
-	}
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("database directory still exists: %v", err)
-	}
-}
-
-func setupRemoveDatabaseSQLTest(t *testing.T, behavior string) (string, string) {
+func setupRemoveDatabaseOfflineTest(t *testing.T) (string, string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses a POSIX dolt stub")
@@ -6874,32 +6639,7 @@ func setupRemoveDatabaseSQLTest(t *testing.T, behavior string) (string, string) 
 	}
 	setupDoltDB(t, filepath.Join(townRoot, ".dolt-data"), "control_db")
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	t.Setenv("GT_DOLT_PORT", strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
-
-	binDir := t.TempDir()
-	t.Setenv("GT_TEST_SHOW_DATABASES_JSON", "{\"rows\":[{\"Database\":\"testdb_remove\"},{\"Database\":\"control_db\"}]}")
-	stub := `#!/bin/sh
-case "$*" in
-  *"FROM dolt_log"*) printf '{"rows":[{"incarnation":"0123456789abcdefghijklmnopqrstuv"}]}\n'; exit 0 ;;
-  *"FROM dolt_tags"*) printf '%s\n' "$GT_TEST_DATABASE_GENERATION_JSON"; exit 0 ;;
-  *"SHOW DATABASES"*)
-    if [ -n "$GT_TEST_SHOW_DATABASES_FILE" ]; then
-      cat "$GT_TEST_SHOW_DATABASES_FILE"
-    else
-      printf '%s\n' "$GT_TEST_SHOW_DATABASES_JSON"
-    fi
-    exit 0 ;;
-esac
-` + behavior
-	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_DOLT_PORT", "1")
 
 	return townRoot, dbPath
 }
@@ -7683,6 +7423,7 @@ func TestRemoveDatabase_RemovesDirectory(t *testing.T) {
 }
 
 func TestRemoveDatabase_ErrorOnMissing(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 	dataDir := filepath.Join(townRoot, ".dolt-data")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {

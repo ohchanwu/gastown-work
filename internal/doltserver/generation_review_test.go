@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -222,5 +223,27 @@ func TestInitRigOwnedRejectsInterposedReplacementRollbackAuthority(t *testing.T)
 	}
 	if _, statErr := os.Stat(databaseGenerationAnchorPath(townRoot, dbName, databaseGenerationID(token))); !os.IsNotExist(statErr) {
 		t.Fatalf("interposed replacement received a generation anchor: %v", statErr)
+	}
+}
+
+func TestRemoveDatabaseRefusesUnconditionalLiveDrop(t *testing.T) {
+	townRoot, _ := startOwnedDatabaseTestServer(t)
+	dbName := "live_drop_refused"
+	if err := serverExecSQL(townRoot, "CREATE DATABASE `live_drop_control`; CREATE DATABASE `live_drop_refused`"); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForCatalog(townRoot, dbName); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RemoveDatabase(townRoot, dbName, true)
+	if err == nil || !strings.Contains(err.Error(), "stopped Dolt server") {
+		t.Fatalf("live cleanup error = %v, want offline-only refusal", err)
+	}
+	if !DatabaseExists(townRoot, dbName) {
+		t.Fatal("live cleanup removed a database without atomic identity-bound DROP")
+	}
+	if _, err := os.Stat(databaseCleanupReceiptPath(townRoot, dbName)); !os.IsNotExist(err) {
+		t.Fatalf("live refusal left a destructive cleanup receipt: %v", err)
 	}
 }

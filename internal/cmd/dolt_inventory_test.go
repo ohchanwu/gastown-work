@@ -128,7 +128,7 @@ func TestRunDoltCleanupReturnsNonzeroOnRefusedOrphan(t *testing.T) {
 	}
 }
 
-func TestRunDoltCleanupStopsAfterWriteProbeFailure(t *testing.T) {
+func TestRunDoltCleanupRefusesDestructiveWorkWhileServerRuns(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses a POSIX dolt stub")
 	}
@@ -154,25 +154,6 @@ func TestRunDoltCleanupStopsAfterWriteProbeFailure(t *testing.T) {
 	t.Cleanup(func() { _ = listener.Close() })
 	t.Setenv("GT_DOLT_PORT", strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
 
-	binDir := t.TempDir()
-	stub := `#!/bin/sh
-case "$*" in
-  *"SHOW DATABASES"*) printf '{"rows":[{"Database":"testdb_a"},{"Database":"testdb_b"}]}\n'; exit 0 ;;
-  *"FROM dolt_log"*) printf '{"rows":[{"incarnation":"0123456789abcdefghijklmnopqrstuv"}]}\n'; exit 0 ;;
-  *"SHOW TABLES"*) exit 0 ;;
-  *"SELECT 1"*) exit 0 ;;
-  *"DROP DATABASE"*) exit 0 ;;
-  *"DELETE FROM dolt_branch_control"*) exit 0 ;;
-  *"__gt_health_probe"*) printf 'probe unavailable\n' >&2; exit 1 ;;
-esac
-printf 'unexpected dolt args: %s\n' "$*" >&2
-exit 2
-`
-	if err := os.WriteFile(filepath.Join(binDir, "dolt"), []byte(stub), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
 	t.Chdir(townRoot)
 	oldDry, oldForce := doltCleanupDry, doltCleanupForce
 	doltCleanupDry, doltCleanupForce = false, false
@@ -180,22 +161,22 @@ exit 2
 
 	var runErr error
 	output := captureStdout(t, func() { runErr = runDoltCleanup(nil, nil) })
-	if runErr == nil || !strings.Contains(runErr.Error(), "write probe") {
-		t.Fatalf("runDoltCleanup() error = %v, want write-probe failure", runErr)
+	if runErr == nil || !strings.Contains(runErr.Error(), "requires a stopped Dolt server") {
+		t.Fatalf("runDoltCleanup() error = %v, want offline-only refusal", runErr)
 	}
-	if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", "testdb_a")); !os.IsNotExist(err) {
-		t.Fatalf("first orphan was not removed: %v", err)
+	for _, name := range []string{"testdb_a", "testdb_b"} {
+		if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", name)); err != nil {
+			t.Fatalf("live cleanup did not preserve %s: %v", name, err)
+		}
 	}
-	if _, err := os.Stat(filepath.Join(townRoot, ".dolt-data", "testdb_b")); err != nil {
-		t.Fatalf("later orphan was not preserved: %v", err)
-	}
-	if strings.Contains(output, "Removed 2/2") {
-		t.Fatalf("cleanup continued after an unverified write probe: %q", output)
+	if output != "" {
+		t.Fatalf("live cleanup produced mutation progress before refusal: %q", output)
 	}
 }
 
 func TestRunDoltCleanupStopsWhenDatabaseInventoryFails(t *testing.T) {
 	townRoot := t.TempDir()
+	t.Setenv("GT_DOLT_PORT", "1")
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
 		t.Fatal(err)
 	}
