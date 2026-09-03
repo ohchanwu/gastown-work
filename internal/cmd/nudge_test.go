@@ -385,6 +385,8 @@ func TestNudgeInvalidPriority(t *testing.T) {
 func TestNudgeValidModesAccepted(t *testing.T) {
 	// Verify all valid modes pass the validation check (they'll fail later
 	// on tmux operations, but should NOT fail on mode validation).
+	origRegistry := session.DefaultRegistry()
+	t.Cleanup(func() { session.SetDefaultRegistry(origRegistry) })
 	origMode := nudgeModeFlag
 	origPriority := nudgePriorityFlag
 	origMessage := nudgeMessageFlag
