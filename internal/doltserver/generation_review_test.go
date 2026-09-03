@@ -317,3 +317,17 @@ func TestWithStoppedDoltForDatabaseMoveStopFailurePreservesDatabase(t *testing.T
 		t.Fatalf("Dolt state after stop failure = running %v pid %d err %v", running, pid, statusErr)
 	}
 }
+
+func TestOwnedDoltProcessStateRejectsStartTokenChange(t *testing.T) {
+	token := getProcessStartToken(os.Getpid())
+	if token == "" {
+		t.Skip("process start tokens unavailable")
+	}
+	state, err := ownedDoltProcessState(t.TempDir(), os.Getpid(), token+"-changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != revalidatedProcessChanged {
+		t.Fatalf("ownedDoltProcessState() = %v, want changed identity", state)
+	}
+}

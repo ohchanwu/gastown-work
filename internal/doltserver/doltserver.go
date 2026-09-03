@@ -3036,6 +3036,10 @@ func stopLocked(townRoot string) error {
 	if err != nil {
 		return fmt.Errorf("finding process: %w", err)
 	}
+	processToken := getProcessStartToken(pid)
+	if runtime.GOOS != "windows" && processToken == "" {
+		return fmt.Errorf("capturing Dolt process %d start identity", pid)
+	}
 
 	// Drain active connections before stopping to reduce the nbs_manifest
 	// race window inside Dolt's NomsBlockStore.Close(). Non-fatal: proceeds even
@@ -3045,7 +3049,7 @@ func stopLocked(townRoot string) error {
 	}
 
 	if err := terminateRevalidatedProcess(pid, func() (revalidatedProcessState, error) {
-		return ownedDoltProcessState(townRoot, pid)
+		return ownedDoltProcessState(townRoot, pid, processToken)
 	}, func(force bool) error {
 		if force {
 			return process.Kill()
@@ -3073,9 +3077,12 @@ func stopLocked(townRoot string) error {
 	return nil
 }
 
-func ownedDoltProcessState(townRoot string, pid int) (revalidatedProcessState, error) {
+func ownedDoltProcessState(townRoot string, pid int, expectedToken string) (revalidatedProcessState, error) {
 	if !processIsAlive(pid) {
 		return revalidatedProcessAbsent, nil
+	}
+	if expectedToken != "" && getProcessStartToken(pid) != expectedToken {
+		return revalidatedProcessChanged, nil
 	}
 	config := DefaultConfig(townRoot)
 	if !doltProcessMatchesTown(townRoot, pid, config) {
