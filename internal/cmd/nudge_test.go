@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/delivery"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -421,6 +423,49 @@ func TestNudgeValidModesAccepted(t *testing.T) {
 				t.Errorf("valid mode %q was rejected: %v", mode, err)
 			}
 		})
+	}
+}
+
+func TestNudgeSourceMailBindsAllDeliveryPaths(t *testing.T) {
+	source := nudgeSource{ID: "msg-0123456789abcdef", Kind: nudge.SourceKindMail}
+	validated, err := validateNudgeSourceMessage(&mail.Message{
+		To:           "gastown/witness",
+		WakeSourceID: source.ID,
+	}, "gastown/polecats/witness")
+	if err != nil {
+		t.Fatalf("validateNudgeSourceMessage: %v", err)
+	}
+	if validated != source {
+		t.Fatalf("validated source = %#v, want %#v", validated, source)
+	}
+	for _, mode := range []string{NudgeModeImmediate, NudgeModeQueue, NudgeModeWaitIdle, "acp", "urgent-fallback"} {
+		t.Run(mode, func(t *testing.T) {
+			got := newNudgeDeliveryRecord("mayor", "read the mail", nudge.PriorityUrgent, source)
+			if got.SourceID != source.ID || got.SourceKind != source.Kind {
+				t.Fatalf("source = %q/%q, want %q/%q", got.SourceKind, got.SourceID, source.Kind, source.ID)
+			}
+		})
+	}
+}
+
+func TestNudgeSourceMailRejectsRecipientMismatch(t *testing.T) {
+	msg := &mail.Message{To: "gastown/witness", WakeSourceID: "msg-0123456789abcdef"}
+	if _, err := validateNudgeSourceMessage(msg, "gastown/refinery"); err == nil {
+		t.Fatal("validateNudgeSourceMessage accepted a different recipient")
+	}
+}
+
+func TestStandaloneNudgeRemainsSourceFree(t *testing.T) {
+	got := newNudgeDeliveryRecord("mayor", "health check", nudge.PriorityNormal, nudgeSource{})
+	if got.SourceID != "" || got.SourceKind != "" {
+		t.Fatalf("standalone nudge source = %q/%q, want empty", got.SourceKind, got.SourceID)
+	}
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "source_id") || strings.Contains(string(data), "source_kind") {
+		t.Fatalf("legacy JSON unexpectedly contains source fields: %s", data)
 	}
 }
 

@@ -484,7 +484,7 @@ if [[ "${1:-}" == "create" ]]; then
     exit 1
   fi
 
-  echo "hq-testmail-1"
+  echo '{"id":"hq-testmail-1"}'
   exit 0
 fi
 
@@ -508,6 +508,9 @@ exit 1
 
 	if err := r.Send(msg); err != nil {
 		t.Fatalf("send from crew workspace should succeed without prefix mismatch: %v", err)
+	}
+	if msg.ID != "hq-testmail-1" || msg.WakeSourceID == "" {
+		t.Fatalf("stored identity = %q, wake source = %q", msg.ID, msg.WakeSourceID)
 	}
 }
 
@@ -2221,6 +2224,30 @@ func TestRouterSendEscalationAddsStructuredLabels(t *testing.T) {
 	}
 }
 
+func TestProtocolMailFallbackConvergesAfterAcceptance(t *testing.T) {
+	msg := &Message{
+		ID:       "msg-0123456789abcdef",
+		From:     "mayor/",
+		To:       "gastown/witness",
+		Subject:  "Review exact object",
+		ThreadID: "thread-source",
+	}
+	if err := ensureWakeSource(msg); err != nil {
+		t.Fatalf("ensureWakeSource: %v", err)
+	}
+	labels := buildMessageLabels(msg, true)
+	stored := (&BeadsMessage{
+		ID:       "hq-wisp-source",
+		Title:    msg.Subject,
+		Assignee: AddressToIdentity(msg.To),
+		Labels:   labels,
+	}).ToMessage()
+	queued := notificationNudge(stored, "mail ready", nudge.PriorityNormal)
+	if stored.WakeSourceID == "" || queued.SourceID != stored.WakeSourceID || queued.SourceKind != nudge.SourceKindMail {
+		t.Fatalf("stored source %q did not bind queued fallback %#v", stored.WakeSourceID, queued)
+	}
+}
+
 func TestBuildMessageLabelsCanOmitDeliveryWithoutDroppingEscalationType(t *testing.T) {
 	msg := &Message{From: "reaper", Type: TypeEscalation, ThreadID: "hq-abc123"}
 	labels := buildMessageLabels(msg, false)
@@ -2326,7 +2353,7 @@ func TestRouterSendPersistsMailWorkEnrollment(t *testing.T) {
 
 	binDir := t.TempDir()
 	argsPath := filepath.Join(binDir, "create.args")
-	script := "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > " + strconv.Quote(argsPath) + "\necho hq-task\n"
+	script := "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > " + strconv.Quote(argsPath) + "\necho '{\"id\":\"hq-task\"}'\n"
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2363,6 +2390,9 @@ func TestRouterSendPersistsMailWorkEnrollment(t *testing.T) {
 	}
 	if !strings.Contains(labels, MailWorkLabel) {
 		t.Fatalf("create labels %q missing %q", labels, MailWorkLabel)
+	}
+	if !strings.Contains(labels, WakeSourceLabelPrefix+msg.WakeSourceID) || msg.ID != "hq-task" {
+		t.Fatalf("stored identity = %q, labels = %q, wake source = %q", msg.ID, labels, msg.WakeSourceID)
 	}
 	work, err := ParseMailWorkMetadata(json.RawMessage(metadata))
 	if err != nil || work.Validate(WorkStateOpen) != nil || work.Route != WorkRouteDirect {

@@ -3,6 +3,7 @@ package cmd
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,33 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+type mailSendReceipt = mail.StoredDelivery
+
+func writeMailSendResult(cmd *cobra.Command, jsonOutput bool, to, subject string, receipts []mailSendReceipt, sendErrs []string, msgType mail.MessageType) error {
+	if jsonOutput {
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(struct {
+			To         string            `json:"to"`
+			Subject    string            `json:"subject"`
+			Deliveries []mailSendReceipt `json:"deliveries"`
+			Errors     []string          `json:"errors,omitempty"`
+		}{to, subject, receipts, sendErrs})
+	}
+
+	fmt.Fprintf(cmd.OutOrStdout(), "%s Message sent to %s\n", style.Bold.Render("✓"), to)
+	fmt.Fprintf(cmd.OutOrStdout(), "  Subject: %s\n", subject)
+	if len(receipts) > 1 || (len(receipts) == 1 && receipts[0].Recipient != to) {
+		recipients := make([]string, 0, len(receipts))
+		for _, receipt := range receipts {
+			recipients = append(recipients, receipt.Recipient)
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "  Recipients: %s\n", strings.Join(recipients, ", "))
+	}
+	if msgType != mail.TypeNotification {
+		fmt.Fprintf(cmd.OutOrStdout(), "  Type: %s\n", msgType)
+	}
+	return nil
+}
 
 func runMailSend(cmd *cobra.Command, args []string) error {
 	// Handle --stdin: read message body from stdin (avoids shell quoting issues)
@@ -163,6 +191,9 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		if errors.Is(err, mail.ErrUnknownRecipient) {
 			return err
 		}
+		if mailSendJSON {
+			return fmt.Errorf("resolving recipients for exact JSON receipts: %w", err)
+		}
 		// Fall back to legacy routing for infrastructure errors (beads down, etc.)
 		router := mail.NewRouter(workDir)
 		defer waitForMailNotifications(router)
@@ -170,15 +201,13 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("sending message: %w", err)
 		}
 		_ = events.LogFeed(events.TypeMail, from, events.MailPayload(to, mailSubject))
-		fmt.Printf("%s Message sent to %s\n", style.Bold.Render("✓"), to)
-		fmt.Printf("  Subject: %s\n", mailSubject)
-		return nil
+		return writeMailSendResult(cmd, false, to, mailSubject, msg.StoredDeliveries, nil, msg.Type)
 	}
 
 	// Route based on recipient type, collecting errors instead of failing early
 	router := mail.NewRouter(workDir)
 	defer waitForMailNotifications(router)
-	var recipientAddrs []string
+	var receipts []mailSendReceipt
 	var sendErrs []string
 
 	for _, rec := range recipients {
@@ -186,36 +215,40 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		case mail.RecipientQueue:
 			// Queue messages: single message, workers claim
 			msg.To = rec.Address
-			if err := router.Send(msg); err != nil {
+			err := router.Send(msg)
+			receipts = append(receipts, msg.StoredDeliveries...)
+			if err != nil {
 				sendErrs = append(sendErrs, fmt.Sprintf("queue %s: %v", rec.Address, err))
 				continue
 			}
-			recipientAddrs = append(recipientAddrs, rec.Address)
 
 		case mail.RecipientChannel:
 			// Channel messages: single message, broadcast
 			msg.To = rec.Address
-			if err := router.Send(msg); err != nil {
+			err := router.Send(msg)
+			receipts = append(receipts, msg.StoredDeliveries...)
+			if err != nil {
 				sendErrs = append(sendErrs, fmt.Sprintf("channel %s: %v", rec.Address, err))
 				continue
 			}
-			recipientAddrs = append(recipientAddrs, rec.Address)
 
 		default:
 			// Direct/agent messages: fan out to each recipient
 			msgCopy := *msg
 			msgCopy.To = rec.Address
 			msgCopy.ID = "" // Each fan-out copy gets its own unique ID
-			if err := router.Send(&msgCopy); err != nil {
+			msgCopy.WakeSourceID = ""
+			err := router.Send(&msgCopy)
+			receipts = append(receipts, msgCopy.StoredDeliveries...)
+			if err != nil {
 				sendErrs = append(sendErrs, fmt.Sprintf("%s: %v", rec.Address, err))
 				continue
 			}
-			recipientAddrs = append(recipientAddrs, rec.Address)
 		}
 	}
 
 	if len(sendErrs) > 0 {
-		if len(recipientAddrs) == 0 {
+		if len(receipts) == 0 {
 			return fmt.Errorf("all sends failed: %s", strings.Join(sendErrs, "; "))
 		}
 		fmt.Fprintf(os.Stderr, "⚠ Some deliveries failed: %s\n", strings.Join(sendErrs, "; "))
@@ -229,22 +262,10 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	// Log mail event to activity feed
 	_ = events.LogFeed(events.TypeMail, from, events.MailPayload(to, mailSubject))
 
-	fmt.Printf("%s Message sent to %s\n", style.Bold.Render("✓"), to)
-	fmt.Printf("  Subject: %s\n", mailSubject)
-
-	// Show resolved recipients if fan-out occurred
-	if len(recipientAddrs) > 1 || (len(recipientAddrs) == 1 && recipientAddrs[0] != to) {
-		fmt.Printf("  Recipients: %s\n", strings.Join(recipientAddrs, ", "))
-	}
-
-	if len(msg.CC) > 0 {
+	if len(msg.CC) > 0 && !mailSendJSON {
 		fmt.Printf("  CC: %s\n", strings.Join(msg.CC, ", "))
 	}
-	if msg.Type != mail.TypeNotification {
-		fmt.Printf("  Type: %s\n", msg.Type)
-	}
-
-	return nil
+	return writeMailSendResult(cmd, mailSendJSON, to, mailSubject, receipts, sendErrs, msg.Type)
 }
 
 func waitForMailNotifications(router *mail.Router) {

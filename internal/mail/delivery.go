@@ -22,7 +22,74 @@ const (
 	DeliveryLabelAcked         = "delivery:acked"
 	DeliveryLabelAckedByPrefix = "delivery-acked-by:"
 	DeliveryLabelAckedAtPrefix = "delivery-acked-at:"
+	WakeSourceLabelPrefix      = "wake-source:"
 )
+
+func validWakeSourceID(id string) bool {
+	if !strings.HasPrefix(id, "msg-") || len(id) <= len("msg-") || len(id) > len("msg-")+32 {
+		return false
+	}
+	for _, r := range strings.TrimPrefix(id, "msg-") {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func wakeSourceIDFromLabels(labels []string) (string, error) {
+	var sourceID string
+	for _, label := range labels {
+		if !strings.HasPrefix(label, WakeSourceLabelPrefix) {
+			continue
+		}
+		id := strings.TrimPrefix(label, WakeSourceLabelPrefix)
+		if !validWakeSourceID(id) {
+			return "", fmt.Errorf("invalid wake source label %q", label)
+		}
+		if sourceID != "" && sourceID != id {
+			return "", fmt.Errorf("conflicting wake source labels")
+		}
+		sourceID = id
+	}
+	if sourceID == "" {
+		return "", fmt.Errorf("message has no wake source label")
+	}
+	return sourceID, nil
+}
+
+func wakeSourceIDOrEmpty(labels []string) string {
+	id, err := wakeSourceIDFromLabels(labels)
+	if err != nil {
+		return ""
+	}
+	return id
+}
+
+// WakeSourceForMessage returns the validated source identity stored on a
+// durable mail message.
+func WakeSourceForMessage(msg *Message) (string, error) {
+	if msg == nil {
+		return "", fmt.Errorf("source mail is nil")
+	}
+	if msg.WakeSourceID != "" {
+		if !validWakeSourceID(msg.WakeSourceID) {
+			return "", fmt.Errorf("invalid wake source ID %q", msg.WakeSourceID)
+		}
+		return msg.WakeSourceID, nil
+	}
+	return wakeSourceIDFromLabels(msg.Labels)
+}
+
+func ensureWakeSource(msg *Message) error {
+	if msg.WakeSourceID == "" {
+		msg.WakeSourceID = GenerateID()
+	}
+	if !validWakeSourceID(msg.WakeSourceID) {
+		return fmt.Errorf("invalid wake source ID %q", msg.WakeSourceID)
+	}
+	return nil
+}
 
 // DeliverySendLabels returns labels written during phase-1 (send).
 func DeliverySendLabels() []string {

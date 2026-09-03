@@ -171,6 +171,22 @@ func TestDeliveryAckLabelSequence(t *testing.T) {
 	})
 }
 
+func TestWakeSourceLabelsRequireValidIdentity(t *testing.T) {
+	const want = "msg-0123456789abcdef"
+	if got, err := wakeSourceIDFromLabels([]string{"gt:message", WakeSourceLabelPrefix + want}); err != nil || got != want {
+		t.Fatalf("valid source = %q, %v; want %q", got, err, want)
+	}
+	for _, labels := range [][]string{
+		{"gt:message"},
+		{WakeSourceLabelPrefix + "../escape"},
+		{WakeSourceLabelPrefix + want, WakeSourceLabelPrefix + "msg-fedcba9876543210"},
+	} {
+		if _, err := wakeSourceIDFromLabels(labels); err == nil {
+			t.Fatalf("wakeSourceIDFromLabels(%q) accepted invalid labels", labels)
+		}
+	}
+}
+
 func TestDeliveryAckLabelsToWriteSkipsExistingLabels(t *testing.T) {
 	at := time.Date(2026, 2, 17, 14, 0, 0, 0, time.UTC)
 

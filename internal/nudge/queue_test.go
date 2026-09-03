@@ -71,6 +71,29 @@ func TestEnqueueAndDrain(t *testing.T) {
 	}
 }
 
+func TestQueuedNudgeSourceJSONCompatibility(t *testing.T) {
+	var legacy QueuedNudge
+	if err := json.Unmarshal([]byte(`{"sender":"mayor","message":"legacy","priority":"normal"}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.SourceID != "" || legacy.SourceKind != "" {
+		t.Fatalf("legacy source = %q/%q, want empty", legacy.SourceKind, legacy.SourceID)
+	}
+
+	want := QueuedNudge{SourceID: "msg-0123456789abcdef", SourceKind: SourceKindMail}
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got QueuedNudge
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SourceID != want.SourceID || got.SourceKind != want.SourceKind {
+		t.Fatalf("round trip source = %q/%q, want %q/%q", got.SourceKind, got.SourceID, want.SourceKind, want.SourceID)
+	}
+}
+
 func TestEnqueueTightensLegacyQueuePermissions(t *testing.T) {
 	townRoot := t.TempDir()
 	const session = "gt-test-private-queue"

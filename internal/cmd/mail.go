@@ -20,6 +20,7 @@ var (
 	mailTo            string // --to flag (alternative to positional arg)
 	mailFrom          string // --from flag (override sender, for relay/bridge use)
 	mailSendSelf      bool
+	mailSendJSON      bool
 	mailCC            []string // CC recipients
 	mailInboxJSON     bool
 	mailReadJSON      bool
@@ -103,7 +104,7 @@ var mailSendCmd = &cobra.Command{
 	Annotations: map[string]string{
 		BrokerSafeAnnotation:      "true",
 		brokerSafeArgsAnnotation:  brokerSafeArgsExactOne,
-		brokerSafeFlagsAnnotation: "subject,message,body,stdin,priority,urgent,type,reply-to,notify,no-notify,pinned,wisp,permanent",
+		brokerSafeFlagsAnnotation: "subject,message,body,stdin,priority,urgent,type,reply-to,notify,no-notify,pinned,wisp,permanent,json",
 	},
 	Short: "Send a message",
 	Long: `Send a message to an agent.
@@ -507,6 +508,7 @@ func init() {
 	mailSendCmd.Flags().StringVar(&mailTo, "to", "", "Recipient address (alternative to positional argument)")
 	mailSendCmd.Flags().StringVar(&mailFrom, "from", "", "Override sender address (for relay/bridge use)")
 	mailSendCmd.Flags().BoolVar(&mailSendSelf, "self", false, "Send to self (auto-detect from cwd)")
+	mailSendCmd.Flags().BoolVar(&mailSendJSON, "json", false, "Output stored recipient message and wake-source IDs as JSON")
 	mailSendCmd.Flags().StringArrayVar(&mailCC, "cc", nil, "CC recipients (can be used multiple times)")
 	_ = mailSendCmd.MarkFlagRequired("subject") // cobra flags: error only at runtime if missing
 

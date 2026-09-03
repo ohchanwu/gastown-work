@@ -335,6 +335,9 @@ func buildMessageLabels(msg *Message, includeDelivery bool) []string {
 	}
 	labels = append(labels, "from:"+msg.From)
 	labels = append(labels, "msg-type:"+string(msg.Type))
+	if msg.WakeSourceID != "" {
+		labels = append(labels, WakeSourceLabelPrefix+msg.WakeSourceID)
+	}
 	if includeDelivery {
 		labels = append(labels, DeliverySendLabels()...)
 	}
@@ -975,6 +978,13 @@ func (r *Router) shouldEnrollMailWork(msg *Message) bool {
 // - Queues (queue:name) - stores single message for worker claiming
 // - Announces (announce:name) - bulletin board, no claiming, retention-limited
 func (r *Router) Send(msg *Message) error {
+	msg.StoredDeliveries = nil
+	if msg.ID == "" {
+		msg.ID = GenerateID()
+	}
+	if err := ensureWakeSource(msg); err != nil {
+		return err
+	}
 	msg.mailWork = r.shouldEnrollMailWork(msg)
 
 	// Check for mailing list address
@@ -1008,12 +1018,19 @@ func (r *Router) Send(msg *Message) error {
 
 // SendDirectContext stores one direct message with caller cancellation.
 func (r *Router) SendDirectContext(ctx context.Context, msg *Message) error {
+	msg.StoredDeliveries = nil
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if isListAddress(msg.To) || isQueueAddress(msg.To) || isAnnounceAddress(msg.To) ||
 		isChannelAddress(msg.To) || isGroupAddress(msg.To) {
 		return fmt.Errorf("recipient %q is not a direct mail address", msg.To)
+	}
+	if msg.ID == "" {
+		msg.ID = GenerateID()
+	}
+	if err := ensureWakeSource(msg); err != nil {
+		return err
 	}
 	msg.mailWork = r.shouldEnrollMailWork(msg)
 	return r.sendToSingleContext(ctx, msg)
@@ -1042,8 +1059,11 @@ func (r *Router) sendToGroup(msg *Message) error {
 		msgCopy := *msg
 		msgCopy.To = recipient
 		msgCopy.ID = "" // Each fan-out copy gets its own ID from bd create
+		msgCopy.WakeSourceID = ""
 
-		if err := r.sendToSingle(&msgCopy); err != nil {
+		err := r.sendToSingle(&msgCopy)
+		msg.StoredDeliveries = append(msg.StoredDeliveries, msgCopy.StoredDeliveries...)
+		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", recipient, err))
 		}
 	}
@@ -1251,6 +1271,9 @@ func (r *Router) sendToSingleContext(ctx context.Context, msg *Message) error {
 	if msg.ID == "" {
 		msg.ID = GenerateID()
 	}
+	if err := ensureWakeSource(msg); err != nil {
+		return err
+	}
 
 	// Validate message before sending
 	if err := msg.Validate(); err != nil {
@@ -1274,7 +1297,7 @@ func (r *Router) sendToSingleContext(ctx context.Context, msg *Message) error {
 	// Flags go first, then -- to end flag parsing, then the positional subject.
 	// This prevents subjects like "--help" from being parsed as flags (see web/api.go).
 	// Let bd auto-generate the ID with the correct database prefix.
-	args := []string{"create",
+	args := []string{"create", "--json",
 		"--assignee", toIdentity,
 		"-d", msg.Body,
 	}
@@ -1316,7 +1339,10 @@ func (r *Router) sendToSingleContext(ctx context.Context, msg *Message) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	if err == nil {
+		err = setStoredMessageID(msg, stdout)
+	}
 	telemetry.RecordMailMessage(context.Background(), "send", telemetry.MailMessageInfo{
 		ID:       msg.ID,
 		From:     msg.From,
@@ -1338,6 +1364,7 @@ func (r *Router) sendToSingleContext(ctx context.Context, msg *Message) error {
 	// doesn't block on idle probing (up to 1s per recipient in fan-out).
 	// Callers that exit soon after Send should call WaitPendingNotifications.
 	r.NotifyPersisted(msg)
+	msg.StoredDeliveries = []StoredDelivery{{Recipient: msg.To, MessageID: msg.ID, SourceID: msg.WakeSourceID}}
 
 	return nil
 }
@@ -1359,8 +1386,11 @@ func (r *Router) sendToList(msg *Message) error {
 		msgCopy := *msg
 		msgCopy.To = recipient
 		msgCopy.ID = "" // Each fan-out copy gets its own ID from bd create
+		msgCopy.WakeSourceID = ""
 
-		if err := r.Send(&msgCopy); err != nil {
+		err := r.Send(&msgCopy)
+		msg.StoredDeliveries = append(msg.StoredDeliveries, msgCopy.StoredDeliveries...)
+		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", recipient, err))
 		}
 	}
@@ -1403,7 +1433,7 @@ func (r *Router) sendToQueue(msg *Message) error {
 	// Flags go first, then -- to end flag parsing, then the positional subject.
 	// This prevents subjects like "--help" from being parsed as flags.
 	// Use queue:<name> as assignee so inbox queries can filter by queue
-	args := []string{"create",
+	args := []string{"create", "--json",
 		"--assignee", msg.To, // queue:name
 		"-d", msg.Body,
 	}
@@ -1437,10 +1467,14 @@ func (r *Router) sendToQueue(msg *Message) error {
 	}
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err = runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return fmt.Errorf("sending to queue %s: %w", queueName, err)
 	}
+	if err := setStoredMessageID(msg, stdout); err != nil {
+		return err
+	}
+	msg.StoredDeliveries = []StoredDelivery{{Recipient: msg.To, MessageID: msg.ID, SourceID: msg.WakeSourceID}}
 
 	// No notification for queue messages - workers poll or check on their own schedule
 
@@ -1490,7 +1524,7 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 	// Flags go first, then -- to end flag parsing, then the positional subject.
 	// This prevents subjects like "--help" from being parsed as flags.
 	// Use announce:<name> as assignee so queries can filter by channel
-	args := []string{"create",
+	args := []string{"create", "--json",
 		"--assignee", msg.To, // announce:name
 		"-d", msg.Body,
 	}
@@ -1520,10 +1554,14 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 	}
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err = runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return fmt.Errorf("sending to announce %s: %w", announceName, err)
 	}
+	if err := setStoredMessageID(msg, stdout); err != nil {
+		return err
+	}
+	msg.StoredDeliveries = []StoredDelivery{{Recipient: msg.To, MessageID: msg.ID, SourceID: msg.WakeSourceID}}
 
 	// No notification for announce messages - readers poll or check on their own schedule
 
@@ -1564,7 +1602,7 @@ func (r *Router) sendToChannel(msg *Message) error {
 	// Flags go first, then -- to end flag parsing, then the positional subject.
 	// This prevents subjects like "--help" from being parsed as flags.
 	// Use channel:<name> as assignee so queries can filter by channel
-	args := []string{"create",
+	args := []string{"create", "--json",
 		"--assignee", msg.To, // channel:name
 		"-d", msg.Body,
 	}
@@ -1594,10 +1632,14 @@ func (r *Router) sendToChannel(msg *Message) error {
 	}
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err = runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return fmt.Errorf("sending to channel %s: %w", channelName, err)
 	}
+	if err := setStoredMessageID(msg, stdout); err != nil {
+		return err
+	}
+	msg.StoredDeliveries = []StoredDelivery{{Recipient: msg.To, MessageID: msg.ID, SourceID: msg.WakeSourceID}}
 
 	// Enforce channel retention policy (on-write cleanup)
 	_ = b.EnforceChannelRetention(channelName)
@@ -1615,9 +1657,12 @@ func (r *Router) sendToChannel(msg *Message) error {
 			msgCopy := *msg
 			msgCopy.To = subscriber
 			msgCopy.ID = "" // Each fan-out copy gets its own ID from bd create
+			msgCopy.WakeSourceID = ""
 			msgCopy.Subject = fmt.Sprintf("[channel:%s] %s", channelName, msg.Subject)
 
-			if err := r.sendToSingle(&msgCopy); err != nil {
+			err := r.sendToSingle(&msgCopy)
+			msg.StoredDeliveries = append(msg.StoredDeliveries, msgCopy.StoredDeliveries...)
+			if err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", subscriber, err))
 			}
 		}
@@ -1626,6 +1671,20 @@ func (r *Router) sendToChannel(msg *Message) error {
 		}
 	}
 
+	return nil
+}
+
+func setStoredMessageID(msg *Message, stdout []byte) error {
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(stdout, &created); err != nil {
+		return fmt.Errorf("message stored but create identity was not returned: %w", err)
+	}
+	if created.ID == "" {
+		return fmt.Errorf("message stored but create identity was not returned: missing id")
+	}
+	msg.ID = created.ID
 	return nil
 }
 
@@ -1771,16 +1830,8 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		// inter-tool-call gaps. See: https://github.com/steveyegge/gastown/issues/2032
 		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
 		if waitErr == nil {
-			queued := nudge.QueuedNudge{
-				DeliveryID:      nudge.NewDeliveryID(),
-				Sender:          msg.From,
-				Message:         notification,
-				Priority:        priority,
-				Kind:            nudgeKindForMessage(msg),
-				ThreadID:        msg.ThreadID,
-				Severity:        prioritySeverityLabel(msg.Priority),
-				DurableUntilAck: priority == nudge.PriorityUrgent,
-			}
+			queued := notificationNudge(msg, notification, priority)
+			queued.DeliveryID = nudge.NewDeliveryID()
 			// Agent is idle — count success only after runtime-specific proof.
 			receipt, deliveryErr := r.tmux.NudgeSessionWithReceipt(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot, DeliveryID: queued.DeliveryID})
 			if deliveryErr == nil && receipt.Typed && receipt.Submitted && receipt.Session == sessionID && receipt.DeliveryID == queued.DeliveryID && receipt.SubmittedAt.After(receipt.TypedAt) {
@@ -1816,15 +1867,7 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		} else if r.townRoot != "" {
 			// Timeout (agent busy) — queue for cooperative delivery
 			// at the next turn boundary.
-			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:          msg.From,
-				Message:         notification,
-				Priority:        priority,
-				Kind:            nudgeKindForMessage(msg),
-				ThreadID:        msg.ThreadID,
-				Severity:        prioritySeverityLabel(msg.Priority),
-				DurableUntilAck: priority == nudge.PriorityUrgent,
-			}); err != nil {
+			if err := nudge.Enqueue(r.townRoot, sessionID, notificationNudge(msg, notification, priority)); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
 			}
@@ -1858,15 +1901,7 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			if r.isSessionMuted(sessionID) {
 				continue
 			}
-			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:          msg.From,
-				Message:         notification,
-				Priority:        priority,
-				Kind:            nudgeKindForMessage(msg),
-				ThreadID:        msg.ThreadID,
-				Severity:        prioritySeverityLabel(msg.Priority),
-				DurableUntilAck: priority == nudge.PriorityUrgent,
-			}); err != nil {
+			if err := nudge.Enqueue(r.townRoot, sessionID, notificationNudge(msg, notification, priority)); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
 			}
@@ -1963,9 +1998,30 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 		ThreadID:     msg.ThreadID,
 		DeliverAfter: time.Now().Add(delay),
 	}
+	if sourceID, err := WakeSourceForMessage(msg); err == nil {
+		reminder.SourceID = sourceID
+		reminder.SourceKind = nudge.SourceKindMail
+	}
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to enqueue reply reminder for %s: %v\n", sessionID, err)
 	}
+}
+
+func notificationNudge(msg *Message, message, priority string) nudge.QueuedNudge {
+	queued := nudge.QueuedNudge{
+		Sender:          msg.From,
+		Message:         message,
+		Priority:        priority,
+		Kind:            nudgeKindForMessage(msg),
+		ThreadID:        msg.ThreadID,
+		Severity:        prioritySeverityLabel(msg.Priority),
+		DurableUntilAck: priority == nudge.PriorityUrgent,
+	}
+	if sourceID, err := WakeSourceForMessage(msg); err == nil {
+		queued.SourceID = sourceID
+		queued.SourceKind = nudge.SourceKindMail
+	}
+	return queued
 }
 
 func senderCanReceiveReply(from string) bool {

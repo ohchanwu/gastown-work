@@ -105,6 +105,10 @@ type Message struct {
 	// ThreadID groups related messages into a conversation thread.
 	ThreadID string `json:"thread_id,omitempty"`
 
+	// WakeSourceID binds every transport wake for this durable message to one
+	// stable source identity. It is persisted as a wake-source label.
+	WakeSourceID string `json:"wake_source_id,omitempty"`
+
 	// ReplyTo is the ID of the message this is replying to.
 	ReplyTo string `json:"reply_to,omitempty"`
 
@@ -147,9 +151,19 @@ type Message struct {
 	// In-memory only — not serialized.
 	SuppressNotify bool `json:"-"`
 
+	// StoredDeliveries is populated by Router.Send with every durable record
+	// created for this logical send, including fan-out copies.
+	StoredDeliveries []StoredDelivery `json:"-"`
+
 	// mailWork is set by Router.Send only for a newly enrolled task. Keeping it
 	// internal prevents callers from bypassing routing and persistence checks.
 	mailWork bool
+}
+
+type StoredDelivery struct {
+	Recipient string `json:"recipient"`
+	MessageID string `json:"message_id"`
+	SourceID  string `json:"source_id"`
 }
 
 // NewMessage creates a new message with a generated ID and thread ID.
@@ -251,6 +265,9 @@ func (m *Message) Validate() error {
 	}
 	if m.Subject == "" {
 		return fmt.Errorf("message must have a Subject")
+	}
+	if m.WakeSourceID != "" && !validWakeSourceID(m.WakeSourceID) {
+		return fmt.Errorf("message has invalid wake source ID %q", m.WakeSourceID)
 	}
 
 	// Routing: exactly one of To, Queue, or Channel
@@ -476,6 +493,7 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		Priority:        priority,
 		Type:            msgType,
 		ThreadID:        bm.threadID,
+		WakeSourceID:    wakeSourceIDOrEmpty(bm.Labels),
 		ReplyTo:         bm.replyTo,
 		Wisp:            bm.Wisp,
 		CC:              ccAddrs,

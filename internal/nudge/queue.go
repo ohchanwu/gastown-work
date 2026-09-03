@@ -32,6 +32,9 @@ const (
 	PriorityNormal = "normal"
 	// PriorityUrgent means the agent should handle this promptly.
 	PriorityUrgent = "urgent"
+
+	// SourceKindMail identifies a wake derived from one durable mail message.
+	SourceKindMail = "mail"
 )
 
 // Operational limits and defaults.
@@ -69,6 +72,8 @@ type QueuedNudge struct {
 	Kind            string    `json:"kind,omitempty"`
 	ThreadID        string    `json:"thread_id,omitempty"`
 	Severity        string    `json:"severity,omitempty"`
+	SourceID        string    `json:"source_id,omitempty"`
+	SourceKind      string    `json:"source_kind,omitempty"`
 	Timestamp       time.Time `json:"timestamp"`
 	ExpiresAt       time.Time `json:"expires_at,omitempty"`
 	Attempts        int       `json:"attempts"`

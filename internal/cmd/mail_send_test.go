@@ -1,10 +1,37 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/mail"
 )
+
+func TestMailSendJSONReturnsRecipientSourceIDs(t *testing.T) {
+	cmd := &cobra.Command{}
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+
+	receipts := []mailSendReceipt{
+		{Recipient: "gastown/witness", MessageID: "hq-wisp-a", SourceID: "msg-0123456789abcdef"},
+		{Recipient: "gastown/refinery", MessageID: "hq-wisp-b", SourceID: "msg-fedcba9876543210"},
+	}
+	if err := writeMailSendResult(cmd, true, "@rig/gastown", "Status", receipts, nil, mail.TypeNotification); err != nil {
+		t.Fatalf("writeMailSendResult: %v", err)
+	}
+
+	var got struct {
+		Deliveries []mailSendReceipt `json:"deliveries"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("JSON output: %v\n%s", err, stdout.String())
+	}
+	if len(got.Deliveries) != 2 || got.Deliveries[0] != receipts[0] || got.Deliveries[1] != receipts[1] {
+		t.Fatalf("deliveries = %#v, want %#v", got.Deliveries, receipts)
+	}
+}
 
 func TestHasReplyPrefix(t *testing.T) {
 	cases := []struct {
