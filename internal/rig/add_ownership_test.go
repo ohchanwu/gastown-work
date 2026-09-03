@@ -138,6 +138,50 @@ func TestRecoverInterruptedAddPreservesUnprovenDatabaseAndRetriesUnowned(t *test
 	}
 }
 
+func TestRecoverInterruptedAddPreservesUnownedDatabaseAfterIntentRetirement(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+	townRoot := t.TempDir()
+	rigName := "retired_intent"
+	token := "retired-intent-token"
+	dbPath := filepath.Join(townRoot, ".dolt-data", rigName)
+	if err := os.MkdirAll(filepath.Join(dbPath, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddOwnershipStamp(rigPath, "owner-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAddDatabaseOwnership(rigPath, addDatabaseOwnership{
+		Owner: "owner-token", DatabaseToken: token,
+		RoutePrefix: "ri-", RoutePath: rigName, RouteToken: "route-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	previous := removeAddDatabase
+	t.Cleanup(func() { removeAddDatabase = previous })
+	removeAddDatabase = func(string, string, string, bool) error {
+		t.Fatal("unowned database was selected for destructive cleanup")
+		return nil
+	}
+
+	recovered, err := recoverInterruptedAdd(townRoot, rigName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered {
+		t.Fatal("retired database intent was not made retryable")
+	}
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		t.Fatalf("unowned database was not preserved: %v", err)
+	}
+	if _, err := os.Stat(rigPath); !os.IsNotExist(err) {
+		t.Fatalf("interrupted rig path remains: %v", err)
+	}
+}
+
 func TestRecoverInterruptedAddRetiresExactAbsentDatabaseIntent(t *testing.T) {
 	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()

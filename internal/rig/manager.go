@@ -907,7 +907,19 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			databaseToken = ownedToken
 		}
 		if createdDatabase && databaseToken != ownershipStamp {
-			return nil, errors.Join(fmt.Errorf("created rig database has no cleanup identity"), err)
+			if err != nil || databaseToken != "" {
+				return nil, errors.Join(fmt.Errorf("created rig database returned unexpected cleanup identity"), err)
+			}
+			if retireErr := doltserver.RetireUnprovenDatabaseCreationIntent(m.townRoot, opts.Name, ownershipStamp); retireErr != nil {
+				return nil, fmt.Errorf("retiring non-destructive database creation intent: %w", retireErr)
+			}
+			if markerErr := clearExactAddDatabaseOwnership(rigPath, config.RigEntry{
+				RegistrationToken:         routeReservation.Token,
+				RegistrationPathToken:     ownershipStamp,
+				RegistrationDatabaseToken: ownershipStamp,
+			}); markerErr != nil {
+				return nil, fmt.Errorf("retiring non-destructive database ownership: %w", markerErr)
+			}
 		}
 		if !createdDatabase {
 			if markerErr := clearExactAddDatabaseOwnership(rigPath, config.RigEntry{
@@ -1478,11 +1490,13 @@ func recoverInterruptedAdd(townRoot, name string) (bool, error) {
 				}
 			} else {
 				if err := doltserver.RecoverDatabaseCreationToken(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
-					if !errors.Is(err, doltserver.ErrDatabaseGenerationUnproven) {
+					if !errors.Is(err, doltserver.ErrDatabaseGenerationUnproven) && !os.IsNotExist(err) {
 						return false, fmt.Errorf("recovering interrupted database creation custody: %w", err)
 					}
-					if err := doltserver.RetireUnprovenDatabaseCreationIntent(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
-						return false, fmt.Errorf("retiring unproven database creation custody: %w", err)
+					if !os.IsNotExist(err) {
+						if err := doltserver.RetireUnprovenDatabaseCreationIntent(townRoot, name, databaseOwnership.DatabaseToken); err != nil {
+							return false, fmt.Errorf("retiring unproven database creation custody: %w", err)
+						}
 					}
 				} else if err := removeAddDatabase(townRoot, name, databaseOwnership.DatabaseToken, true); err != nil {
 					return false, fmt.Errorf("removing exact interrupted rig database: %w", err)

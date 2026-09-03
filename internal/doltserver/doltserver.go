@@ -3572,8 +3572,10 @@ func createOwnedDatabaseOnServer(townRoot, dbName, generation string) error {
 	})
 }
 
-// InitRigOwned durably stamps a newly created database with creationToken so
-// its caller can perform generation-bound compensating cleanup.
+// InitRigOwned creates a rig database while tracking an exact creation intent.
+// Live SQL creation cannot atomically publish an unforgeable filesystem
+// identity, so a successful live create is returned without rollback authority;
+// the caller must retire the intent and adopt the database non-destructively.
 func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning bool, created bool, ownedToken string, err error) {
 	if rigName == "" {
 		return false, false, "", fmt.Errorf("rig name cannot be empty")
@@ -3657,26 +3659,6 @@ func InitRigOwned(townRoot, rigName, creationToken string) (serverWasRunning boo
 				}
 				InvalidateDBCache()
 			}
-			if created && creationToken != "" {
-				intent, err := readDatabaseCreationIntent(databaseCreationIntentPath(townRoot, rigName))
-				if err != nil {
-					return fmt.Errorf("reading database creation intent: %w", err)
-				}
-				if err := installDatabaseGeneration(townRoot, rigName, rigDir, intent.Generation); err != nil {
-					return fmt.Errorf("recording created database generation: %w", err)
-				}
-				if err := verifyDatabaseGeneration(townRoot, rigName, rigDir, intent.Generation); err != nil {
-					return fmt.Errorf("verifying created database generation: %w", err)
-				}
-				if err := writeDatabaseCreationOwner(rigDir, creationToken, intent.Generation); err != nil {
-					return fmt.Errorf("stamping created database ownership: %w", err)
-				}
-				ownedToken = creationToken
-				if err := clearDatabaseCreationIntent(townRoot, rigName, creationToken); err != nil {
-					return fmt.Errorf("retiring database creation intent: %w", err)
-				}
-			}
-
 			beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
 			if err != nil {
 				return fmt.Errorf("resolving beads directory: %w", err)

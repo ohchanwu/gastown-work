@@ -168,3 +168,59 @@ func TestCancelDatabaseCreationIntentWaitsForDelayedCreate(t *testing.T) {
 		t.Fatalf("delayed creation intent was not preserved: %v", err)
 	}
 }
+
+func TestInitRigOwnedDoesNotGrantLiveCreateRollbackAuthority(t *testing.T) {
+	townRoot, _ := startOwnedDatabaseTestServer(t)
+	dbName := "unowned_live_create"
+	token := "unowned-live-create-token"
+
+	_, created, owned, err := InitRigOwned(townRoot, dbName, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || owned != "" {
+		t.Fatalf("InitRigOwned() = created %v, owner %q", created, owned)
+	}
+	dbPath := filepath.Join(DefaultConfig(townRoot).DataDir, dbName)
+	if _, err := os.Stat(filepath.Join(dbPath, databaseCreationOwnerFile)); !os.IsNotExist(err) {
+		t.Fatalf("live create received a database owner: %v", err)
+	}
+	if _, err := os.Stat(databaseGenerationAnchorPath(townRoot, dbName, databaseGenerationID(token))); !os.IsNotExist(err) {
+		t.Fatalf("live create received a generation anchor: %v", err)
+	}
+	if err := RetireUnprovenDatabaseCreationIntent(townRoot, dbName, token); err != nil {
+		t.Fatalf("retiring non-destructive creation intent: %v", err)
+	}
+}
+
+func TestInitRigOwnedRejectsInterposedReplacementRollbackAuthority(t *testing.T) {
+	townRoot, _ := startOwnedDatabaseTestServer(t)
+	dbName := "interposed_replacement"
+	token := "interposed-replacement-token"
+	previous := createOwnedDatabaseStatement
+	createOwnedDatabaseStatement = func(ctx context.Context, conn *sql.Conn, query string) error {
+		if _, err := conn.ExecContext(ctx, query); err != nil {
+			return err
+		}
+		return serverExecSQL(townRoot, "DROP DATABASE `interposed_replacement`; CREATE DATABASE `interposed_replacement`")
+	}
+	t.Cleanup(func() { createOwnedDatabaseStatement = previous })
+
+	_, created, owned, err := InitRigOwned(townRoot, dbName, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("interposed replacement was not observed as a new live create")
+	}
+	if owned != "" {
+		t.Fatalf("replacement created between CREATE and anchor publication received deletion authority %q", owned)
+	}
+	dbPath := filepath.Join(DefaultConfig(townRoot).DataDir, dbName)
+	if _, statErr := os.Stat(filepath.Join(dbPath, databaseCreationOwnerFile)); !os.IsNotExist(statErr) {
+		t.Fatalf("interposed replacement received a database owner: %v", statErr)
+	}
+	if _, statErr := os.Stat(databaseGenerationAnchorPath(townRoot, dbName, databaseGenerationID(token))); !os.IsNotExist(statErr) {
+		t.Fatalf("interposed replacement received a generation anchor: %v", statErr)
+	}
+}
