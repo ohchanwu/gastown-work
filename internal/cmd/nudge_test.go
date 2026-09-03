@@ -822,6 +822,8 @@ func TestNudgeTrailingSlashNormalization(t *testing.T) {
 	// runNudge must strip the trailing slash so these match the role shortcuts.
 	// Without normalization, "mayor/" falls through to parseAddress which
 	// rejects it ("invalid address format"), silently dropping the nudge.
+	origRegistry := session.DefaultRegistry()
+	t.Cleanup(func() { session.SetDefaultRegistry(origRegistry) })
 	origMode := nudgeModeFlag
 	origPriority := nudgePriorityFlag
 	origMessage := nudgeMessageFlag
@@ -857,6 +859,8 @@ func TestNudgeTrailingSlashNormalization(t *testing.T) {
 }
 
 func TestNudgeDogTargetRoutesToDogSession(t *testing.T) {
+	origRegistry := session.DefaultRegistry()
+	t.Cleanup(func() { session.SetDefaultRegistry(origRegistry) })
 	origMode := nudgeModeFlag
 	origPriority := nudgePriorityFlag
 	origMessage := nudgeMessageFlag
