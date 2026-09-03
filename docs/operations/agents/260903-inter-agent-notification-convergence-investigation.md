@@ -1,9 +1,12 @@
 # Inter-Agent Notification Convergence Phase 0 Investigation
 
-Status: Phase 0 complete; awaiting independent AUTO GATE
+Status: Phase 0 correction complete; awaiting independent AUTO GATE rereview
 
-Governing specification:
-`docs/superpowers/specs/260902-inter-agent-notification-convergence-and-alert-deduplication-repair-spec.md`
+The governing specification is the town-operations file
+`260902-inter-agent-notification-convergence-and-alert-deduplication-repair-spec.md`.
+It is maintained outside this source checkout under the town-level
+`docs/superpowers/specs/` tree. This report is self-contained for review; the
+post-gate documentation task mirrors the specification into this checkout.
 
 Repair tracker: `gastown-7rp`
 
@@ -119,7 +122,18 @@ source work begins.
   once per occurrence.
 - Witness, Deacon, dog, callback, patrol, lifecycle, and formula code invokes
   the generic mail or escalation paths. Most recurring `gt escalate` templates
-  omit a fingerprint; several protocols also add manual nudges independently.
+  omit a fingerprint.
+- The durable-mail/manual-nudge duplicate crosses two shared CLI entry points:
+  `runMailSend` stores through `mail.Router.Send` and `NotifyPersisted`, while a
+  later recovery command enters `runNudge` and creates a fresh delivery ID.
+  `waitForMailNotifications` exposes only aggregate notification status, and
+  `gt mail send` does not expose the stored direct-message ID, so a caller
+  currently cannot bind that fallback to the durable source.
+- The repository contains no source-owned function or formula step that
+  unconditionally pairs those commands for the same state. The observed pairs
+  are agent/operator recovery sequences. Existing Boot, Deacon, lease, and
+  patrol nudges are standalone health or work signals and must not be migrated
+  merely because their files also contain mail commands.
 - `mail.Router.enqueueReplyReminder` creates a delayed queued nudge after every
   non-reply message from a replyable sender. No explicit response-required bit
   is checked.
@@ -405,7 +419,10 @@ reminder, and clear it on every exact terminal transition.
 | Terminal suppression | Only when every caller supplies the key |
 
 Needed: recurring producers must compute a stable fingerprint by default and
-emit one new wake only for a material transition or recurrence after closure.
+refresh the same canonical record for repeated observations. The fingerprint
+identifies the incident family and stable monitored subject; a separate
+material-state key identifies severity and current affected scope. Emit one new
+wake only for a material transition or recurrence after closure.
 
 ### Reaper anomaly reconciliation
 
@@ -447,7 +464,11 @@ metadata, and make only the newest binding verdict wake-eligible.
 | Terminal suppression | New identity on every caller retry |
 
 Needed: leave standalone ephemeral nudges alone; protocol fallback nudges must
-reuse the durable source identity and consult its eligibility.
+reuse the durable source identity and consult its eligibility. The shared
+producer interface is `gt mail send --json` returning every stored recipient
+message ID plus `gt nudge --source-mail <message-id>` validating the same
+recipient and copying that source into every direct, queued, and transport-
+fallback record. No `--source-mail` means the existing standalone behavior.
 
 ## Current test-protection map and fresh baseline
 
@@ -626,32 +647,39 @@ and before it injects a prompt.
    Router-generated mail, escalation, and reminder wakes use one generated
    source ID that is also stored as a validated `wake-source:<id>` label on the
    durable message. Legacy or manual records leave the fields empty.
-2. Add a mail-package eligibility query which uses the source ID, thread, typed
+2. Make `gt mail send --json` return the exact stored message ID for each
+   recipient, including fan-out copies. Add an optional
+   `gt nudge --source-mail <message-id>` producer seam which resolves that
+   message, rejects a recipient mismatch, and reuses its wake-source identity.
+   Source-owned protocol fallbacks must use this seam; standalone health and
+   coordination nudges continue without a source.
+3. Add a mail-package eligibility query which uses the source ID, thread, typed
    labels, delivery/read/work state, and replies. A lookup failure returns
    `unknown`, which retains and Nacks the claim; only positive terminal or
    superseded proof may suppress it.
-3. Add an exact claim terminalization operation. A consumer holding the
+4. Add an exact claim terminalization operation. A consumer holding the
    delivery lease may remove its own claim after positive durable proof without
    fabricating a submission receipt. `RemoveKindByThread` continues to ignore
    claims so another process cannot steal active custody.
-4. Call the same eligibility query from the poller, idle watcher,
+5. Call the same eligibility query from the poller, idle watcher,
    prompt-boundary queue injector, and ACP Propeller. Report ordinary queue
    removal failures as partial convergence; the later claim then self-heals.
-5. Make ACP `notify` distinguish UI-only observation from accepted prompt
+6. Make ACP `notify` distinguish UI-only observation from accepted prompt
    injection. A busy normal wake remains queued; only a successful
    `InjectPrompt` can produce the local ACP submission receipt.
-6. Reuse `TypeTask` as the existing explicit response-required marker. Enqueue
+7. Reuse `TypeTask` as the existing explicit response-required marker. Enqueue
    at most one reminder per source and thread. Informational notifications do
    not create reminders; exact reply or mail-work completion clears them.
-7. Keep generic manual escalation behavior, but require stable explicit
-   fingerprints in recurring Deacon, dog, and cross-rig producers. Reuse the
-   existing escalation lookup and Reaper material-transition model.
-8. Add minimal typed Witness review labels for lineage, generation, exact SHA,
+8. Keep generic manual escalation behavior, but separate the stable incident
+   fingerprint from the material-state key for recurring Deacon, dog, and
+   cross-rig producers. Reuse one open canonical record, notify once for each
+   state transition, and create a new occurrence only after closure.
+9. Add minimal typed Witness review labels for lineage, generation, exact SHA,
    and verdict. A verdict must be an exact reply to its request. Only the
    highest unambiguous generation in one lineage is binding; conflicting
    metadata fails open and reports the ambiguity. Historical verdicts remain
    durable and queryable.
-9. Restore the process-global prefix registry in the nudge CLI test so the
+10. Restore the process-global prefix registry in the nudge CLI test so the
    unchanged focused suite becomes order-independent.
 
 The generic source key and eligibility query are the shared convergence point.
@@ -690,6 +718,9 @@ schema migration:
   preserve the wake, return a diagnostic, and do not mark it accepted.
 - Existing standalone nudges and manual unfingerprinted escalations retain
   their current semantics.
+- The new mail-send JSON result, source-bound nudge flag, escalation scope,
+  material-state key, and material generation are additive. Older senders omit
+  them; new readers fail open rather than infer them.
 - Exact terminal claim removal requires a held lease plus a source-ID match;
   it cannot delete an unrelated record.
 - No existing mail, verdict, escalation, receipt, or queue record is rewritten
@@ -742,20 +773,29 @@ residue, and commits locally without pushing.
 
 - **Files/functions:** `internal/nudge/queue.go`, queue tests;
   `internal/mail/types.go`, `router.go`, `delivery.go`, and tests;
-  `internal/cmd/nudge.go`, `nudge_poller.go`, `mail_check.go`, and tests;
-  `internal/acp/propulsion.go` and tests.
+  `internal/cmd/mail_send.go`, `nudge.go`, `nudge_poller.go`, `mail_check.go`,
+  and tests; `internal/acp/propulsion.go` and tests. Review and update only
+  source-owned protocol templates proved to issue a delivery-failure fallback;
+  the inventory found no current unconditional in-repo pair.
 - **Interface:** optional queue source ID/kind, durable `wake-source` label,
   tri-state eligibility (`eligible`, `terminal`, `unknown`), and exact
-  owner-held claim terminalization.
+  owner-held claim terminalization. `gt mail send --json` returns per-recipient
+  stored IDs; `gt nudge --source-mail <id>` validates source/recipient binding
+  and copies the source through immediate, queued, and urgent-fallback paths.
 - **RED:** add
   `TestQueuedWakeTerminalSourceIsNotInjected`,
   `TestQueuedWakeEligibilityFailureRemainsRetryable`,
   `TestClaimedWakeSelfHealsAfterThreadRemovalRace`, and
-  `TestMailCheckReportsPartialQueueConvergence`.
-- **GREEN:** stamp router wakes, query Beads before injection, retain on unknown,
-  and terminalize only the exact owned claim on positive proof.
+  `TestMailCheckReportsPartialQueueConvergence`; add a CLI integration fixture
+  proving mail plus source-bound fallback yields one visible wake after source
+  acceptance, a recipient mismatch is rejected, and a standalone nudge stays
+  source-free and deliverable.
+- **GREEN:** stamp router wakes, surface exact stored IDs, bind an explicit
+  protocol fallback to the same source, query Beads before injection, retain on
+  unknown, and terminalize only the exact owned claim on positive proof.
 - **Verify:** focused mail/nudge/delivery/cmd/ACP normal and race suites; mixed
-  legacy/new queue records; exact unrelated-source preservation.
+  legacy/new queue records; mail-plus-fallback convergence; exact unrelated-
+  source and standalone-nudge preservation.
 - **Residue:** fixture queues empty only for terminal sources; no listener or
   live-state delta.
 - **Commit:** `fix: converge queued wakes with durable sources`.
@@ -791,18 +831,40 @@ residue, and commits locally without pushing.
 
 ### Source Task E — converge recurring automated escalations
 
-- **Files/functions:** `internal/cmd/escalate_impl.go`, `dog.go`,
-  `capacity_dispatch.go`, escalation tests, and recurring Deacon/dog formula
-  call sites under `internal/formula/formulas/`.
-- **RED:** add one fixture with twenty identical observations, one severity or
-  scope transition, closure, and recurrence. Assert one initial wake, one
-  transition wake, and one recurrence wake.
-- **GREEN:** keep `runEscalate` fingerprint convergence; make each recurring
-  machine producer supply a stable family-and-scope key. Sampling time,
-  measurement, and diagnostics path stay outside the key.
+- **Files/functions:** `internal/cmd/escalate.go`, `escalate_impl.go`,
+  `escalate_test.go`, `dog.go`, `capacity_dispatch.go`;
+  `internal/beads/beads_escalation.go` and tests; recurring Deacon/dog formula
+  call sites under `internal/formula/formulas/`; escalation transition labels
+  and exact-message lookup in `internal/mail`.
+- **Interface:** `--fingerprint` is the stable incident identity: condition
+  family plus stable monitored-subject identity. It excludes severity,
+  affected-set value, observation time, measurement, reason text, and
+  diagnostics path. Add explicit normalized
+  `--scope`/`EscalationFields.Scope`; the material-state key is the normalized
+  severity plus scope. Routing derived from severity is therefore part of
+  material state without hashing volatile prose. A positive material generation
+  increments only after a state-key change; transition mail is keyed by
+  escalation ID, generation, and recipient.
+- **RED:** add one fixture with twenty identical observations, one severity
+  transition, one affected-scope transition, closure, and recurrence. Add a
+  concurrent identical-transition case. Assert one canonical open bead, one
+  initial wake, exactly one wake per material transition, and one new
+  occurrence/wake after closure.
+- **GREEN:** on a matching open fingerprint, compare the stored material-state
+  key. For an identical state, compare-and-update only the same bead's latest
+  observation fields and suppress mail/wake. For a changed state, atomically
+  update the same bead's severity, scope, title/reason/source, state key, and
+  incremented generation. Then ensure one same-thread transition mail/wake per
+  generation and recipient; a retry finds the durable transition mail instead
+  of creating another, and a CAS loser re-reads the winning generation. Exclude
+  closed occurrences from open matching so a later recurrence creates a new
+  bead. Multiple open matches or lookup/update failure return an error and send
+  nothing. Require recurring machine producers to supply the stable fingerprint
+  and explicit scope.
 - **Verify:** escalation/Reaper/formula/cmd normal and race tests plus embedded
   formula validation.
-- **Residue:** one open fixture incident and no duplicate mail; fixture removed.
+- **Residue:** one open recurrence fixture incident and no duplicate or orphaned
+  transition mail; fixture removed.
 - **Commit:** `fix: fingerprint recurring agent escalations`.
 
 ### Source Task F — model Witness binding verdict lineage
@@ -823,8 +885,9 @@ residue, and commits locally without pushing.
 
 ### Integration and installed acceptance
 
-- Update `docs/architecture.md`, the maintained mail protocol, formula embeds,
-  and the town-level mirrored specification only after behavior is green.
+- Update `docs/design/architecture.md`, the maintained mail protocol, formula
+  embeds, and the source/town mirrored specification only after behavior is
+  green.
 - Run format, vet, build, focused normal/race, full suite, Gitleaks, mixed-version
   rollback, and listener/queue residue checks.
 - Obtain an independent exact-SHA source verdict, install only the approved
