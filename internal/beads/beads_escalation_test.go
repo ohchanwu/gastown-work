@@ -3,6 +3,7 @@ package beads
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -342,6 +343,69 @@ func TestEscalationFieldsRoundTrip(t *testing.T) {
 	}
 	if parsed.Fingerprint != original.Fingerprint {
 		t.Errorf("Fingerprint: got %q, want %q", parsed.Fingerprint, original.Fingerprint)
+	}
+}
+
+func TestPrepareEscalationTransitionFieldsLifecycle(t *testing.T) {
+	observation := EscalationObservation{
+		Severity:    "high",
+		Scope:       "db-a,db-b",
+		Reason:      "first sample",
+		Source:      "reaper",
+		EscalatedBy: "deacon/dogs/bravo",
+		ObservedAt:  "2026-09-04T01:00:00Z",
+		Fingerprint: "escalation-fp:abc123def456",
+		Recipients:  []string{"overseer", "mayor/", "mayor/"},
+		RelatedBead: "hq-incident",
+	}
+
+	fields, kind, err := prepareEscalationTransitionFields(nil, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != EscalationTransitionCreated || fields.MaterialGeneration != 1 {
+		t.Fatalf("initial transition = %q generation %d", kind, fields.MaterialGeneration)
+	}
+	if !reflect.DeepEqual(fields.PendingRecipients, []string{"mayor/", "overseer"}) {
+		t.Fatalf("initial pending recipients = %#v", fields.PendingRecipients)
+	}
+
+	for i := range 20 {
+		observation.Reason = "sample " + string(rune('a'+i))
+		fields, kind, err = prepareEscalationTransitionFields(fields, observation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kind != EscalationTransitionUnchanged || fields.MaterialGeneration != 1 {
+			t.Fatalf("identical observation %d = %q generation %d", i, kind, fields.MaterialGeneration)
+		}
+	}
+
+	fields.PendingRecipients = nil
+	observation.Severity = "critical"
+	fields, kind, err = prepareEscalationTransitionFields(fields, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != EscalationTransitionChanged || fields.MaterialGeneration != 2 {
+		t.Fatalf("severity transition = %q generation %d", kind, fields.MaterialGeneration)
+	}
+
+	fields.PendingRecipients = nil
+	observation.Scope = "db-a,db-c"
+	fields, kind, err = prepareEscalationTransitionFields(fields, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != EscalationTransitionChanged || fields.MaterialGeneration != 3 {
+		t.Fatalf("scope transition = %q generation %d", kind, fields.MaterialGeneration)
+	}
+
+	roundTrip := ParseEscalationFields(FormatEscalationDescription("incident", fields))
+	if roundTrip.MaterialState != fields.MaterialState || roundTrip.MaterialGeneration != 3 ||
+		!reflect.DeepEqual(roundTrip.PendingRecipients, fields.PendingRecipients) ||
+		roundTrip.Scope != observation.Scope || roundTrip.LastObservedAt != observation.ObservedAt {
+		t.Fatalf("transition round trip = %#v, want %#v", roundTrip, fields)
 	}
 }
 

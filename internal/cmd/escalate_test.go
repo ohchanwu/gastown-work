@@ -2,13 +2,16 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/mail"
 )
 
 func TestGetNextSeverity(t *testing.T) {
@@ -175,6 +178,118 @@ func TestEscalationFingerprintLabel(t *testing.T) {
 	}
 	if escalationFingerprintLabel(" ") != "" {
 		t.Fatal("blank fingerprint should produce empty label")
+	}
+}
+
+func TestEscalationMaterialIdentity(t *testing.T) {
+	scope, err := normalizeEscalationScope(" DB-B,db-a,db-b ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope != "db-a,db-b" {
+		t.Fatalf("normalized scope = %q", scope)
+	}
+	one := escalationWakeSourceID("hq-wisp-incident", 2, "mayor/")
+	two := escalationWakeSourceID("hq-wisp-incident", 2, "overseer")
+	if one == two || !strings.HasPrefix(one, "msg-") || len(one) != len("msg-")+32 {
+		t.Fatalf("deterministic source ids = %q, %q", one, two)
+	}
+	if one != escalationWakeSourceID("hq-wisp-incident", 2, "mayor/") {
+		t.Fatal("same transition identity produced a different source id")
+	}
+}
+
+func TestDeliverEscalationRecipientsRecoversCrashWindows(t *testing.T) {
+	issue := &beads.Issue{ID: "hq-wisp-incident", Title: "Dolt slow"}
+	fields := &beads.EscalationFields{
+		Severity: "high", MaterialGeneration: 1, PendingRecipients: []string{"mayor/"},
+	}
+
+	for _, crash := range []string{"before mail", "after mail"} {
+		t.Run(crash, func(t *testing.T) {
+			stored := make(map[string]string)
+			pending := true
+			first := true
+			ensure := func(msg *mail.Message) (bool, error) {
+				if crash == "before mail" && first {
+					first = false
+					return false, errors.New("injected pre-persistence failure")
+				}
+				if id, ok := stored[msg.WakeSourceID]; ok {
+					msg.ID = id
+					return false, nil
+				}
+				msg.ID = "hq-mail-one"
+				stored[msg.WakeSourceID] = msg.ID
+				return true, nil
+			}
+			afterPersist := func(string) error {
+				if crash == "after mail" && first {
+					first = false
+					return errors.New("injected post-persistence failure")
+				}
+				return nil
+			}
+			ops := escalationRecipientDeliveryOps{
+				ensure: ensure, afterPersist: afterPersist,
+				annotate: func(string, string) error { return nil },
+				complete: func(string) error { pending = false; return nil },
+			}
+			if _, err := deliverEscalationRecipients(issue, fields, "deacon/dogs/bravo", ops); err == nil {
+				t.Fatal("injected crash should preserve a failed delivery")
+			}
+			if !pending {
+				t.Fatal("pending recipient cleared before durable completion")
+			}
+			if _, err := deliverEscalationRecipients(issue, fields, "deacon/dogs/bravo", ops); err != nil {
+				t.Fatal(err)
+			}
+			if pending || len(stored) != 1 {
+				t.Fatalf("recovery pending=%v stored=%d, want false/1", pending, len(stored))
+			}
+		})
+	}
+}
+
+func TestDeliverEscalationRecipientsConcurrentRetryCreatesOneMail(t *testing.T) {
+	issue := &beads.Issue{ID: "hq-wisp-incident", Title: "Dolt slow"}
+	fields := &beads.EscalationFields{Severity: "high", MaterialGeneration: 3, PendingRecipients: []string{"mayor/"}}
+	stored := make(map[string]string)
+	var mu sync.Mutex
+	ops := escalationRecipientDeliveryOps{
+		ensure: func(msg *mail.Message) (bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if id, ok := stored[msg.WakeSourceID]; ok {
+				msg.ID = id
+				return false, nil
+			}
+			msg.ID = "hq-mail-one"
+			stored[msg.WakeSourceID] = msg.ID
+			return true, nil
+		},
+		annotate: func(string, string) error { return nil },
+		complete: func(string) error { return nil },
+	}
+	errCh := make(chan error, 20)
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := deliverEscalationRecipients(issue, fields, "deacon/dogs/bravo", ops)
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(stored) != 1 {
+		t.Fatalf("stored transition mails = %d, want 1", len(stored))
 	}
 }
 

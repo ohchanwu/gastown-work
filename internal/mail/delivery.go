@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/nudge"
 )
 
@@ -194,6 +197,97 @@ func wakeSourceIDOrEmpty(labels []string) string {
 		return ""
 	}
 	return id
+}
+
+func findWakeSourceMessage(messages []*Message, sourceID string) (*Message, error) {
+	var found *Message
+	for _, message := range messages {
+		if message == nil {
+			return nil, errors.New("wake source thread contains nil message")
+		}
+		id, err := WakeSourceForMessage(message)
+		if err != nil {
+			continue
+		}
+		if id != sourceID {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("wake source %q is not unique", sourceID)
+		}
+		found = message
+	}
+	return found, nil
+}
+
+// EnsureDirectMessageBySource creates one direct message for an exact durable
+// source. Concurrent and crash-recovery retries return the existing message.
+func (r *Router) EnsureDirectMessageBySource(msg *Message) (bool, error) {
+	if r == nil || r.townRoot == "" || msg == nil || msg.ThreadID == "" {
+		return false, errors.New("source-bound direct mail requires router, town root, message, and thread")
+	}
+	sourceID, err := WakeSourceForMessage(msg)
+	if err != nil {
+		return false, err
+	}
+	lockDir := filepath.Join(r.townRoot, constants.DirRuntime, "mail_source_locks")
+	if err := os.MkdirAll(lockDir, 0700); err != nil {
+		return false, fmt.Errorf("creating mail source lock directory: %w", err)
+	}
+	unlock, err := lock.FlockAcquire(filepath.Join(lockDir, sourceID+".flock"))
+	if err != nil {
+		return false, fmt.Errorf("locking durable mail source: %w", err)
+	}
+	defer unlock()
+
+	mailbox := NewMailboxWithBeadsDir("system", r.townRoot, filepath.Join(r.townRoot, ".beads"))
+	thread, err := mailbox.ListByThread(msg.ThreadID)
+	if err != nil {
+		return false, fmt.Errorf("reading durable mail source thread: %w", err)
+	}
+	existing, err := findWakeSourceMessage(thread, sourceID)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil {
+		if existing.ThreadID != msg.ThreadID || existing.Type != msg.Type ||
+			AddressToIdentity(existing.To) != AddressToIdentity(msg.To) {
+			return false, fmt.Errorf("durable mail source %q conflicts with existing message %s", sourceID, existing.ID)
+		}
+		msg.ID = existing.ID
+		msg.StoredDeliveries = []StoredDelivery{{Recipient: msg.To, MessageID: msg.ID, SourceID: sourceID}}
+		return false, r.ensureQueuedSourceWake(existing)
+	}
+	stored := *msg
+	stored.SuppressNotify = true
+	if err := r.Send(&stored); err != nil {
+		return false, err
+	}
+	msg.ID = stored.ID
+	msg.StoredDeliveries = stored.StoredDeliveries
+	if err := r.ensureQueuedSourceWake(&stored); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (r *Router) ensureQueuedSourceWake(msg *Message) error {
+	if msg == nil {
+		return nil
+	}
+	queued := notificationNudge(msg, formatNotificationMessage(msg), nudgePriorityForMailPriority(msg.Priority))
+	for _, sessionID := range AddressToSessionIDs(msg.To) {
+		if r.isSessionMuted(sessionID) {
+			continue
+		}
+		if _, err := nudge.EnqueueUniqueBySource(r.townRoot, sessionID, queued); err != nil {
+			return fmt.Errorf("queueing durable source wake for %s: %w", sessionID, err)
+		}
+		if err := r.startQueuedRetry(sessionID); err != nil {
+			return fmt.Errorf("starting durable source wake retry for %s: %w", sessionID, err)
+		}
+	}
+	return nil
 }
 
 // WakeSourceForMessage returns the validated source identity stored on a

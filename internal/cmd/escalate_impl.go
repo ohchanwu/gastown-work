@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +49,14 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	if !config.IsValidSeverity(severity) {
 		return fmt.Errorf("invalid severity '%s': must be critical, high, medium, or low", escalateSeverity)
 	}
+	var normalizedScope string
+	if strings.TrimSpace(escalateFingerprint) != "" {
+		var err error
+		normalizedScope, err = normalizeEscalationScope(escalateScope)
+		if err != nil {
+			return fmt.Errorf("fingerprinted escalation requires --scope: %w", err)
+		}
+	}
 
 	// Find workspace
 	townRoot, err := workspace.FindFromCwdOrError()
@@ -80,6 +91,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		}
 		if escalateFingerprint != "" {
 			fmt.Printf("  Fingerprint: %s\n", escalationFingerprintLabel(escalateFingerprint))
+			fmt.Printf("  Scope: %s\n", normalizedScope)
 		}
 		fmt.Printf("  Actions: %s\n", strings.Join(actions, ", "))
 		fmt.Printf("  Mail targets: %s\n", strings.Join(targets, ", "))
@@ -90,26 +102,9 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 	fingerprintLabel := escalationFingerprintLabel(escalateFingerprint)
 	if fingerprintLabel != "" {
-		matches, err := bd.ListEscalationsByFingerprint(fingerprintLabel)
-		if err != nil {
-			return fmt.Errorf("checking escalation fingerprint: %w", err)
-		}
-		if len(matches) > 0 {
-			existing := matches[0]
-			if escalateJSON {
-				result := map[string]interface{}{
-					"id":          existing.ID,
-					"status":      "duplicate_suppressed",
-					"fingerprint": fingerprintLabel,
-				}
-				out, _ := json.MarshalIndent(result, "", "  ")
-				fmt.Println(string(out))
-			} else {
-				fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), existing.ID)
-				fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
-			}
-			return nil
-		}
+		actions := escalationConfig.GetRouteForSeverity(severity)
+		return runFingerprintedEscalation(townRoot, bd, escalationConfig, actions,
+			description, severity, normalizedScope, fingerprintLabel, agentID)
 	}
 	fields := &beads.EscalationFields{
 		Severity:    severity,
@@ -253,6 +248,206 @@ func escalationFingerprintLabel(raw string) string {
 	}
 	sum := sha256.Sum256([]byte(raw))
 	return fmt.Sprintf("escalation-fp:%x", sum[:6])
+}
+
+func normalizeEscalationScope(raw string) (string, error) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(raw)), ",")
+	seen := make(map[string]struct{}, len(parts))
+	normalized := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.ContainsAny(part, " \t\r\n") {
+			return "", fmt.Errorf("invalid escalation scope item %q", part)
+		}
+		if _, ok := seen[part]; ok {
+			continue
+		}
+		seen[part] = struct{}{}
+		normalized = append(normalized, part)
+	}
+	if len(normalized) == 0 {
+		return "", errors.New("escalation scope is empty")
+	}
+	sort.Strings(normalized)
+	return strings.Join(normalized, ","), nil
+}
+
+func escalationWakeSourceID(escalationID string, generation int, recipient string) string {
+	sum := sha256.Sum256([]byte(escalationID + "\x00" + strconv.Itoa(generation) + "\x00" + mail.AddressToIdentity(recipient)))
+	return "msg-" + hex.EncodeToString(sum[:16])
+}
+
+func normalizedEscalationRecipients(targets []string) []string {
+	seen := make(map[string]struct{}, len(targets))
+	recipients := make([]string, 0, len(targets))
+	for _, target := range targets {
+		identity := mail.AddressToIdentity(target)
+		if identity == "" {
+			continue
+		}
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		recipients = append(recipients, identity)
+	}
+	sort.Strings(recipients)
+	return recipients
+}
+
+type escalationRecipientDeliveryOps struct {
+	ensure       func(*mail.Message) (bool, error)
+	annotate     func(string, string) error
+	complete     func(string) error
+	afterPersist func(string) error
+}
+
+func deliverEscalationRecipients(issue *beads.Issue, fields *beads.EscalationFields, agentID string, ops escalationRecipientDeliveryOps) ([]deliveryStatus, error) {
+	if issue == nil || fields == nil || fields.MaterialGeneration < 1 {
+		return nil, errors.New("invalid escalation delivery state")
+	}
+	var statuses []deliveryStatus
+	var errs []error
+	for _, target := range fields.PendingRecipients {
+		status := deliveryStatus{Target: target, Channel: "mail", Severity: fields.Severity, NotificationRoute: "mail+nudge"}
+		msg := &mail.Message{
+			From:         agentID,
+			To:           target,
+			Subject:      fmt.Sprintf("[%s] %s", strings.ToUpper(fields.Severity), issue.Title),
+			Body:         formatEscalationMailBody(issue.ID, fields.Severity, fields.Reason, agentID, fields.RelatedBead),
+			Type:         mail.TypeEscalation,
+			ThreadID:     issue.ID,
+			WakeSourceID: escalationWakeSourceID(issue.ID, fields.MaterialGeneration, target),
+			Priority:     escalationMailPriority(fields.Severity),
+		}
+		created, err := ops.ensure(msg)
+		status.Created = created
+		status.Persisted = msg.ID != ""
+		if err != nil {
+			status.Error = err.Error()
+			statuses = append(statuses, status)
+			errs = append(errs, fmt.Errorf("persisting escalation mail for %s: %w", target, err))
+			continue
+		}
+		status.Persisted = true
+		if ops.afterPersist != nil {
+			if err := ops.afterPersist(target); err != nil {
+				status.Error = err.Error()
+				statuses = append(statuses, status)
+				errs = append(errs, err)
+				continue
+			}
+		}
+		if err := ops.annotate(msg.ID, target); err != nil {
+			status.Error = err.Error()
+			statuses = append(statuses, status)
+			errs = append(errs, fmt.Errorf("annotating escalation mail for %s: %w", target, err))
+			continue
+		}
+		status.Annotated = true
+		if err := ops.complete(target); err != nil {
+			status.Error = err.Error()
+			statuses = append(statuses, status)
+			errs = append(errs, fmt.Errorf("completing escalation mail for %s: %w", target, err))
+			continue
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, errors.Join(errs...)
+}
+
+func escalationMailPriority(severity string) mail.Priority {
+	switch severity {
+	case config.SeverityCritical:
+		return mail.PriorityUrgent
+	case config.SeverityHigh:
+		return mail.PriorityHigh
+	case config.SeverityMedium:
+		return mail.PriorityNormal
+	default:
+		return mail.PriorityLow
+	}
+}
+
+func runFingerprintedEscalation(townRoot string, bd *beads.Beads, escalationConfig *config.EscalationConfig,
+	actions []string, description, severity, scope, fingerprintLabel, agentID string,
+) error {
+	targets := extractMailTargetsFromActions(actions)
+	transition, err := bd.ConvergeEscalationObservation(beads.EscalationObservation{
+		Title: description, Severity: severity, Scope: scope, Reason: escalateReason,
+		Source: escalateSource, EscalatedBy: agentID, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		RelatedBead: escalateRelatedBead, Fingerprint: fingerprintLabel,
+		Recipients: normalizedEscalationRecipients(targets),
+	})
+	if err != nil {
+		return fmt.Errorf("converging escalation transition: %w", err)
+	}
+
+	router := mail.NewRouter(townRoot)
+	statuses := []deliveryStatus{{Channel: "bead", Created: transition.Kind == beads.EscalationTransitionCreated, Severity: severity}}
+	deliveryStatuses, deliveryErr := deliverEscalationRecipients(transition.Issue, transition.Fields, agentID, escalationRecipientDeliveryOps{
+		ensure: router.EnsureDirectMessageBySource,
+		annotate: func(messageID, _ string) error {
+			return bd.Update(messageID, beads.UpdateOptions{AddLabels: []string{
+				"severity:" + transition.Fields.Severity,
+				"escalation:" + transition.Issue.ID,
+			}})
+		},
+		complete: func(target string) error {
+			return bd.CompleteEscalationRecipient(transition.Issue.ID, fingerprintLabel,
+				transition.Fields.MaterialGeneration, target)
+		},
+	})
+	statuses = append(statuses, deliveryStatuses...)
+	waitForMailNotifications(router)
+
+	if transition.Kind == beads.EscalationTransitionCreated || transition.Kind == beads.EscalationTransitionChanged {
+		external := executeExternalActions(actions, escalationConfig, transition.Issue.ID, severity, description, townRoot)
+		statuses = append(statuses, external...)
+		for _, status := range external {
+			if status.Error != "" {
+				deliveryErr = errors.Join(deliveryErr, errors.New(status.Error))
+			}
+		}
+		payload := events.EscalationPayload(transition.Issue.ID, agentID, strings.Join(targets, ","), description)
+		payload["severity"] = severity
+		payload["actions"] = strings.Join(actions, ",")
+		payload["source"] = escalateSource
+		_ = events.LogFeed(events.TypeEscalationSent, agentID, payload)
+	}
+
+	statusName := "duplicate_suppressed"
+	if transition.Kind == beads.EscalationTransitionCreated {
+		statusName = "ok"
+	} else if transition.Kind == beads.EscalationTransitionChanged {
+		statusName = "updated"
+	} else if len(transition.Fields.PendingRecipients) > 0 {
+		statusName = "delivery_recovered"
+	}
+	if deliveryErr != nil {
+		statusName = "partial_failure"
+	}
+	if escalateJSON {
+		result := map[string]interface{}{
+			"id": transition.Issue.ID, "severity": severity, "scope": scope,
+			"generation": transition.Fields.MaterialGeneration, "fingerprint": fingerprintLabel,
+			"actions": actions, "targets": targets, "delivery": statuses, "status": statusName,
+		}
+		out, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		fmt.Printf("%s Escalation %s: %s\n", severityEmoji(severity), statusName, transition.Issue.ID)
+		fmt.Printf("  Severity: %s | Scope: %s | Generation: %d\n", severity, scope, transition.Fields.MaterialGeneration)
+		fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
+		fmt.Printf("  Routed to: %s\n", strings.Join(targets, ", "))
+	}
+	if deliveryErr != nil {
+		return fmt.Errorf("escalation %s delivery incomplete: %w", transition.Issue.ID, deliveryErr)
+	}
+	return nil
 }
 
 type deliveryStatus struct {

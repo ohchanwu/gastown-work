@@ -6,9 +6,11 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/nudge"
 )
 
@@ -187,6 +189,91 @@ func TestWakeSourceLabelsRequireValidIdentity(t *testing.T) {
 		if _, err := wakeSourceIDFromLabels(labels); err == nil {
 			t.Fatalf("wakeSourceIDFromLabels(%q) accepted invalid labels", labels)
 		}
+	}
+}
+
+func TestFindWakeSourceMessageFailsClosedOnDuplicates(t *testing.T) {
+	const sourceID = "msg-0123456789abcdef"
+	one := &Message{ID: "hq-one", ThreadID: "hq-incident", WakeSourceID: sourceID}
+	found, err := findWakeSourceMessage([]*Message{one}, sourceID)
+	if err != nil || found != one {
+		t.Fatalf("single source = %#v, %v", found, err)
+	}
+	if _, err := findWakeSourceMessage([]*Message{one, {
+		ID: "hq-two", ThreadID: "hq-incident", WakeSourceID: sourceID,
+	}}, sourceID); err == nil {
+		t.Fatal("duplicate durable source should fail closed")
+	}
+}
+
+func TestEnsureDirectMessageBySourceConcurrent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell bd stub is POSIX-only")
+	}
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(t.TempDir(), "messages.json")
+	countPath := filepath.Join(t.TempDir(), "creates")
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+case "$1" in
+  list)
+    if [ -s "$MAIL_SOURCE_STATE" ]; then cat "$MAIL_SOURCE_STATE"; else printf '[]\n'; fi
+    ;;
+  create)
+    printf 'create\n' >> "$MAIL_SOURCE_COUNT"
+    printf '%s\n' '[{"id":"hq-mail-one","title":"[HIGH] incident","description":"body","assignee":"mayor/","priority":1,"status":"open","labels":["gt:message","gt:escalation","from:deacon/dogs/bravo","msg-type:escalation","wake-source:msg-0123456789abcdef","thread:hq-wisp-incident","delivery:pending"]}]' > "$MAIL_SOURCE_STATE"
+    printf '%s\n' '{"id":"hq-mail-one"}'
+    ;;
+  *) printf '[]\n' ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MAIL_SOURCE_STATE", statePath)
+	t.Setenv("MAIL_SOURCE_COUNT", countPath)
+
+	router := NewRouterWithTownRoot(townRoot, townRoot)
+	router.startPoller = nil
+	const workers = 20
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := router.EnsureDirectMessageBySource(&Message{
+				From: "deacon/dogs/bravo", To: "mayor/", Subject: "[HIGH] incident", Body: "body",
+				Type: TypeEscalation, ThreadID: "hq-wisp-incident",
+				WakeSourceID: "msg-0123456789abcdef",
+			})
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(data), "create\n") != 1 {
+		t.Fatalf("durable creates = %q, want exactly one", data)
+	}
+	if pending, err := nudge.Pending(townRoot, "hq-mayor"); err != nil || pending != 1 {
+		t.Fatalf("queued source wakes = %d, %v; want 1", pending, err)
 	}
 }
 

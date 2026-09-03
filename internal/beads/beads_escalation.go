@@ -2,9 +2,11 @@
 package beads
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -28,10 +30,44 @@ type EscalationFields struct {
 	LastReescalatedAt  string // When last re-escalated (empty if never)
 	LastReescalatedBy  string // Who last re-escalated (empty if never)
 	Fingerprint        string // Stable duplicate-suppression label
+	Scope              string // Normalized material affected scope
+	MaterialState      string // Hash of severity plus normalized scope
+	MaterialGeneration int    // Positive generation for material state
+	PendingRecipients  []string
+	LastObservedAt     string
 	AnomalyFamily      string // Stable anomaly family excluding affected IDs
 	AnomalyScope       string // Successfully observed database scope
 	PreviousOccurrence string // Most recent resolved occurrence in this lifecycle
 	AnomalyMailStored  bool   // Durable anomaly mail was stored for all configured targets
+	transitionInvalid  bool
+}
+
+type EscalationTransitionKind string
+
+const (
+	EscalationTransitionCreated   EscalationTransitionKind = "created"
+	EscalationTransitionUnchanged EscalationTransitionKind = "unchanged"
+	EscalationTransitionChanged   EscalationTransitionKind = "changed"
+	EscalationTransitionBackfill  EscalationTransitionKind = "backfilled"
+)
+
+type EscalationObservation struct {
+	Title       string
+	Severity    string
+	Scope       string
+	Reason      string
+	Source      string
+	EscalatedBy string
+	ObservedAt  string
+	RelatedBead string
+	Fingerprint string
+	Recipients  []string
+}
+
+type EscalationTransition struct {
+	Issue  *Issue
+	Fields *EscalationFields
+	Kind   EscalationTransitionKind
 }
 
 // FormatEscalationDescription creates a description string from escalation fields.
@@ -104,6 +140,24 @@ func FormatEscalationDescription(title string, fields *EscalationFields) string 
 		lines = append(lines, fmt.Sprintf("fingerprint: %s", fields.Fingerprint))
 	} else {
 		lines = append(lines, "fingerprint: null")
+	}
+	if fields.Scope != "" {
+		lines = append(lines, fmt.Sprintf("scope: %s", fields.Scope))
+	} else {
+		lines = append(lines, "scope: null")
+	}
+	if fields.MaterialState != "" {
+		lines = append(lines, fmt.Sprintf("material_state: %s", fields.MaterialState))
+	} else {
+		lines = append(lines, "material_state: null")
+	}
+	lines = append(lines, fmt.Sprintf("material_generation: %d", fields.MaterialGeneration))
+	pending, _ := json.Marshal(fields.PendingRecipients)
+	lines = append(lines, "pending_recipients: "+string(pending))
+	if fields.LastObservedAt != "" {
+		lines = append(lines, fmt.Sprintf("last_observed_at: %s", fields.LastObservedAt))
+	} else {
+		lines = append(lines, "last_observed_at: null")
 	}
 	if fields.AnomalyFamily != "" {
 		lines = append(lines, fmt.Sprintf("anomaly_family: %s", fields.AnomalyFamily))
@@ -179,6 +233,24 @@ func ParseEscalationFields(description string) *EscalationFields {
 			fields.LastReescalatedBy = value
 		case "fingerprint":
 			fields.Fingerprint = value
+		case "scope":
+			fields.Scope = value
+		case "material_state":
+			fields.MaterialState = value
+		case "material_generation":
+			if n, err := strconv.Atoi(value); err == nil {
+				fields.MaterialGeneration = n
+			} else {
+				fields.transitionInvalid = true
+			}
+		case "pending_recipients":
+			if value == "" {
+				fields.PendingRecipients = nil
+			} else if err := json.Unmarshal([]byte(value), &fields.PendingRecipients); err != nil {
+				fields.transitionInvalid = true
+			}
+		case "last_observed_at":
+			fields.LastObservedAt = value
 		case "anomaly_family":
 			fields.AnomalyFamily = value
 		case "anomaly_scope":
@@ -191,6 +263,194 @@ func ParseEscalationFields(description string) *EscalationFields {
 	}
 
 	return fields
+}
+
+func escalationMaterialState(severity, scope string) string {
+	sum := sha256.Sum256([]byte(severity + "\x00" + scope))
+	return fmt.Sprintf("escalation-state:%x", sum[:12])
+}
+
+func normalizedEscalationRecipients(recipients []string) []string {
+	seen := make(map[string]struct{}, len(recipients))
+	result := make([]string, 0, len(recipients))
+	for _, recipient := range recipients {
+		recipient = strings.TrimSpace(recipient)
+		if recipient == "" {
+			continue
+		}
+		if _, ok := seen[recipient]; ok {
+			continue
+		}
+		seen[recipient] = struct{}{}
+		result = append(result, recipient)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func prepareEscalationTransitionFields(current *EscalationFields, observation EscalationObservation) (*EscalationFields, EscalationTransitionKind, error) {
+	if observation.Severity == "" || observation.Fingerprint == "" || observation.ObservedAt == "" {
+		return nil, "", errors.New("escalation transition requires severity, fingerprint, and observation time")
+	}
+	state := escalationMaterialState(observation.Severity, observation.Scope)
+	if current == nil {
+		return &EscalationFields{
+			Severity: observation.Severity, Reason: observation.Reason, Source: observation.Source,
+			EscalatedBy: observation.EscalatedBy, EscalatedAt: observation.ObservedAt,
+			RelatedBead: observation.RelatedBead, Fingerprint: observation.Fingerprint,
+			Scope: observation.Scope, MaterialState: state, MaterialGeneration: 1,
+			PendingRecipients: normalizedEscalationRecipients(observation.Recipients),
+			LastObservedAt:    observation.ObservedAt,
+		}, EscalationTransitionCreated, nil
+	}
+	if current.transitionInvalid || current.MaterialGeneration < 0 ||
+		(current.MaterialGeneration == 0) != (current.MaterialState == "") {
+		return nil, "", errors.New("invalid stored escalation transition state")
+	}
+	if current.Fingerprint != "" && current.Fingerprint != observation.Fingerprint {
+		return nil, "", errors.New("stored escalation fingerprint changed")
+	}
+
+	next := *current
+	next.PendingRecipients = append([]string(nil), current.PendingRecipients...)
+	next.Reason = observation.Reason
+	next.Source = observation.Source
+	next.RelatedBead = observation.RelatedBead
+	next.LastObservedAt = observation.ObservedAt
+	next.Fingerprint = observation.Fingerprint
+	if current.MaterialGeneration == 0 {
+		next.Severity = observation.Severity
+		next.Scope = observation.Scope
+		next.MaterialState = state
+		next.MaterialGeneration = 1
+		next.PendingRecipients = nil
+		return &next, EscalationTransitionBackfill, nil
+	}
+	if current.MaterialState == state {
+		return &next, EscalationTransitionUnchanged, nil
+	}
+	next.Severity = observation.Severity
+	next.Scope = observation.Scope
+	next.MaterialState = state
+	next.MaterialGeneration++
+	next.PendingRecipients = normalizedEscalationRecipients(observation.Recipients)
+	next.AckedBy = ""
+	next.AckedAt = ""
+	return &next, EscalationTransitionChanged, nil
+}
+
+func escalationTransitionLockID(fingerprint string) (string, error) {
+	const prefix = "escalation-fp:"
+	value := strings.TrimPrefix(fingerprint, prefix)
+	if !strings.HasPrefix(fingerprint, prefix) || len(value) != 12 {
+		return "", fmt.Errorf("invalid escalation fingerprint %q", fingerprint)
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return "", fmt.Errorf("invalid escalation fingerprint %q", fingerprint)
+		}
+	}
+	return "escalation-transition-" + value, nil
+}
+
+// ConvergeEscalationObservation serializes one fingerprint family, creates the
+// initial occurrence, or atomically advances its material generation.
+func (b *Beads) ConvergeEscalationObservation(observation EscalationObservation) (*EscalationTransition, error) {
+	lockID, err := escalationTransitionLockID(observation.Fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := b.lockBead(lockID)
+	if err != nil {
+		return nil, fmt.Errorf("locking escalation transition: %w", err)
+	}
+	defer unlock()
+
+	matches, err := b.ListEscalationsByFingerprint(observation.Fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("ambiguous escalation fingerprint %q: %d open occurrences", observation.Fingerprint, len(matches))
+	}
+	if len(matches) == 0 {
+		fields, kind, err := prepareEscalationTransitionFields(nil, observation)
+		if err != nil {
+			return nil, err
+		}
+		issue, err := b.CreateEscalationBead(observation.Title, fields)
+		if err != nil {
+			return nil, err
+		}
+		return &EscalationTransition{Issue: issue, Fields: fields, Kind: kind}, nil
+	}
+
+	issue := matches[0]
+	current := ParseEscalationFields(issue.Description)
+	fields, kind, err := prepareEscalationTransitionFields(current, observation)
+	if err != nil {
+		return nil, err
+	}
+	description := FormatEscalationDescription(observation.Title, fields)
+	opts := UpdateOptions{Title: &observation.Title, Description: &description}
+	oldSeverity := "severity:" + current.Severity
+	newSeverity := "severity:" + fields.Severity
+	if oldSeverity != newSeverity {
+		if HasLabel(issue, oldSeverity) {
+			opts.RemoveLabels = append(opts.RemoveLabels, oldSeverity)
+		}
+		if !HasLabel(issue, newSeverity) {
+			opts.AddLabels = append(opts.AddLabels, newSeverity)
+		}
+	}
+	if kind == EscalationTransitionChanged && HasLabel(issue, "acked") {
+		opts.RemoveLabels = append(opts.RemoveLabels, "acked")
+	}
+	if err := b.Update(issue.ID, opts); err != nil {
+		return nil, err
+	}
+	updated, err := b.Show(issue.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &EscalationTransition{Issue: updated, Fields: fields, Kind: kind}, nil
+}
+
+// CompleteEscalationRecipient clears one exact pending recipient only while
+// the fingerprint and material generation still match.
+func (b *Beads) CompleteEscalationRecipient(id, fingerprint string, generation int, recipient string) error {
+	lockID, err := escalationTransitionLockID(fingerprint)
+	if err != nil {
+		return err
+	}
+	unlock, err := b.lockBead(lockID)
+	if err != nil {
+		return fmt.Errorf("locking escalation transition: %w", err)
+	}
+	defer unlock()
+
+	issue, fields, err := b.GetEscalationBead(id)
+	if err != nil {
+		return err
+	}
+	if issue == nil || issue.Status != string(StatusOpen) || fields.Fingerprint != fingerprint || fields.MaterialGeneration != generation {
+		return fmt.Errorf("%w: escalation transition changed", ErrAgentFieldsChanged)
+	}
+	pending := fields.PendingRecipients[:0]
+	found := false
+	for _, candidate := range fields.PendingRecipients {
+		if candidate == recipient {
+			found = true
+			continue
+		}
+		pending = append(pending, candidate)
+	}
+	if !found {
+		return nil
+	}
+	fields.PendingRecipients = append([]string(nil), pending...)
+	description := FormatEscalationDescription(issue.Title, fields)
+	return b.Update(id, UpdateOptions{Description: &description})
 }
 
 // CreateEscalationBead creates an escalation bead for tracking escalations.

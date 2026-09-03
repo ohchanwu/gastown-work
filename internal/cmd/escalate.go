@@ -11,6 +11,7 @@ var (
 	escalateSource      string
 	escalateRelatedBead string
 	escalateFingerprint string
+	escalateScope       string
 	escalateJSON        bool
 	escalateListJSON    bool
 	escalateListAll     bool
@@ -145,6 +146,7 @@ func init() {
 	escalateCmd.Flags().StringVar(&escalateSource, "source", "", "Source identifier (e.g., plugin:rebuild-gt, patrol:deacon)")
 	escalateCmd.Flags().StringVar(&escalateRelatedBead, "related", "", "Related bead ID (task, bug, etc.)")
 	escalateCmd.Flags().StringVar(&escalateFingerprint, "fingerprint", "", "Stable duplicate-suppression key for repeated alerts")
+	escalateCmd.Flags().StringVar(&escalateScope, "scope", "", "Normalized affected scope for a fingerprinted alert")
 	escalateCmd.Flags().BoolVar(&escalateJSON, "json", false, "Output as JSON")
 	escalateCmd.Flags().BoolVarP(&escalateDryRun, "dry-run", "n", false, "Show what would be done without executing")
 	escalateCmd.Flags().BoolVar(&escalateStdin, "stdin", false, "Read reason from stdin (avoids shell quoting issues)")
