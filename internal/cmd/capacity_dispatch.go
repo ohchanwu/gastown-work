@@ -860,26 +860,28 @@ func listAllSlingContextRecordsContext(ctx context.Context, townRoot string) ([]
 	seenDirs := make(map[string]bool, len(dirs))
 	for _, dir := range dirs {
 		beadsDir := beads.ResolveBeadsDir(dir)
-		identity := beadsDir
-		if resolved, err := filepath.EvalSymlinks(beadsDir); err == nil {
-			identity = resolved
+		resolved, err := filepath.EvalSymlinks(beadsDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolving sling context database %s: %w", beadsDir, err)
 		}
-		if seenDirs[identity] {
+		resolved = filepath.Clean(resolved)
+		if seenDirs[resolved] {
 			continue
 		}
-		seenDirs[identity] = true
-		targets = append(targets, scanTarget{workDir: dir, beadsDir: beadsDir})
+		seenDirs[resolved] = true
+		targets = append(targets, scanTarget{workDir: filepath.Dir(resolved), beadsDir: resolved})
 	}
 
 	type scanResult struct {
 		contexts []*beads.Issue
-		err      error
 	}
 	results := make([]scanResult, len(targets))
 	workers := len(targets)
 	if workers > slingContextScanConcurrency {
 		workers = slingContextScanConcurrency
 	}
+	scanCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	wg.Add(workers)
@@ -889,28 +891,37 @@ func listAllSlingContextRecordsContext(ctx context.Context, townRoot string) ([]
 			for index := range jobs {
 				target := targets[index]
 				b := beads.NewWithBeadsDir(target.workDir, target.beadsDir)
-				results[index].contexts, results[index].err = b.ListOpenSlingContextsContext(ctx)
+				contexts, err := b.ListOpenSlingContextsContext(scanCtx)
+				if err != nil {
+					cancel(fmt.Errorf("listing sling contexts in %s: %w", target.beadsDir, err))
+					return
+				}
+				results[index].contexts = contexts
 			}
 		}()
 	}
+
+submit:
 	for index := range targets {
-		if err := ctx.Err(); err != nil {
-			close(jobs)
-			wg.Wait()
-			return nil, err
+		if scanCtx.Err() != nil {
+			break
 		}
-		jobs <- index
+		select {
+		case jobs <- index:
+		case <-scanCtx.Done():
+			break submit
+		}
 	}
 	close(jobs)
 	wg.Wait()
+	if err := context.Cause(scanCtx); err != nil {
+		return nil, err
+	}
 
 	var records []slingContextRecord
 	seen := make(map[string]bool)
 	for index, result := range results {
 		target := targets[index]
-		if result.err != nil {
-			return nil, fmt.Errorf("listing sling contexts in %s: %w", target.beadsDir, result.err)
-		}
 		for _, ctx := range result.contexts {
 			key := target.beadsDir + "\x00" + ctx.ID
 			if seen[key] {

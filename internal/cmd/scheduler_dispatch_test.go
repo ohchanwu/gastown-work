@@ -195,6 +195,11 @@ func TestListAllSlingContextRecordsKeepsResolvedDatabaseAfterAliasRetarget(t *te
 	if err := os.Symlink(canonical, alias); err != nil {
 		t.Skipf("symlink fixture unavailable: %v", err)
 	}
+	resolvedCanonical, err := filepath.EvalSymlinks(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical = resolvedCanonical
 
 	ready := filepath.Join(t.TempDir(), "ready")
 	release := filepath.Join(t.TempDir(), "release")
