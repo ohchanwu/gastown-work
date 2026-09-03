@@ -372,25 +372,23 @@ func (p *Propeller) notify(text string, meta map[string]string, urgent bool) err
 	// Always notify the UI
 	p.notifyWithMeta(text, meta)
 
-	// Notify the Agent only if session is ready.
-	// We bypass the IsBusy check if urgent is true (e.g. nudges/escalations).
-	if p.proxy.SessionID() != "" {
-		if urgent || !p.proxy.IsBusy() {
-			// Try a few times in case of transient turn-state changes
-			var err error
-			for i := 0; i < 3; i++ {
-				err = p.proxy.InjectPrompt(text)
-				if err == nil {
-					return nil
-				}
-				debugLog(p.townRoot, "[Propeller] InjectPrompt attempt %d failed: %v", i+1, err)
-				time.Sleep(100 * time.Millisecond)
-			}
-			// Log failure to town.log
-			logEvent(p.townRoot, "acp_error", fmt.Sprintf("failed to inject prompt after retries: %v", err))
-			style.PrintWarning("ACP Propeller failed to inject agent prompt after retries: %v", err)
-			return err
-		}
+	if !urgent && p.proxy.IsBusy() {
+		return fmt.Errorf("agent is busy; prompt was not accepted")
 	}
-	return nil
+
+	// Try a few times in case of transient turn-state changes. Only successful
+	// prompt injection is delivery acceptance; the UI update above is advisory.
+	var err error
+	for i := 0; i < 3; i++ {
+		err = p.proxy.InjectPrompt(text)
+		if err == nil {
+			return nil
+		}
+		debugLog(p.townRoot, "[Propeller] InjectPrompt attempt %d failed: %v", i+1, err)
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Log failure to town.log
+	logEvent(p.townRoot, "acp_error", fmt.Sprintf("failed to inject prompt after retries: %v", err))
+	style.PrintWarning("ACP Propeller failed to inject agent prompt after retries: %v", err)
+	return err
 }

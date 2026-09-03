@@ -167,6 +167,42 @@ func TestPropeller_NotifyReturnsErrorWithoutSessionID(t *testing.T) {
 	}
 }
 
+func TestPropellerBusyNormalNudgeRemainsQueued(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "hq-mayor"
+	if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+		Sender:   "witness",
+		Message:  "wait for a safe prompt boundary",
+		Priority: nudge.PriorityNormal,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	proxy := NewProxy()
+	var ui bytes.Buffer
+	proxy.setStreams(nil, &ui)
+	proxy.sessionMux.Lock()
+	proxy.sessionID = "attached-session"
+	proxy.sessionMux.Unlock()
+	proxy.promptMux.Lock()
+	proxy.activePromptID = "prompt-in-flight"
+	proxy.promptMux.Unlock()
+
+	prop := NewPropeller(proxy, townRoot, session)
+	prop.deliverNudges()
+
+	queued, err := nudge.ListQueued(townRoot, session)
+	if err != nil {
+		t.Fatalf("ListQueued: %v", err)
+	}
+	if len(queued) != 1 || queued[0].Attempts != 1 {
+		t.Fatalf("busy queue = %#v, want one retryable claimed wake", queued)
+	}
+	if !bytes.Contains(ui.Bytes(), []byte("wait for a safe prompt boundary")) {
+		t.Fatalf("busy UI update missing nudge: %s", ui.String())
+	}
+}
+
 func TestEscalationMetaFromNudges_MetadataDriven(t *testing.T) {
 	nudges := []nudge.QueuedNudge{
 		{Sender: "witness", Message: "Helpful document about urgent migrations", Priority: nudge.PriorityNormal, Kind: "mail"},
