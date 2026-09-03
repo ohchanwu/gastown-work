@@ -2999,7 +2999,7 @@ func WithStoppedDoltForDatabaseMove(townRoot string, operation func() error) err
 				return fmt.Errorf("Dolt server is too new to stop safely for a database move")
 			}
 			wasRunning = true
-			if err := stopLocked(townRoot); err != nil {
+			if err := stopOwnedDoltServer(townRoot); err != nil {
 				return fmt.Errorf("stopping Dolt server for database move: %w", err)
 			}
 		}
@@ -3016,6 +3016,10 @@ func WithStoppedDoltForDatabaseMove(townRoot string, operation func() error) err
 	}
 	return operationErr
 }
+
+// stopOwnedDoltServer is a narrow test seam for proving that a failed stop
+// cannot reach a destructive database operation. Production uses stopLocked.
+var stopOwnedDoltServer = stopLocked
 
 func stopLocked(townRoot string) error {
 	config := DefaultConfig(townRoot)
@@ -3040,24 +3044,18 @@ func stopLocked(townRoot string) error {
 		drainConnectionsBeforeStop(config)
 	}
 
-	// Send termination signal for graceful shutdown (SIGTERM on Unix, Kill on Windows)
-	if err := gracefulTerminate(process); err != nil {
-		return fmt.Errorf("sending termination signal: %w", err)
-	}
-
-	// Wait for graceful shutdown (dolt needs more time)
-	for i := 0; i < 10; i++ {
-		time.Sleep(500 * time.Millisecond)
-		if !processIsAlive(pid) {
-			break
+	if err := terminateRevalidatedProcess(pid, func() (revalidatedProcessState, error) {
+		return ownedDoltProcessState(townRoot, pid)
+	}, func(force bool) error {
+		if force {
+			return process.Kill()
 		}
+		return gracefulTerminate(process)
+	}, time.Sleep); err != nil {
+		return fmt.Errorf("stopping Dolt process %d: %w", pid, err)
 	}
-
-	// Check if still running
-	if processIsAlive(pid) {
-		// Still running, force kill
-		_ = process.Kill()
-		time.Sleep(100 * time.Millisecond)
+	if processIsAlive(pid) || isDoltServerOnPort(config.Port) {
+		return fmt.Errorf("Dolt process %d or port %d remained active after stop", pid, config.Port)
 	}
 
 	// Clean up PID file
@@ -3073,6 +3071,20 @@ func stopLocked(townRoot string) error {
 	_ = SaveState(townRoot, state)
 
 	return nil
+}
+
+func ownedDoltProcessState(townRoot string, pid int) (revalidatedProcessState, error) {
+	if !processIsAlive(pid) {
+		return revalidatedProcessAbsent, nil
+	}
+	config := DefaultConfig(townRoot)
+	if !doltProcessMatchesTown(townRoot, pid, config) {
+		return revalidatedProcessChanged, nil
+	}
+	if listenerPID := findDoltServerOnPort(config.Port); listenerPID > 0 && listenerPID != pid {
+		return revalidatedProcessChanged, nil
+	}
+	return revalidatedProcessOwned, nil
 }
 
 // GetConnectionString returns the MySQL connection string for the server.

@@ -279,3 +279,41 @@ func TestRemoveDatabasesWithDoltStoppedRestartsAfterRemovalFailure(t *testing.T)
 		t.Fatal("cleanup failure did not preserve target database")
 	}
 }
+
+func TestWithStoppedDoltForDatabaseMoveStopFailurePreservesDatabase(t *testing.T) {
+	townRoot, _ := startOwnedDatabaseTestServer(t)
+	state, err := LoadState(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.StartedAt = time.Now().Add(-2 * time.Minute)
+	if err := SaveState(townRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	const dbName = "stop_failure_preserves_database"
+	if err := serverExecSQL(townRoot, "CREATE DATABASE `"+dbName+"`"); err != nil {
+		t.Fatal(err)
+	}
+
+	previousStop := stopOwnedDoltServer
+	stopOwnedDoltServer = func(string) error { return errors.New("injected stop failure") }
+	t.Cleanup(func() { stopOwnedDoltServer = previousStop })
+	called := false
+	err = WithStoppedDoltForDatabaseMove(townRoot, func() error {
+		called = true
+		return RemoveDatabase(townRoot, dbName, true)
+	})
+	if err == nil || !strings.Contains(err.Error(), "injected stop failure") {
+		t.Fatalf("WithStoppedDoltForDatabaseMove() error = %v, want injected stop failure", err)
+	}
+	if called {
+		t.Fatal("database move ran after stop failure")
+	}
+	if !DatabaseExists(townRoot, dbName) {
+		t.Fatal("database was removed after stop failure")
+	}
+	running, pid, statusErr := IsRunning(townRoot)
+	if statusErr != nil || !running || pid <= 0 {
+		t.Fatalf("Dolt state after stop failure = running %v pid %d err %v", running, pid, statusErr)
+	}
+}

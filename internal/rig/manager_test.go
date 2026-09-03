@@ -1212,6 +1212,35 @@ func TestAddRigOrphanCleanupRemovesDuplicateWithLiveServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fakeBDThatCreatesPrefix(t, townRoot, port, doltBin)
+	repoDir := createTestGitRepoForRig(t, "source")
+	manager := NewManager(townRoot, rigsConfig, git.NewGit(townRoot))
+	running, oldPID, err := doltserver.IsRunning(townRoot)
+	if err != nil || !running || oldPID <= 0 {
+		t.Fatalf("pre-add Dolt state = running %v pid %d err %v", running, oldPID, err)
+	}
+
+	added, err := manager.AddRig(AddRigOptions{Name: rigName, GitURL: repoDir, BeadsPrefix: prefix})
+	if err != nil {
+		t.Fatalf("AddRig: %v", err)
+	}
+	if added == nil || added.Name != rigName || !manager.RigExists(rigName) {
+		t.Fatalf("AddRig did not complete registration: added %#v", added)
+	}
+	if doltserver.DatabaseExists(townRoot, prefix) {
+		t.Fatalf("prefix database %q survived live AddRig cleanup", prefix)
+	}
+	if !doltserver.DatabaseExists(townRoot, rigName) {
+		t.Fatalf("canonical rig database %q was removed", rigName)
+	}
+	running, newPID, err := doltserver.IsRunning(townRoot)
+	if err != nil || !running || newPID <= 0 || newPID == oldPID {
+		t.Fatalf("post-cleanup Dolt state = running %v pid %d old %d err %v", running, newPID, oldPID, err)
+	}
+}
+
+func fakeBDThatCreatesPrefix(t *testing.T, townRoot string, port int, doltBin string) string {
+	t.Helper()
 	t.Setenv("TEST_DOLT_BIN", doltBin)
 	t.Setenv("TEST_DOLT_PORT", strconv.Itoa(port))
 	t.Setenv("TEST_DOLT_DATA_DIR", filepath.Join(townRoot, ".dolt-data"))
@@ -1239,29 +1268,43 @@ case "$cmd" in
 esac
 `, "")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	repoDir := createTestGitRepoForRig(t, "source")
-	manager := NewManager(townRoot, rigsConfig, git.NewGit(townRoot))
-	running, oldPID, err := doltserver.IsRunning(townRoot)
-	if err != nil || !running || oldPID <= 0 {
-		t.Fatalf("pre-add Dolt state = running %v pid %d err %v", running, oldPID, err)
-	}
+	return binDir
+}
 
-	added, err := manager.AddRig(AddRigOptions{Name: rigName, GitURL: repoDir, BeadsPrefix: prefix})
+func TestAddRigOrphanCleanupRefusesFreshServer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test manages a native Dolt server")
+	}
+	doltBin, err := exec.LookPath("dolt")
 	if err != nil {
-		t.Fatalf("AddRig: %v", err)
+		t.Skip("dolt binary not available")
 	}
-	if added == nil || added.Name != rigName || !manager.RigExists(rigName) {
-		t.Fatalf("AddRig did not complete registration: added %#v", added)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if doltserver.DatabaseExists(townRoot, prefix) {
-		t.Fatalf("prefix database %q survived live AddRig cleanup", prefix)
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+	townRoot, rigsConfig := setupTestTown(t)
+	if err := doltserver.Start(townRoot); err != nil {
+		t.Fatalf("starting isolated Dolt server: %v", err)
 	}
-	if !doltserver.DatabaseExists(townRoot, rigName) {
-		t.Fatalf("canonical rig database %q was removed", rigName)
+	t.Cleanup(func() {
+		if running, _, _ := doltserver.IsRunning(townRoot); running {
+			_ = doltserver.Stop(townRoot)
+		}
+	})
+	fakeBDThatCreatesPrefix(t, townRoot, port, doltBin)
+	repoDir := createTestGitRepoForRig(t, "fresh-source")
+	manager := NewManager(townRoot, rigsConfig, git.NewGit(townRoot))
+	_, err = manager.AddRig(AddRigOptions{Name: "fresh_rig", GitURL: repoDir, BeadsPrefix: "fr"})
+	if err == nil || !strings.Contains(err.Error(), "too new to stop safely") {
+		t.Fatalf("AddRig error = %v, want fail-closed fresh-server refusal", err)
 	}
-	running, newPID, err := doltserver.IsRunning(townRoot)
-	if err != nil || !running || newPID <= 0 || newPID == oldPID {
-		t.Fatalf("post-cleanup Dolt state = running %v pid %d old %d err %v", running, newPID, oldPID, err)
+	running, pid, statusErr := doltserver.IsRunning(townRoot)
+	if statusErr != nil || !running || pid <= 0 {
+		t.Fatalf("Dolt state after fresh-server refusal = running %v pid %d err %v", running, pid, statusErr)
 	}
 }
 
