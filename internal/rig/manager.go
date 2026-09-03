@@ -1651,8 +1651,9 @@ func warnDeprecatedRigConfigKeys(data []byte, path string) {
 // reads from <rigName> — causing the silent data split documented in gh#3562.
 //
 // On entry the orphan is freshly created by bd init and contains only schema
-// tables, so it is safe to force-drop. If the candidate looks like a real rig
-// database (matches rigName, "hq", or doesn't exist at all) it is skipped.
+// tables, so AddRig may coordinate an owned server stop, exact offline removal,
+// and restart. If the candidate looks like a real rig database (matches
+// rigName, "hq", or doesn't exist at all) it is skipped.
 //
 // Returns an error only if at least one orphan candidate exists on disk and
 // cannot be removed — callers in AddRig treat that as fatal so the user is not
@@ -1662,7 +1663,7 @@ func dropRigOrphanDBs(townRoot, prefix, rigName string) error {
 		return nil
 	}
 	candidates := []string{prefix, "beads_" + prefix}
-	var failures []string
+	var existing []string
 	for _, name := range candidates {
 		if name == rigName || name == "hq" {
 			continue
@@ -1670,18 +1671,21 @@ func dropRigOrphanDBs(townRoot, prefix, rigName string) error {
 		if !doltserver.DatabaseExists(townRoot, name) {
 			continue
 		}
-		if err := doltserver.RemoveDatabase(townRoot, name, true); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
-			continue
-		}
+		existing = append(existing, name)
+	}
+	if err := doltserver.RemoveDatabasesWithDoltStopped(townRoot, existing, true); err != nil {
+		return fmt.Errorf("removing orphan database(s) for rig %q (prefix %q): %w", rigName, prefix, err)
+	}
+	var failures []string
+	for _, name := range existing {
 		// Re-check: RemoveDatabase may report success but leave files behind
-		// in pathological cases (read-only server, partial DROP).
+		// after a failed filesystem sync or restart.
 		if doltserver.DatabaseExists(townRoot, name) {
-			failures = append(failures, fmt.Sprintf("%s: still present after RemoveDatabase", name))
+			failures = append(failures, fmt.Sprintf("%s: still present after offline removal", name))
 		}
 	}
 	if len(failures) > 0 {
-		return fmt.Errorf("orphan database(s) for rig %q (prefix %q) could not be removed: %s — run `gt dolt cleanup --force` to resolve",
+		return fmt.Errorf("orphan database(s) for rig %q (prefix %q) could not be removed: %s — stop Dolt, run `gt dolt cleanup --force`, then start Dolt",
 			rigName, prefix, strings.Join(failures, "; "))
 	}
 	return nil

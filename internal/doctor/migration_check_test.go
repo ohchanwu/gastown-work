@@ -414,12 +414,15 @@ func TestDoltOrphanedDatabaseCheck_DetectsOrphans(t *testing.T) {
 	if len(result.Details) != 1 {
 		t.Fatalf("expected 1 detail, got %d", len(result.Details))
 	}
-	if result.FixHint == "" {
-		t.Error("expected a fix hint")
+	for _, command := range []string{"gt dolt stop", "gt dolt cleanup", "gt dolt start"} {
+		if !strings.Contains(result.FixHint, command) {
+			t.Errorf("fix hint %q missing %q", result.FixHint, command)
+		}
 	}
 }
 
 func TestDoltOrphanedDatabaseCheck_Fix(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
 	townRoot := t.TempDir()
 
 	setupDoltDB(t, townRoot, "hq")

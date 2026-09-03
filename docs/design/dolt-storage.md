@@ -74,6 +74,10 @@ a receipt or issuing SQL. Once the server is stopped, cleanup records the exact
 incarnation, atomically renames that directory into its private claim path,
 revalidates ownership, and deletes only the claimed directory. This avoids the
 unrecoverable race between a live identity check and unconditional `DROP DATABASE`.
+AddRig's duplicate-prefix repair is the narrow coordinated exception: it uses
+the owned lifecycle transaction to stop the local server, remove only the exact
+new duplicate through the same offline path, and restore the server even when
+cleanup fails.
 
 ## Environment Variables
 

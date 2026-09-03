@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -245,5 +246,36 @@ func TestRemoveDatabaseRefusesUnconditionalLiveDrop(t *testing.T) {
 	}
 	if _, err := os.Stat(databaseCleanupReceiptPath(townRoot, dbName)); !os.IsNotExist(err) {
 		t.Fatalf("live refusal left a destructive cleanup receipt: %v", err)
+	}
+}
+
+func TestRemoveDatabasesWithDoltStoppedRestartsAfterRemovalFailure(t *testing.T) {
+	townRoot, _ := startOwnedDatabaseTestServer(t)
+	state, err := LoadState(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.StartedAt = time.Now().Add(-2 * time.Minute)
+	if err := SaveState(townRoot, state); err != nil {
+		t.Fatal(err)
+	}
+	const dbName = "restart_after_cleanup_failure"
+	if err := serverExecSQL(townRoot, "CREATE DATABASE `"+dbName+"`"); err != nil {
+		t.Fatal(err)
+	}
+
+	previousSync := databaseCleanupFileSync
+	databaseCleanupFileSync = func(*os.File) error { return errors.New("injected receipt sync failure") }
+	t.Cleanup(func() { databaseCleanupFileSync = previousSync })
+	err = RemoveDatabasesWithDoltStopped(townRoot, []string{dbName}, true)
+	if err == nil || !strings.Contains(err.Error(), "injected receipt sync failure") {
+		t.Fatalf("RemoveDatabasesWithDoltStopped() error = %v, want injected receipt failure", err)
+	}
+	running, pid, statusErr := IsRunning(townRoot)
+	if statusErr != nil || !running || pid <= 0 {
+		t.Fatalf("Dolt was not restored after cleanup failure: running %v pid %d err %v", running, pid, statusErr)
+	}
+	if !DatabaseExists(townRoot, dbName) {
+		t.Fatal("cleanup failure did not preserve target database")
 	}
 }

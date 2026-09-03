@@ -3,13 +3,16 @@ package rig
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -1164,6 +1167,101 @@ func TestDropRigOrphanDBs_RemovesLegacyBeadsPrefixDB(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, rigName, ".dolt")); err != nil {
 		t.Errorf("rig DB %q should be preserved; stat err = %v", rigName, err)
+	}
+}
+
+func TestAddRigOrphanCleanupRemovesDuplicateWithLiveServer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test manages a native Dolt server")
+	}
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt binary not available")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+
+	townRoot, rigsConfig := setupTestTown(t)
+	if err := doltserver.Start(townRoot); err != nil {
+		t.Fatalf("starting isolated Dolt server: %v", err)
+	}
+	t.Cleanup(func() {
+		running, _, _ := doltserver.IsRunning(townRoot)
+		if running {
+			if err := doltserver.Stop(townRoot); err != nil {
+				t.Errorf("stopping isolated Dolt server: %v", err)
+			}
+		}
+	})
+	state, err := doltserver.LoadState(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.StartedAt = time.Now().Add(-2 * time.Minute)
+	if err := doltserver.SaveState(townRoot, state); err != nil {
+		t.Fatal(err)
+	}
+
+	const rigName = "mobile_apps"
+	const prefix = "ma"
+	doltBin, err := exec.LookPath("dolt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_DOLT_BIN", doltBin)
+	t.Setenv("TEST_DOLT_PORT", strconv.Itoa(port))
+	t.Setenv("TEST_DOLT_DATA_DIR", filepath.Join(townRoot, ".dolt-data"))
+	binDir := writeFakeBD(t, `#!/bin/bash
+cmd="$1"
+[[ "$cmd" == "--allow-stale" ]] && { shift; cmd="$1"; }
+shift
+case "$cmd" in
+  init)
+    prefix=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --prefix) prefix="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [[ -n "$prefix" ]]; then
+      cd "$TEST_DOLT_DATA_DIR" || exit 1
+      "$TEST_DOLT_BIN" --host 127.0.0.1 --port "$TEST_DOLT_PORT" --user root --password "" --no-tls sql -q "CREATE DATABASE IF NOT EXISTS $prefix"
+    fi
+    ;;
+  config|slot) exit 0 ;;
+  show) exit 1 ;;
+  create) printf '{"id":"test-agent","title":"test-agent","description":"","issue_type":"agent"}' ;;
+esac
+`, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	repoDir := createTestGitRepoForRig(t, "source")
+	manager := NewManager(townRoot, rigsConfig, git.NewGit(townRoot))
+	running, oldPID, err := doltserver.IsRunning(townRoot)
+	if err != nil || !running || oldPID <= 0 {
+		t.Fatalf("pre-add Dolt state = running %v pid %d err %v", running, oldPID, err)
+	}
+
+	added, err := manager.AddRig(AddRigOptions{Name: rigName, GitURL: repoDir, BeadsPrefix: prefix})
+	if err != nil {
+		t.Fatalf("AddRig: %v", err)
+	}
+	if added == nil || added.Name != rigName || !manager.RigExists(rigName) {
+		t.Fatalf("AddRig did not complete registration: added %#v", added)
+	}
+	if doltserver.DatabaseExists(townRoot, prefix) {
+		t.Fatalf("prefix database %q survived live AddRig cleanup", prefix)
+	}
+	if !doltserver.DatabaseExists(townRoot, rigName) {
+		t.Fatalf("canonical rig database %q was removed", rigName)
+	}
+	running, newPID, err := doltserver.IsRunning(townRoot)
+	if err != nil || !running || newPID <= 0 || newPID == oldPID {
+		t.Fatalf("post-cleanup Dolt state = running %v pid %d old %d err %v", running, newPID, oldPID, err)
 	}
 }
 

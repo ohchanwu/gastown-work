@@ -503,7 +503,7 @@ func (c *DoltOrphanedDatabaseCheck) Run(ctx *CheckContext) *CheckResult {
 		Status:   StatusWarning,
 		Message:  fmt.Sprintf("%d orphaned database(s) in .dolt-data/", len(orphans)),
 		Details:  details,
-		FixHint:  "Run 'gt dolt cleanup' to remove orphaned databases",
+		FixHint:  "Run 'gt dolt stop', then 'gt dolt cleanup', then 'gt dolt start' to remove orphaned databases",
 		Category: c.CheckCategory,
 	}
 }

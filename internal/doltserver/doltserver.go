@@ -6053,12 +6053,35 @@ func WithDatabaseOwnershipTransaction(townRoot string, operation func() error) e
 	return doltlock.WithDatabaseOwnership(townRoot, operation)
 }
 
-// RemoveDatabase removes an orphaned database directory from .dolt-data/.
-// The caller should verify the database is actually orphaned before calling this.
-// If the Dolt server is running, it will DROP the database first.
-// If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
+// RemoveDatabase removes an orphaned database directory from .dolt-data/ while
+// the Dolt server is stopped. The caller should verify the database is actually
+// orphaned before calling this. If force is false and the database has more than
+// the offline safety threshold, removal is refused. (gt-q8f6n)
 func RemoveDatabase(townRoot, dbName string, force bool) error {
 	return removeDatabase(townRoot, dbName, force, "", "")
+}
+
+// RemoveDatabasesWithDoltStopped stops an owned local Dolt server, removes the
+// exact database names through the offline receipt/claim path, then restores the
+// server even when removal fails. It is reserved for coordinated lifecycle
+// operations such as AddRig cleanup; routine cleanup remains explicitly offline.
+func RemoveDatabasesWithDoltStopped(townRoot string, dbNames []string, force bool) error {
+	if len(dbNames) == 0 {
+		return nil
+	}
+	for _, dbName := range dbNames {
+		if err := validateDatabaseRemoval(townRoot, dbName); err != nil {
+			return err
+		}
+	}
+	return WithStoppedDoltForDatabaseMove(townRoot, func() error {
+		for _, dbName := range dbNames {
+			if err := removeDatabaseWithLifecycleHeld(townRoot, dbName, force, "", ""); err != nil {
+				return fmt.Errorf("removing database %q while Dolt is stopped: %w", dbName, err)
+			}
+		}
+		return nil
+	})
 }
 
 // RemoveDatabaseIfCreationToken removes dbName only when it still carries the
@@ -6080,11 +6103,8 @@ func RemoveDatabaseIfRootIncarnation(townRoot, dbName, rootIdentity string, forc
 }
 
 func removeDatabase(townRoot, dbName string, force bool, creationToken, legacyRoot string) error {
-	if _, err := DatabasePath(townRoot, dbName); err != nil {
+	if err := validateDatabaseRemoval(townRoot, dbName); err != nil {
 		return err
-	}
-	if isProtectedSharedServerDatabase(dbName) {
-		return fmt.Errorf("database %q is a protected shared-server database", dbName)
 	}
 
 	doltLifecycleMu.Lock()
@@ -6101,7 +6121,20 @@ func removeDatabase(townRoot, dbName string, force bool, creationToken, legacyRo
 	if running {
 		return fmt.Errorf("destructive database cleanup requires a stopped Dolt server; refusing unconditional live DROP for %q", dbName)
 	}
+	return removeDatabaseWithLifecycleHeld(townRoot, dbName, force, creationToken, legacyRoot)
+}
 
+func validateDatabaseRemoval(townRoot, dbName string) error {
+	if _, err := DatabasePath(townRoot, dbName); err != nil {
+		return err
+	}
+	if isProtectedSharedServerDatabase(dbName) {
+		return fmt.Errorf("database %q is a protected shared-server database", dbName)
+	}
+	return nil
+}
+
+func removeDatabaseWithLifecycleHeld(townRoot, dbName string, force bool, creationToken, legacyRoot string) error {
 	return WithDatabaseOwnershipTransaction(townRoot, func() error {
 		lockDir := filepath.Join(townRoot, ".runtime", "dolt-database-cleanup")
 		if err := ensurePrivateDatabaseCleanupDirectory(lockDir); err != nil {
