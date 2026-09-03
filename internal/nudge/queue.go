@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/delivery"
@@ -284,6 +285,37 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	path := filepath.Join(dir, filename)
 
 	return writeQueueRecord(path, nudge)
+}
+
+// EnqueueUniqueBySource writes a nudge unless the same kind, thread, and
+// durable source is already queued or claimed for this session.
+func EnqueueUniqueBySource(townRoot, session string, n QueuedNudge) (bool, error) {
+	if n.Kind == "" || n.ThreadID == "" || n.SourceID == "" {
+		return false, errors.New("unique nudge requires kind, thread, and source")
+	}
+	dir := queueDir(townRoot, session)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return false, fmt.Errorf("creating nudge queue dir: %w", err)
+	}
+	queueLock := flock.New(filepath.Join(dir, ".enqueue.lock"))
+	if err := queueLock.Lock(); err != nil {
+		return false, fmt.Errorf("locking nudge queue: %w", err)
+	}
+	defer func() { _ = queueLock.Unlock() }()
+
+	queued, err := ListQueued(townRoot, session)
+	if err != nil {
+		return false, err
+	}
+	for _, existing := range queued {
+		if existing.Kind == n.Kind && existing.ThreadID == n.ThreadID && existing.SourceID == n.SourceID {
+			return false, nil
+		}
+	}
+	if err := Enqueue(townRoot, session, n); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Requeue writes previously drained nudges back to the queue for later delivery.

@@ -1968,20 +1968,17 @@ func prioritySeverityLabel(priority Priority) string {
 	}
 }
 
-// enqueueReplyReminder queues a deferred nudge reminding the recipient to reply
-// via gt mail send rather than in chat. Best-effort: errors are logged, not returned.
+// enqueueReplyReminder queues one deferred nudge for an actionable task mail.
+// Best-effort: errors are logged, not returned.
 //
 // Skipped when:
 //   - No town root (can't use nudge queue)
-//   - Message type is TypeReply (recipient is already replying)
+//   - Message is not an explicit task
 //   - Sender is not a direct mail address that can receive a reply
 //   - Configured delay is zero or negative (feature disabled)
 func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
-	if r.townRoot == "" {
+	if r.townRoot == "" || msg == nil || msg.Type != TypeTask {
 		return
-	}
-	if msg.Type == TypeReply {
-		return // Already a reply — reminder would be redundant
 	}
 	if !senderCanReceiveReply(msg.From) {
 		return
@@ -1990,19 +1987,21 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if delay <= 0 {
 		return // Disabled by config
 	}
+	sourceID, err := WakeSourceForMessage(msg)
+	if err != nil || msg.ThreadID == "" {
+		return
+	}
 	reminder := nudge.QueuedNudge{
 		Sender:       "system",
 		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", msg.From, msg.Subject, msg.From),
 		Priority:     nudge.PriorityNormal,
 		Kind:         "reply-reminder",
 		ThreadID:     msg.ThreadID,
+		SourceID:     sourceID,
+		SourceKind:   nudge.SourceKindMail,
 		DeliverAfter: time.Now().Add(delay),
 	}
-	if sourceID, err := WakeSourceForMessage(msg); err == nil {
-		reminder.SourceID = sourceID
-		reminder.SourceKind = nudge.SourceKindMail
-	}
-	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
+	if _, err := nudge.EnqueueUniqueBySource(r.townRoot, sessionID, reminder); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to enqueue reply reminder for %s: %v\n", sessionID, err)
 	}
 }

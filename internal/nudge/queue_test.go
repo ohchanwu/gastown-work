@@ -71,6 +71,39 @@ func TestEnqueueAndDrain(t *testing.T) {
 	}
 }
 
+func TestEnqueueUniqueBySourceConcurrent(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionID := "gt-gastown-crew-sean"
+	reminder := QueuedNudge{
+		Sender:     "system",
+		Message:    "reply required",
+		Kind:       "reply-reminder",
+		ThreadID:   "thread-actionable",
+		SourceID:   "msg-0123456789abcdef",
+		SourceKind: SourceKindMail,
+	}
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := EnqueueUniqueBySource(townRoot, sessionID, reminder); err != nil {
+				t.Errorf("EnqueueUniqueBySource: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	queued, err := ListQueued(townRoot, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != 1 {
+		t.Fatalf("queued %d reminders, want 1", len(queued))
+	}
+}
+
 func TestQueuedNudgeSourceJSONCompatibility(t *testing.T) {
 	var legacy QueuedNudge
 	if err := json.Unmarshal([]byte(`{"sender":"mayor","message":"legacy","priority":"normal"}`), &legacy); err != nil {

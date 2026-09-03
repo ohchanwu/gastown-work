@@ -1908,10 +1908,10 @@ func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {
 		t.Fatalf("external retry starts = %d, want 1", pollerStarts)
 	}
 
-	// The unconfirmed notification and deferred reply reminder both persist.
+	// Informational mail retains only its unconfirmed notification.
 	pending, _ := nudge.Pending(townRoot, sessionName)
-	if pending != 2 {
-		t.Errorf("expected notification + reminder for idle unsupported runtime, got %d", pending)
+	if pending != 1 {
+		t.Errorf("expected one notification for idle unsupported runtime, got %d", pending)
 	}
 
 	// Confirm the queued nudge is deferred, not a missed immediate notification.
@@ -1963,12 +1963,10 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 		t.Fatalf("external retry starts = %d, want 1", pollerStarts)
 	}
 
-	// Two nudges should be queued:
-	//   1. The immediate "you have mail" notification (deliverable now).
-	//   2. The deferred reply-reminder (not ready until configured delay elapses).
+	// Informational mail queues only the immediate notification.
 	pending, _ := nudge.Pending(townRoot, sessionName)
-	if pending != 2 {
-		t.Errorf("expected 2 queued nudges (notification + reply-reminder) for busy agent, got %d", pending)
+	if pending != 1 {
+		t.Errorf("expected 1 queued notification for busy agent, got %d", pending)
 	}
 
 	// Exactly 1 should be immediately deliverable (the main notification).
@@ -1986,10 +1984,10 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 		t.Error("normal queued notification should retain its configured TTL")
 	}
 
-	// The reply-reminder should still be in queue (deferred).
+	// Informational mail must not leave a reply reminder.
 	remaining, _ := nudge.Pending(townRoot, sessionName)
-	if remaining != 1 {
-		t.Errorf("expected 1 deferred reply-reminder still in queue, got %d", remaining)
+	if remaining != 0 {
+		t.Errorf("expected no reply reminder for informational mail, got %d", remaining)
 	}
 }
 
@@ -2016,8 +2014,8 @@ func TestNotifyRecipient_QueuedRetryStarterFailureIsVisible(t *testing.T) {
 	if !errors.Is(err, ErrNotificationQueued) || !errors.Is(err, ErrNotificationFailed) {
 		t.Fatalf("notifyRecipient error = %v, want queued and failed retry ownership", err)
 	}
-	if pending, _ := nudge.Pending(townRoot, sessionName); pending != 2 {
-		t.Fatalf("durable notification + reminder count = %d, want 2", pending)
+	if pending, _ := nudge.Pending(townRoot, sessionName); pending != 1 {
+		t.Fatalf("durable notification count = %d, want 1", pending)
 	}
 	nudges, drainErr := nudge.Drain(townRoot, sessionName)
 	if drainErr != nil || len(nudges) != 1 || nudges[0].Priority != nudge.PriorityUrgent || !nudges[0].DurableUntilAck {
@@ -2056,8 +2054,8 @@ func TestNotifyRecipient_CanonicalAliasFansOutToBusyCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Pending(%s): %v", sessionID, err)
 		}
-		if pending != 2 {
-			t.Fatalf("Pending(%s) = %d, want 2 queued nudges (mail + reminder)", sessionID, pending)
+		if pending != 1 {
+			t.Fatalf("Pending(%s) = %d, want one informational mail wake", sessionID, pending)
 		}
 
 		nudges, err := nudge.Drain(townRoot, sessionID)
@@ -2191,8 +2189,8 @@ func TestNotifyRecipient_BusyAgentEscalationUsesUrgentQueuedNudge(t *testing.T) 
 	}
 
 	remaining, _ := nudge.Pending(townRoot, sessionName)
-	if remaining != 1 {
-		t.Fatalf("expected 1 deferred reply-reminder after draining escalation nudge, got %d", remaining)
+	if remaining != 0 {
+		t.Fatalf("expected no reply reminder for escalation mail, got %d", remaining)
 	}
 }
 
@@ -2411,15 +2409,19 @@ func TestEnqueueReplyReminder_Basic(t *testing.T) {
 		townRoot: townRoot,
 	}
 	msg := &Message{
-		From:    "gastown/witness",
-		To:      "gastown/crew/alice",
-		Subject: "status check",
-		Type:    TypeNotification,
+		From:         "gastown/witness",
+		To:           "gastown/crew/alice",
+		Subject:      "status check",
+		Type:         TypeTask,
+		ThreadID:     "thread-actionable",
+		WakeSourceID: "msg-0123456789abcdef",
 	}
 	sessionID := "gt-gastown-crew-alice"
 
 	before := time.Now()
-	r.enqueueReplyReminder(msg, sessionID)
+	for range 20 {
+		r.enqueueReplyReminder(msg, sessionID)
+	}
 	after := time.Now()
 
 	// Exactly one nudge should be queued.
@@ -2443,12 +2445,18 @@ func TestEnqueueReplyReminder_Basic(t *testing.T) {
 	// File still in queue — confirm DeliverAfter is ~30s ahead.
 	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", sessionID)
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 file in queue dir, got %d", len(entries))
+	var queueFiles []os.DirEntry
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".json") {
+			queueFiles = append(queueFiles, entry)
+		}
+	}
+	if len(queueFiles) != 1 {
+		t.Fatalf("expected 1 queue record, got %d", len(queueFiles))
 	}
 
 	// Read the raw JSON to inspect DeliverAfter.
-	data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	data, err := os.ReadFile(filepath.Join(dir, queueFiles[0].Name()))
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -2475,6 +2483,26 @@ func TestEnqueueReplyReminder_Basic(t *testing.T) {
 	}
 	if q.ThreadID != msg.ThreadID {
 		t.Errorf("ThreadID = %q, want %q", q.ThreadID, msg.ThreadID)
+	}
+	if q.SourceID != msg.WakeSourceID || q.SourceKind != nudge.SourceKindMail {
+		t.Errorf("source = (%q, %q), want (%q, %q)", q.SourceID, q.SourceKind, msg.WakeSourceID, nudge.SourceKindMail)
+	}
+}
+
+func TestEnqueueReplyReminderInformationalMailCreatesZero(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	r.enqueueReplyReminder(&Message{
+		From:         "gastown/witness",
+		To:           "gastown/crew/alice",
+		Subject:      "FYI only",
+		Type:         TypeNotification,
+		ThreadID:     "thread-informational",
+		WakeSourceID: "msg-0123456789abcdef",
+	}, "gt-gastown-crew-alice")
+
+	if pending, err := nudge.Pending(townRoot, "gt-gastown-crew-alice"); err != nil || pending != 0 {
+		t.Fatalf("informational reminder count = %d, %v; want zero", pending, err)
 	}
 }
 
@@ -2510,10 +2538,12 @@ func TestEnqueueReplyReminder_RoutableSenderStillQueues(t *testing.T) {
 			townRoot := t.TempDir()
 			r := &Router{workDir: t.TempDir(), townRoot: townRoot}
 			msg := &Message{
-				From:    from,
-				To:      "gastown/crew/bob",
-				Subject: "status check",
-				Type:    TypeNotification,
+				From:         from,
+				To:           "gastown/crew/bob",
+				Subject:      "status check",
+				Type:         TypeTask,
+				ThreadID:     "thread-actionable",
+				WakeSourceID: "msg-0123456789abcdef",
 			}
 			sessionID := session.CrewSessionName(session.PrefixFor("gastown"), "bob")
 
