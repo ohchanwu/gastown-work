@@ -1013,3 +1013,38 @@ func TestDogReaperFormulaDelegatesAnomalyLifecycleToCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestRecurringEscalationFormulasUseStableIdentity(t *testing.T) {
+	tests := []struct {
+		formula     string
+		step        string
+		fingerprint string
+		scope       string
+	}{
+		{formula: "mol-deacon-patrol", step: "dolt-health", fingerprint: "dolt:server-unreachable", scope: "town-dolt"},
+		{formula: "mol-dog-stale-db", step: "cleanup", fingerprint: "dolt:orphan-database-limit", scope: "town-dolt"},
+		{formula: "mol-dog-doctor", step: "probe", fingerprint: "dolt:server-unreachable", scope: "town-dolt"},
+		{formula: "mol-dog-doctor", step: "report", fingerprint: "dolt:critical-degradation", scope: "town-dolt"},
+		{formula: "mol-dog-phantom-db", step: "escalate", fingerprint: "dolt:phantom-databases", scope: "town-dolt"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.formula+"/"+tt.step, func(t *testing.T) {
+			content, err := GetEmbeddedFormulaContent(tt.formula)
+			if err != nil {
+				t.Fatal(err)
+			}
+			workflow, err := Parse(content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			step := workflow.GetStep(tt.step)
+			if step == nil {
+				t.Fatalf("missing step %q", tt.step)
+			}
+			identity := `--fingerprint "` + tt.fingerprint + `" --scope "` + tt.scope + `"`
+			if !strings.Contains(step.Description, identity) {
+				t.Fatalf("step %q lacks stable escalation identity %q", tt.step, identity)
+			}
+		})
+	}
+}

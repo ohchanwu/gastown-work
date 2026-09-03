@@ -168,7 +168,7 @@ func (d *Daemon) syncJsonlGitBackup() {
 	// Post-scrub verification: re-scan output for any remaining pollution.
 	if remaining := d.verifyNoPollution(gitRepo, databases); remaining > 0 {
 		d.logger.Printf("jsonl_git_backup: WARNING: %d suspicious record(s) survived scrub+filter", remaining)
-		d.escalate("jsonl_git_backup", fmt.Sprintf("post-scrub verification found %d suspicious records — review JSONL exports", remaining))
+		d.escalate("pollution-survived", fmt.Sprintf("post-scrub verification found %d suspicious records — review JSONL exports", remaining))
 	}
 
 	mol.closeStep("verify")
@@ -179,7 +179,7 @@ func (d *Daemon) syncJsonlGitBackup() {
 	if len(spikes) > 0 {
 		report := formatSpikeReport(spikes)
 		d.logger.Printf("jsonl_git_backup: HALTING — spike detected:\n%s", report)
-		d.escalate("jsonl_git_backup", report)
+		d.escalate("export-spike", report)
 		mol.failStep("push", "spike detected")
 		return // Do NOT commit — spike detected.
 	}
@@ -194,7 +194,7 @@ func (d *Daemon) syncJsonlGitBackup() {
 		d.jsonlPushFailures++
 		if d.jsonlPushFailures >= maxConsecutivePushFailures {
 			d.logger.Printf("jsonl_git_backup: ESCALATION: %d consecutive push failures", d.jsonlPushFailures)
-			d.escalate("jsonl_git_backup", fmt.Sprintf("git push failed %d consecutive times", d.jsonlPushFailures))
+			d.escalate("push-failure", fmt.Sprintf("git push failed %d consecutive times", d.jsonlPushFailures))
 			// Reset to avoid flooding escalations every tick.
 			d.jsonlPushFailures = 0
 		}
@@ -500,18 +500,27 @@ func (d *Daemon) runGitCmd(dir string, timeout time.Duration, args ...string) er
 	return nil
 }
 
-// escalate sends an escalation message to the mayor via gt escalate.
-func (d *Daemon) escalate(source, message string) {
+// escalate sends a fingerprinted escalation message to the mayor via gt escalate.
+func (d *Daemon) escalate(condition, message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", "HIGH",
-		fmt.Sprintf("%s: %s", source, message))
+	cmd := exec.CommandContext(ctx, "gt", jsonlBackupEscalationArgs(condition, message)...)
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
 	util.SetDetachedProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		d.logger.Printf("jsonl_git_backup: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+}
+
+func jsonlBackupEscalationArgs(condition, message string) []string {
+	condition = strings.ToLower(strings.TrimSpace(condition))
+	return []string{
+		"escalate", "-s", "HIGH",
+		"--fingerprint", "jsonl-backup:" + condition,
+		"--scope", "service:jsonl-backup",
+		"jsonl_git_backup: " + message,
 	}
 }
 

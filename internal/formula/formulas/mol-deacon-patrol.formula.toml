@@ -680,7 +680,7 @@ Parse the JSON output (HealthReport schema):
 
 **Server down (CRITICAL):**
 ```bash
-gt escalate -s CRITICAL "Dolt server is down"
+gt escalate -s CRITICAL --fingerprint "dolt:server-unreachable" --scope "town-dolt" "Dolt server is down"
 ```
 
 **Commit bloat (commits > 50k in any DB):**

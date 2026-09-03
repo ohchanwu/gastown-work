@@ -62,7 +62,7 @@ Time the probe query. Warn if > {{latency_threshold}}.
 **If server unreachable:**
 This is a critical failure. Escalate immediately:
 ```bash
-gt escalate -s CRITICAL "Dolt: server unreachable"
+gt escalate -s CRITICAL --fingerprint "dolt:server-unreachable" --scope "town-dolt" "Dolt: server unreachable"
 ```
 
 **Exit criteria:** Server connectivity confirmed (or escalated)."""
@@ -153,8 +153,9 @@ None detected.
 
 **2. Escalate if critical:**
 ```bash
-# If server unreachable or critically degraded
-gt escalate -s CRITICAL "Dolt: <condition>"
+# For a critical degradation distinct from the probe's server-unreachable incident.
+# Keep measurements and diagnostics in the message, not the fingerprint or scope.
+gt escalate -s CRITICAL --fingerprint "dolt:critical-degradation" --scope "town-dolt" "Dolt: <condition and current diagnostics>"
 ```
 
 **3. Signal completion to Deacon:**

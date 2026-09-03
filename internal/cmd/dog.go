@@ -1650,7 +1650,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		if !dogDispatchJSON {
 			style.PrintWarning("%s", warn)
 		}
-		if escErr := dogEscalateBestEffort(warn); escErr != nil {
+		if escErr := dogEscalateBestEffort("session-start", targetDog.Name, warn); escErr != nil {
 			if !dogDispatchJSON {
 				style.PrintWarning("escalation also failed (%v) — escalate manually: gt escalate --severity medium %q", escErr, warn)
 			}
@@ -1667,7 +1667,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		if !dogDispatchJSON {
 			style.PrintWarning("%s", warn)
 		}
-		_ = dogEscalateBestEffort(warn)
+		_ = dogEscalateBestEffort("work-lookup", targetDog.Name, warn)
 	} else if d.Work != "" {
 		result.WorkConfirmed = true
 	} else {
@@ -1676,7 +1676,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		if !dogDispatchJSON {
 			style.PrintWarning("%s", warn)
 		}
-		_ = dogEscalateBestEffort(warn)
+		_ = dogEscalateBestEffort("work-cleared", targetDog.Name, warn)
 	}
 
 	// Success - output result
@@ -1715,10 +1715,21 @@ type dogDispatchResult struct {
 	Warnings       []string `json:"warnings,omitempty"`
 }
 
-// dogEscalateBestEffort fires a MEDIUM escalation via gt escalate.
-func dogEscalateBestEffort(msg string) error {
-	cmd := exec.Command("gt", "escalate", "--severity", "medium", msg)
+// dogEscalateBestEffort fires a fingerprinted MEDIUM escalation via gt escalate.
+func dogEscalateBestEffort(condition, dogName, msg string) error {
+	cmd := exec.Command("gt", dogEscalationArgs(condition, dogName, msg)...)
 	return cmd.Run()
+}
+
+func dogEscalationArgs(condition, dogName, msg string) []string {
+	condition = strings.ToLower(strings.TrimSpace(condition))
+	dogName = strings.ToLower(strings.TrimSpace(dogName))
+	return []string{
+		"escalate", "--severity", "medium",
+		"--fingerprint", "dog-dispatch:" + condition + ":" + dogName,
+		"--scope", "dog:" + dogName,
+		msg,
+	}
 }
 
 // ifStr returns ifTrue if cond is true, otherwise ifFalse.

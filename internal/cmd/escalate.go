@@ -54,7 +54,7 @@ CONFIGURATION:
 Examples:
   gt escalate "Build failing" --severity critical --reason "CI blocked"
   gt escalate "Need API credentials" --severity high --source "plugin:rebuild-gt"
-  gt escalate "Deacon await-signal timeout" --severity medium --source deacon --fingerprint deacon:await-signal:hq-deacon
+  gt escalate "Deacon await-signal timeout" --severity medium --source deacon --fingerprint deacon:await-signal:hq-deacon --scope deacon:hq-deacon
   gt escalate "Code review requested" --reason "PR #123 ready"
   gt escalate list                          # Show open escalations
   gt escalate ack hq-abc123                 # Acknowledge

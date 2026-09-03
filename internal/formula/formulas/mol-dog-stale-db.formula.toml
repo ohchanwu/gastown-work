@@ -101,7 +101,7 @@ If DROP puts server into read-only, attempt recovery before continuing.
 SQL cleanup would take too long (each DROP is ~27s under load).
 Escalate instead of attempting cleanup:
 ```bash
-gt escalate -s HIGH "Dolt: {{orphan_count}} orphan databases detected (too many for SQL cleanup)"
+gt escalate -s HIGH --fingerprint "dolt:orphan-database-limit" --scope "town-dolt" "Dolt: {{orphan_count}} orphan databases detected (too many for SQL cleanup)"
 ```
 
 Recommend filesystem cleanup:

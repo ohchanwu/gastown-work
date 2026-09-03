@@ -827,10 +827,20 @@ func isBeadNotFound(err error) bool {
 // sees the dead-with-active-work state immediately. Best effort — logged on
 // failure but does not gate the prime exit.
 var firePolecatHookUnresolvableEscalation = func(agentID, detail string) {
-	msg := fmt.Sprintf("polecat hook unresolvable: agent=%s detail=%s — see gt-el4", agentID, detail)
-	cmd := exec.Command("gt", "escalate", "--severity", "high", "--reason", "polecat-hook-unresolvable", msg)
+	cmd := exec.Command("gt", polecatHookUnresolvableEscalationArgs(agentID, detail)...)
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "polecat prime: escalation failed: %v\n", err)
+	}
+}
+
+func polecatHookUnresolvableEscalationArgs(agentID, detail string) []string {
+	agentKey := strings.ToLower(strings.TrimSpace(agentID))
+	msg := fmt.Sprintf("polecat hook unresolvable: agent=%s detail=%s — see gt-el4", agentID, detail)
+	return []string{
+		"escalate", "--severity", "high", "--reason", "polecat-hook-unresolvable",
+		"--fingerprint", "polecat-hook-unresolvable:" + agentKey,
+		"--scope", "agent:" + agentKey,
+		msg,
 	}
 }
 

@@ -90,7 +90,7 @@ Skip this step — nothing to escalate.
 
 **2. If phantoms were found, escalate:**
 ```bash
-gt escalate -s HIGH "Dolt: detected {{phantom_count}} phantom database(s): {{phantom_names}} — requires Dolt server restart to resolve"
+gt escalate -s HIGH --fingerprint "dolt:phantom-databases" --scope "town-dolt" "Dolt: detected {{phantom_count}} phantom database(s): {{phantom_names}} — requires Dolt server restart to resolve"
 ```
 
 Phantom databases indicate a Dolt bug (DROP DATABASE + catalog re-materialization)
