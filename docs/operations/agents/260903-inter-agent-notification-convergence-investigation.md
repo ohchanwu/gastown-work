@@ -451,7 +451,107 @@ reuse the durable source identity and consult its eligibility.
 
 ## Current test-protection map and fresh baseline
 
-Investigation pending.
+### Environment and inventory
+
+Phase 0 used Go 1.24.4 on Darwin arm64, tmux 3.7, Dolt 2.1.8, and
+Homebrew ICU 77 for race builds. `go test -list .` compiled all ten planned
+packages and enumerated 2,778 tests. All fixtures were package-owned temporary
+directories, private tmux sockets, or in-memory stores; tests requiring an
+explicit isolated Dolt port skipped rather than using the canonical server.
+
+The exact plan-focused normal and race commands passed in `internal/mail`,
+`internal/nudge`, `internal/delivery`, `internal/tmux`, `internal/acp`,
+`internal/witness`, `internal/reaper`, `internal/deacon`, and `internal/dog`.
+Both commands failed in `internal/cmd` on the same two tests; the race run
+reported no data race before that functional failure.
+
+### Preserved first failure and diagnosis
+
+The first failure was
+`TestCompleteRetirementRecordKeepsPendingAfterStoredMailSendError`; the paired
+`TestCompleteRetirementRecordRenewsPortableDeliveryAfterWitnessRestart` failed
+for the same reason. Each test passes alone, and the pair passes for twenty
+shuffled repetitions. The failure reduces to this order:
+
+1. `TestNudgeValidModesAccepted` invokes `runNudge` from the source checkout.
+2. `runNudge` calls `session.InitRegistry` for the surrounding town.
+3. The test restores its CLI flags and environment but not the process-global
+   prefix registry.
+4. The following retirement test's fixed `gt-witness` authority no longer
+   matches the reloaded registry and is rejected before its intended injected
+   mail failure.
+
+The two-test reproduction is deterministic under shuffle seed
+`1788441383814540000`; the reverse order passes. This is an isolated-test
+pollution defect and a required pre-green repair, not evidence that retirement
+delivery itself regressed. Phase 0 did not edit the test.
+
+### Executable liveness protections
+
+- Idle tmux delivery and router handoff:
+  `TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff`.
+- Busy tmux queueing and safe-boundary preservation:
+  `TestNotifyRecipient_BusyAgent` and
+  `TestPollerCustomPromptBusyDoesNotClaimQueue`.
+- Absent/headless retention:
+  `TestNotifyRecipient_CanonicalAliasQueuesAllHeadlessCandidates` and
+  `TestPropeller_DeliverNudges_RequeuesWhenSessionUnavailable`.
+- Transport failure and retry ownership:
+  `TestNotifyRecipient_QueuedRetryStarterFailureIsVisible`,
+  `TestNackSanitizesErrorAndDefersRetry`, and
+  `TestSettlePollerClaimRequiresRecoverableStateAfterAckAndNackFailures`.
+- Output versus acceptance:
+  `TestNudgeQueueTypedOnlySurvivesUntilMatchingRuntimeReceipt`,
+  `TestClaimDueRequiresMatchingPostClaimReceipt`, and the three focused
+  control-plane receipt tests.
+- Generation replacement:
+  `TestReplaceBeforeStoppingPollerGenerationPreservesLivePollerOnReplacementFailure`,
+  `TestStopRequestedRejectsStaleGeneration`, and the portable mail-work tests.
+- Exact ordinary-record convergence:
+  `TestAcknowledgeDeliveryBeadConvergesPendingLabel`,
+  `TestRemoveKindByThread`, and `TestClearReplyReminders`.
+- Reaper incident identity:
+  `TestReconcileAnomaliesFiveIdenticalSnapshotsCreateOneOccurrence`,
+  `TestReconcileAnomaliesChangedAffectedSetReplacesOccurrence`,
+  `TestReconcileAnomaliesRecurrenceLinksLatestClosedOccurrence`, and the
+  persistent command-level five-patrol test.
+
+The listed exact selections passed normally and under the race detector in
+all eight exercised packages: mail, nudge, delivery, tmux, ACP, Reaper, cmd,
+and control-plane health.
+
+### Duplication and stress baseline
+
+- Five identical Reaper scans converge on one occurrence, escalation, and
+  mail. A changed affected set replaces the occurrence; a resolved incident can
+  recur as one new linked occurrence.
+- Ordinary thread removal deletes only the requested kind and thread while
+  preserving a different kind on that thread and the same kind on another
+  thread.
+- An informational `TypeNotification` from a replyable sender currently creates
+  a reminder. This is a deterministic RED against the new explicit
+  response-required contract.
+- Twenty observations in one unchanged non-Reaper incident fixture are
+  unproven. Current general escalation convergence depends on callers supplying
+  the optional fingerprint.
+- A rapid five-SHA Witness lineage is unproven because current durable records
+  have no explicit lineage or binding-verdict metadata.
+- Normal-priority ACP while busy is unproven by tests and source-traced RED:
+  `notify` emits a UI update, skips `InjectPrompt`, returns nil, and the caller
+  acknowledges and deletes the claim as submitted.
+- In-flight claim convergence is unproven and source-traced RED:
+  `RemoveKindByThread` ignores `.claimed` records.
+- Queue-removal failure followed by next-injector self-healing is unproven.
+  `mail check` discards the removal error, and injectors do not recheck durable
+  terminal state.
+
+### Isolation result
+
+The post-test read-only inventory matched the pre-test baseline: one canonical
+Dolt server; zero configured-port imposters, owned-town leaks, or owned-test
+leaks; nineteen unknown listeners; and one unrelated orphan database. No live
+message, escalation, queue, session, agent, or database was mutated. Sanitized
+command results are retained in the ignored local Phase 0 archive.
 
 ## Redundancy risk classification
 
@@ -467,7 +567,21 @@ Investigation pending.
 
 ## Unproven assumptions
 
-Investigation pending.
+- Whether any supported ACP client treats a UI-only `session/update` as a safe
+  agent work boundary. Current code and receipt semantics say it must not.
+- Whether a current protocol carries machine-readable Witness review lineage
+  outside the searched Beads message fields. No implementation or test was
+  found.
+- Whether any recurring non-Reaper incident producer already supplies a stable
+  fingerprint indirectly. The traced formulas and helpers do not.
+- Whether a claimed wake can be cancelled safely without violating the active
+  consumer's delivery lease. A new exact claim-state seam is required.
+- Whether queue filesystem failure can be reproduced without adding a test seam
+  or relying on platform-specific permissions. Current tests cover Ack/Nack
+  recovery but not terminal-source self-healing after removal failure.
+- Whether twenty identical samples expose a limit absent from the existing
+  five-snapshot Reaper test. Implementation acceptance must exercise all twenty
+  in one fixture.
 
 ## Evidence-backed implementation-plan revision
 
@@ -475,4 +589,53 @@ Investigation pending.
 
 ## Reproduction commands
 
-Investigation pending.
+Test inventory and the plan-focused baseline:
+
+```bash
+CGO_ENABLED=0 go test -list . \
+  ./internal/mail ./internal/nudge ./internal/delivery ./internal/tmux \
+  ./internal/acp ./internal/witness ./internal/reaper ./internal/deacon \
+  ./internal/dog ./internal/cmd
+
+CGO_ENABLED=0 go test \
+  ./internal/mail ./internal/nudge ./internal/delivery ./internal/tmux \
+  ./internal/acp ./internal/witness ./internal/reaper ./internal/deacon \
+  ./internal/dog ./internal/cmd \
+  -run 'Mail|Nudge|Queue|Delivery|Receipt|Reminder|Escalat|Supersed|Poller|Prompt|ACP|Generation|Absent|Busy|Idle' \
+  -count=1
+
+ICU_PREFIX="$(brew --prefix icu4c@77)"
+CGO_CPPFLAGS="-I${ICU_PREFIX}/include" \
+CGO_LDFLAGS="-L${ICU_PREFIX}/lib" \
+go test -race \
+  ./internal/mail ./internal/nudge ./internal/delivery ./internal/tmux \
+  ./internal/acp ./internal/witness ./internal/reaper ./internal/deacon \
+  ./internal/dog ./internal/cmd \
+  -run 'Mail|Nudge|Queue|Delivery|Receipt|Reminder|Escalat|Supersed|Poller|Prompt|ACP|Generation|Absent|Busy|Idle' \
+  -count=1
+```
+
+Minimized registry-pollution failure:
+
+```bash
+CGO_ENABLED=0 go test ./internal/cmd \
+  -run '^(TestNudgeValidModesAccepted|TestCompleteRetirementRecordKeepsPendingAfterStoredMailSendError)$' \
+  -count=1 -shuffle=1788441383814540000 -v
+```
+
+Representative exact user-path selections:
+
+```bash
+CGO_ENABLED=0 go test ./internal/mail \
+  -run 'TestNotifyRecipient_|TestClearReplyReminders|TestAcknowledgeDeliveryBeadConvergesPendingLabel' \
+  -count=1
+CGO_ENABLED=0 go test ./internal/nudge ./internal/delivery \
+  -run 'TestClaimDueRequiresMatchingPostClaimReceipt|TestNackSanitizesErrorAndDefersRetry|TestRemoveKindByThread|TestPromptSubmittedReceipt' \
+  -count=1
+CGO_ENABLED=0 go test ./internal/acp ./internal/reaper ./internal/health \
+  -run 'TestPropeller_|TestReconcileAnomalies|TestEvaluateControlPlane' \
+  -count=1
+CGO_ENABLED=0 go test ./internal/cmd \
+  -run 'TestNudgeQueueTypedOnly|TestPollerCustomPromptBusy|TestSettlePollerClaim|TestReconcileAnomalyScansFive' \
+  -count=1
+```
