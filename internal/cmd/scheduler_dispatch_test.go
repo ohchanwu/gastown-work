@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/config"
@@ -100,6 +101,81 @@ func TestListAllSlingContextRecordsFailsOnPartialScanFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "listing sling contexts") || !strings.Contains(err.Error(), filepath.Join("rig", ".beads")) {
 		t.Fatalf("error = %q, want explicit context scan failure", err.Error())
+	}
+}
+
+func TestListAllSlingContextRecordsScansRigsConcurrently(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"} {
+		if err := os.MkdirAll(filepath.Join(townRoot, "rig-"+name, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanLog := filepath.Join(t.TempDir(), "scans")
+	installFakeBD(t, `#!/bin/sh
+if [ "$1" = "--allow-stale" ] && [ "$2" = "version" ]; then
+  exit 0
+fi
+sleep 0.3
+printf '%s\n' "$BEADS_DIR" >> "$GT_SLING_SCAN_LOG"
+printf '[]\n'
+`)
+	t.Setenv("GT_SLING_SCAN_LOG", scanLog)
+
+	started := time.Now()
+	records, err := listAllSlingContextRecordsContext(context.Background(), townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("records = %d, want 0", len(records))
+	}
+	if elapsed := time.Since(started); elapsed >= 2500*time.Millisecond {
+		t.Fatalf("13 sling-context scans took %s, want bounded concurrency under 2.5s", elapsed.Round(time.Millisecond))
+	}
+	data, err := os.ReadFile(scanLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scans := len(strings.Fields(string(data))); scans != 13 {
+		t.Fatalf("sling-context scans = %d, want 13 unique directories", scans)
+	}
+}
+
+func TestListAllSlingContextRecordsScansResolvedDatabaseOnce(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	canonical := filepath.Join(townRoot, "rig", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(canonical, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(canonical, filepath.Join(townRoot, "rig", ".beads")); err != nil {
+		t.Skipf("symlink fixture unavailable: %v", err)
+	}
+	scanLog := filepath.Join(t.TempDir(), "scans")
+	installFakeBD(t, `#!/bin/sh
+if [ "$1" = "--allow-stale" ] && [ "$2" = "version" ]; then
+  exit 0
+fi
+printf '%s\n' "$BEADS_DIR" >> "$GT_SLING_SCAN_LOG"
+printf '[]\n'
+`)
+	t.Setenv("GT_SLING_SCAN_LOG", scanLog)
+
+	if _, err := listAllSlingContextRecordsContext(context.Background(), townRoot); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(scanLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scans := len(strings.Fields(string(data))); scans != 2 {
+		t.Fatalf("sling-context scans = %d, want town plus one resolved rig database; dirs:\n%s", scans, data)
 	}
 }
 
