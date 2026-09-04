@@ -2,10 +2,11 @@
 
 Active work:
 
-- [Inter-agent notification convergence and alert deduplication repair](specs/260902-inter-agent-notification-convergence-and-alert-deduplication-repair-spec.md)
+None.
 
 Completed work:
 
+- [Inter-agent notification convergence and alert deduplication repair](archive/260902-inter-agent-notification-convergence-and-alert-deduplication-repair-spec.md)
 - [Lifecycle integration and Codex startup tracker closeout](archive/260828-lifecycle-integration-and-codex-startup-tracker-closeout-plan.md)
 - [Lifecycle custody and truthful closeout repair](archive/260817-lifecycle-custody-and-truthful-closeout-repair-spec.md)
 - [Codex startup repair tracker reconciliation](archive/260828-codex-startup-repair-tracker-reconciliation-spec.md)
